@@ -17,6 +17,17 @@ import com.rtatuner.app.core.calibration.CalibrationManager
 import com.rtatuner.app.core.calibration.CalibrationUiState
 import com.rtatuner.app.core.calibration.MicCalibrationCurve
 import com.rtatuner.app.core.calibration.TargetCurve
+import com.rtatuner.app.core.database.RtaDatabase
+import com.rtatuner.app.core.database.SessionRepository
+import com.rtatuner.app.core.database.SessionSnapshotEntity
+import com.rtatuner.app.core.database.SessionWithSnapshots
+import com.rtatuner.app.core.database.TuningSessionEntity
+import com.rtatuner.app.core.session.RtaSnapshot
+import com.rtatuner.app.core.session.SnapshotPalette
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.UUID
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -41,13 +52,22 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
     private var captureManager: AudioCaptureManager = createCaptureManager(currentWindowSize)
     val signalGenerator: SignalGenerator = SignalGenerator(sampleRate = 48000)
     val calibrationManager: CalibrationManager = CalibrationManager(application)
+    private val database = RtaDatabase.getInstance(application)
+    val sessionRepository = SessionRepository(database.tuningSessionDao())
 
     private val _uiState = MutableStateFlow(AudioCaptureUiState())
     val uiState: StateFlow<AudioCaptureUiState> = _uiState.asStateFlow()
 
+    private val _frozenSnapshots = MutableStateFlow<List<RtaSnapshot>>(emptyList())
+    val frozenSnapshots: StateFlow<List<RtaSnapshot>> = _frozenSnapshots.asStateFlow()
+
+    private val _savedSessions = MutableStateFlow<List<SessionWithSnapshots>>(emptyList())
+    val savedSessions: StateFlow<List<SessionWithSnapshots>> = _savedSessions.asStateFlow()
+
     private var captureCollectorJob: Job? = null
     private var generatorCollectorJob: Job? = null
     private var calibrationCollectorJob: Job? = null
+    private var sessionsCollectorJob: Job? = null
     private var ballisticsJob: Job? = null
     private var peakHoldDb = AudioMath.MIN_DB_FS
     private var peakHoldTimestamp = 0L
@@ -56,8 +76,10 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
         startCollectingCaptureState()
         startCollectingGeneratorState()
         startCollectingCalibrationState()
+        startCollectingSavedSessions()
         startBallisticsTicker()
     }
+
 
     private fun startCollectingGeneratorState() {
         generatorCollectorJob?.cancel()
@@ -360,13 +382,189 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
         calibrationManager.clearNoiseFloor()
     }
 
+    private fun startCollectingSavedSessions() {
+        sessionsCollectorJob?.cancel()
+        sessionsCollectorJob = viewModelScope.launch {
+            sessionRepository.allSessionsWithSnapshots.collect { sessions ->
+                _savedSessions.value = sessions
+            }
+        }
+    }
+
+    // ==========================================
+    // STAGE 6: SNAPSHOT / FREEZE MANAGEMENT
+    // ==========================================
+
+    fun freezeCurrentSnapshot(customName: String? = null) {
+        val currentSnapshots = _frozenSnapshots.value
+        val calState = calibrationManager.uiState.value
+        val isSpl = calState.splCalibration.isSplMode
+        val splOffset = if (isSpl) calState.splCalibration.splOffsetDb else 0.0f
+        val liveBands = _uiState.value.octave31Db.clone()
+
+        val defaultName = if (currentSnapshots.isEmpty()) "Before EQ" else "Snapshot ${currentSnapshots.size + 1}"
+        val name = if (customName.isNullOrBlank()) defaultName else customName
+        val colorHex = SnapshotPalette.getColorForIndex(currentSnapshots.size)
+
+        val newSnapshot = RtaSnapshot(
+            name = name,
+            timestamp = System.currentTimeMillis(),
+            bands31Db = liveBands,
+            isSplMode = isSpl,
+            splOffsetDb = splOffset,
+            calibrationName = if (calState.isMicCurveActive) calState.micCurve?.name else null,
+            targetCurveName = if (calState.isTargetCurveActive) calState.targetCurve?.name else null,
+            windowSize = currentWindowSize,
+            isNoiseSubtractionActive = calState.isNoiseSubtractionActive,
+            activeNoiseFloorBands = if (calState.noiseFloor.isCaptured) calState.noiseFloor.bands31Db.clone() else null,
+            colorHex = colorHex,
+            isVisible = true
+        )
+
+        _frozenSnapshots.value = currentSnapshots + newSnapshot
+    }
+
+    fun unfreezeSnapshot(id: String) {
+        _frozenSnapshots.value = _frozenSnapshots.value.filterNot { it.id == id }
+    }
+
+    fun clearAllFrozenSnapshots() {
+        _frozenSnapshots.value = emptyList()
+    }
+
+    fun toggleSnapshotVisibility(id: String) {
+        _frozenSnapshots.value = _frozenSnapshots.value.map {
+            if (it.id == id) it.copy(isVisible = !it.isVisible) else it
+        }
+    }
+
+    fun renameSnapshot(id: String, newName: String) {
+        if (newName.isBlank()) return
+        _frozenSnapshots.value = _frozenSnapshots.value.map {
+            if (it.id == id) it.copy(name = newName) else it
+        }
+    }
+
+    fun loadSessionSnapshotsToOverlay(sessionWithSnapshots: SessionWithSnapshots) {
+        val loaded = sessionWithSnapshots.snapshots.mapIndexed { index, entity ->
+            RtaSnapshot(
+                id = UUID.randomUUID().toString(),
+                name = "${sessionWithSnapshots.session.name} - ${entity.name}",
+                timestamp = entity.timestamp,
+                bands31Db = entity.bands31Db.clone(),
+                isSplMode = entity.isSplMode,
+                splOffsetDb = entity.splOffsetDb,
+                calibrationName = entity.calibrationName,
+                targetCurveName = entity.targetCurveName,
+                windowSize = sessionWithSnapshots.session.windowSize,
+                isNoiseSubtractionActive = entity.isNoiseSubtractionActive,
+                activeNoiseFloorBands = entity.activeNoiseFloorBands?.clone(),
+                colorHex = entity.colorHex,
+                isVisible = true
+            )
+        }
+        _frozenSnapshots.value = _frozenSnapshots.value + loaded
+    }
+
+    // ==========================================
+    // STAGE 6: ROOM SESSION PERSISTENCE
+    // ==========================================
+
+    fun saveSession(
+        name: String,
+        notes: String = "",
+        includeLive: Boolean = true,
+        includeFrozenIds: List<String> = emptyList(),
+        onComplete: ((Long) -> Unit)? = null
+    ) {
+        viewModelScope.launch {
+            val calState = calibrationManager.uiState.value
+            val isSpl = calState.splCalibration.isSplMode
+            val splOffset = if (isSpl) calState.splCalibration.splOffsetDb else 0.0f
+            val now = System.currentTimeMillis()
+
+            val sessionEntity = TuningSessionEntity(
+                name = name.ifBlank { "Session ${SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(now))}" },
+                notes = notes,
+                createdAt = now,
+                activeCalibrationName = if (calState.isMicCurveActive) calState.micCurve?.name else null,
+                activeTargetCurveName = if (calState.isTargetCurveActive) calState.targetCurve?.name else null,
+                isSplMode = isSpl,
+                splOffsetDb = splOffset,
+                windowSize = currentWindowSize,
+                isNoiseSubtractionActive = calState.isNoiseSubtractionActive,
+                activeNoiseFloorBands = if (calState.noiseFloor.isCaptured) calState.noiseFloor.bands31Db.clone() else null
+            )
+
+            val snapshotEntities = mutableListOf<SessionSnapshotEntity>()
+
+            // Include live spectrum as a snapshot if selected
+            if (includeLive) {
+                snapshotEntities.add(
+                    SessionSnapshotEntity(
+                        sessionId = 0,
+                        name = "Live Capture",
+                        timestamp = now,
+                        bands31Db = _uiState.value.octave31Db.clone(),
+                        colorHex = SnapshotPalette.getColorForIndex(0),
+                        isSplMode = isSpl,
+                        splOffsetDb = splOffset,
+                        calibrationName = sessionEntity.activeCalibrationName,
+                        targetCurveName = sessionEntity.activeTargetCurveName,
+                        isNoiseSubtractionActive = sessionEntity.isNoiseSubtractionActive,
+                        activeNoiseFloorBands = sessionEntity.activeNoiseFloorBands
+                    )
+                )
+            }
+
+            // Include selected frozen snapshots
+            val currentFrozen = _frozenSnapshots.value
+            for (frozen in currentFrozen) {
+                if (includeFrozenIds.isEmpty() || includeFrozenIds.contains(frozen.id)) {
+                    snapshotEntities.add(
+                        SessionSnapshotEntity(
+                            sessionId = 0,
+                            name = frozen.name,
+                            timestamp = frozen.timestamp,
+                            bands31Db = frozen.bands31Db.clone(),
+                            colorHex = frozen.colorHex,
+                            isSplMode = frozen.isSplMode,
+                            splOffsetDb = frozen.splOffsetDb,
+                            calibrationName = frozen.calibrationName,
+                            targetCurveName = frozen.targetCurveName,
+                            isNoiseSubtractionActive = frozen.isNoiseSubtractionActive,
+                            activeNoiseFloorBands = frozen.activeNoiseFloorBands
+                        )
+                    )
+                }
+            }
+
+            val id = sessionRepository.saveSession(sessionEntity, snapshotEntities)
+            onComplete?.invoke(id)
+        }
+    }
+
+    fun deleteSession(sessionId: Long) {
+        viewModelScope.launch {
+            sessionRepository.deleteSession(sessionId)
+        }
+    }
+
+    fun updateSessionNotes(sessionId: Long, notes: String) {
+        viewModelScope.launch {
+            sessionRepository.updateSessionNotes(sessionId, notes)
+        }
+    }
+
     override fun onCleared() {
         super.onCleared()
         ballisticsJob?.cancel()
         captureCollectorJob?.cancel()
         generatorCollectorJob?.cancel()
         calibrationCollectorJob?.cancel()
+        sessionsCollectorJob?.cancel()
         captureManager.stopCapture()
         signalGenerator.stop()
     }
 }
+

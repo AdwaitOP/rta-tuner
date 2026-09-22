@@ -15,6 +15,7 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import com.rtatuner.app.core.audio.FftDisplayMode
 import com.rtatuner.app.core.dsp.Iso31Bands
+import com.rtatuner.app.core.session.RtaSnapshot
 import com.rtatuner.app.ui.EmaPreset
 import com.rtatuner.app.ui.RtaDisplayConfig
 import java.util.Locale
@@ -87,7 +88,8 @@ class RtaSurfaceView @JvmOverloads constructor(
         rawFftDb: FloatArray,
         binResolutionHz: Float,
         unreliableBands: BooleanArray? = null,
-        targetDeltas31Db: FloatArray? = null
+        targetDeltas31Db: FloatArray? = null,
+        frozenSnapshots: List<RtaSnapshot> = emptyList()
     ) {
         currentPayload.set(
             SpectralPayload(
@@ -95,7 +97,8 @@ class RtaSurfaceView @JvmOverloads constructor(
                 rawFftDb = rawFftDb,
                 binResolutionHz = binResolutionHz,
                 unreliableBands = unreliableBands,
-                targetDeltas31Db = targetDeltas31Db
+                targetDeltas31Db = targetDeltas31Db,
+                frozenSnapshots = frozenSnapshots
             )
         )
     }
@@ -230,6 +233,24 @@ class RtaSurfaceView @JvmOverloads constructor(
 
         private val rawPath = Path()
         private val targetPath = Path()
+        private val snapshotPath = Path()
+        private val snapshotPaint = Paint().apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 2.5f
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+            isAntiAlias = true
+        }
+        private val snapshotDotPaint = Paint().apply {
+            style = Paint.Style.FILL
+            isAntiAlias = true
+        }
+        private val snapshotLegendPaint = Paint().apply {
+            color = Color.WHITE
+            textSize = 16f
+            typeface = Typeface.MONOSPACE
+            isAntiAlias = true
+        }
 
         // Telemetry counters
         private var frameCount = 0
@@ -585,6 +606,61 @@ class RtaSurfaceView @JvmOverloads constructor(
                 canvas.drawPath(targetPath, targetCurvePaint)
             }
 
+            // 3.5. Draw Frozen Snapshot Overlays
+            val snapshots = payload?.frozenSnapshots
+            if (!snapshots.isNullOrEmpty()) {
+                for (snap in snapshots) {
+                    if (!snap.isVisible) continue
+                    val colorInt = snap.colorHex.toInt()
+                    snapshotPaint.color = colorInt
+                    snapshotDotPaint.color = colorInt
+                    snapshotPath.reset()
+                    var snapStarted = false
+
+                    // Cross-mode offset correction between dBFS and SPL
+                    val crossModeOffset = when {
+                        snap.isSplMode && !config.isSplMode -> -snap.splOffsetDb
+                        !snap.isSplMode && config.isSplMode -> splOffset
+                        snap.isSplMode && config.isSplMode -> (splOffset - snap.splOffsetDb)
+                        else -> 0.0f
+                    }
+
+                    for (i in 0 until Iso31Bands.NUM_BANDS) {
+                        val rawDb = if (i < snap.bands31Db.size) snap.bands31Db[i] else minDb
+                        val safeDb = if (rawDb.isNaN() || rawDb.isInfinite()) minDb else rawDb
+                        val effectiveDb = (safeDb + crossModeOffset).coerceIn(minDb, maxDb)
+                        val y = plotTop + plotHeight * ((maxDb - effectiveDb) / dbRange)
+
+                        val left = barLefts[i]
+                        val right = barRights[i]
+                        val centerX = (left + right) / 2f
+
+                        if (config.displayMode == FftDisplayMode.OCTAVE_1_3) {
+                            if (!snapStarted) {
+                                snapshotPath.moveTo(left, y)
+                                snapshotPath.lineTo(right, y)
+                                snapStarted = true
+                            } else {
+                                snapshotPath.lineTo(left, y)
+                                snapshotPath.lineTo(right, y)
+                            }
+                        } else {
+                            val f = Iso31Bands.CENTER_FREQUENCIES[i]
+                            val x = freqToPlotX(f)
+                            if (!snapStarted) {
+                                snapshotPath.moveTo(x, y)
+                                snapStarted = true
+                            } else {
+                                snapshotPath.lineTo(x, y)
+                            }
+                        }
+
+                        canvas.drawCircle(centerX, y, 3.0f, snapshotDotPaint)
+                    }
+                    canvas.drawPath(snapshotPath, snapshotPaint)
+                }
+            }
+
             canvas.restore()
 
             // 4. Draw Gutter Overlays & Axis Dividers
@@ -638,6 +714,8 @@ class RtaSurfaceView @JvmOverloads constructor(
         val rawFftDb: FloatArray,
         val binResolutionHz: Float,
         val unreliableBands: BooleanArray? = null,
-        val targetDeltas31Db: FloatArray? = null
+        val targetDeltas31Db: FloatArray? = null,
+        val frozenSnapshots: List<RtaSnapshot> = emptyList()
     )
 }
+

@@ -78,8 +78,12 @@ import androidx.core.content.ContextCompat
 import com.rtatuner.app.core.audio.AudioCaptureUiState
 import com.rtatuner.app.core.audio.CaptureStatus
 import com.rtatuner.app.core.audio.FftDisplayMode
+import com.rtatuner.app.core.session.RtaSnapshot
 import com.rtatuner.app.ui.components.LevelMeter
+import com.rtatuner.app.ui.components.SessionToolsCard
 import com.rtatuner.app.ui.components.surface.RtaSurfaceView
+import androidx.compose.material.icons.filled.AcUnit
+import androidx.compose.material.icons.filled.Close
 import java.util.Locale
 
 @Composable
@@ -89,6 +93,9 @@ fun DebugScreen(
 ) {
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsState()
+    val frozenSnapshots by viewModel.frozenSnapshots.collectAsState()
+    val savedSessions by viewModel.savedSessions.collectAsState()
+    var surfaceViewRef by remember { mutableStateOf<RtaSurfaceView?>(null) }
 
     var hasPermission by remember {
         mutableStateOf(
@@ -146,9 +153,15 @@ fun DebugScreen(
                 )
             }
 
-            // Stage 3 SurfaceView Spectrum Card
+            // Stage 3 SurfaceView Spectrum Card with Stage 6 Frozen Overlays
             SurfaceSpectrumCard(
                 uiState = uiState,
+                frozenSnapshots = frozenSnapshots,
+                onFreeze = { viewModel.freezeCurrentSnapshot() },
+                onClearAllFrozen = { viewModel.clearAllFrozenSnapshots() },
+                onToggleSnapshotVisibility = { viewModel.toggleSnapshotVisibility(it) },
+                onUnfreezeSnapshot = { viewModel.unfreezeSnapshot(it) },
+                onSurfaceViewCreated = { surfaceViewRef = it },
                 onToggleMode = { viewModel.setFftDisplayMode(it) },
                 onSelectWindowSize = { viewModel.setWindowSize(it) },
                 onSelectEmaPreset = { viewModel.setEmaPreset(it) },
@@ -175,6 +188,16 @@ fun DebugScreen(
                 onSetNoiseSubtractionActive = { viewModel.setNoiseSubtractionActive(it) },
                 onClearNoiseFloor = { viewModel.clearNoiseFloor() }
             )
+
+            // Stage 6 Session Tools Card
+            SessionToolsCard(
+                viewModel = viewModel,
+                surfaceViewRef = surfaceViewRef,
+                uiState = uiState,
+                frozenSnapshots = frozenSnapshots,
+                savedSessions = savedSessions
+            )
+
 
             // Hardware Mic Noise Floor Limitation Notice
             MicNoiseFloorNoticeCard()
@@ -298,6 +321,12 @@ private fun StatusBadge(status: CaptureStatus) {
 @Composable
 private fun SurfaceSpectrumCard(
     uiState: AudioCaptureUiState,
+    frozenSnapshots: List<RtaSnapshot> = emptyList(),
+    onFreeze: () -> Unit = {},
+    onClearAllFrozen: () -> Unit = {},
+    onToggleSnapshotVisibility: (String) -> Unit = {},
+    onUnfreezeSnapshot: (String) -> Unit = {},
+    onSurfaceViewCreated: ((RtaSurfaceView) -> Unit)? = null,
     onToggleMode: (FftDisplayMode) -> Unit,
     onSelectWindowSize: (Int) -> Unit,
     onSelectEmaPreset: (EmaPreset) -> Unit,
@@ -446,6 +475,7 @@ private fun SurfaceSpectrumCard(
                             this.onRenderStatsUpdated = { fps, drawTimeUs ->
                                 onUpdateRenderTelemetry(fps, drawTimeUs)
                             }
+                            onSurfaceViewCreated?.invoke(this)
                         }
                     },
                     update = { surfaceView ->
@@ -455,11 +485,95 @@ private fun SurfaceSpectrumCard(
                             rawFftDb = uiState.rawFftDb,
                             binResolutionHz = binResolution,
                             unreliableBands = uiState.unreliableBands,
-                            targetDeltas31Db = uiState.targetDeltas31Db
+                            targetDeltas31Db = uiState.targetDeltas31Db,
+                            frozenSnapshots = frozenSnapshots
                         )
                     }
                 )
             }
+
+            // Quick Freeze & Active Overlays Bar
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Quick Freeze Action
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(Color(0xFF00E5FF))
+                        .clickable { onFreeze() }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AcUnit,
+                            contentDescription = null,
+                            tint = Color.Black,
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Text(
+                            text = "FREEZE",
+                            color = Color.Black,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+
+                if (frozenSnapshots.isNotEmpty()) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        frozenSnapshots.forEach { snap ->
+                            val color = Color(snap.colorHex)
+                            Surface(
+                                color = color.copy(alpha = if (snap.isVisible) 0.2f else 0.05f),
+                                shape = RoundedCornerShape(4.dp),
+                                border = androidx.compose.foundation.BorderStroke(
+                                    0.5.dp,
+                                    if (snap.isVisible) color else Color(0xFF37474F)
+                                ),
+                                modifier = Modifier.clickable { onToggleSnapshotVisibility(snap.id) }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(6.dp)
+                                            .clip(CircleShape)
+                                            .background(if (snap.isVisible) color else Color(0xFF546E7A))
+                                    )
+                                    Text(
+                                        text = snap.name,
+                                        color = if (snap.isVisible) Color.White else Color(0xFF78909C),
+                                        fontSize = 9.sp,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                    Icon(
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = "Remove",
+                                        tint = Color(0xFFFF8A80),
+                                        modifier = Modifier
+                                            .size(10.dp)
+                                            .clickable { onUnfreezeSnapshot(snap.id) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
 
             // Telemetry & Advanced Settings Row
             Row(
