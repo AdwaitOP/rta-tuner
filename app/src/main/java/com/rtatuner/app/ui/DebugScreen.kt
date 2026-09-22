@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -39,14 +40,23 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
 import com.rtatuner.app.core.audio.GeneratorMode
 import com.rtatuner.app.core.audio.SweepRangePreset
 import com.rtatuner.app.core.audio.SignalGeneratorState
+import com.rtatuner.app.core.calibration.CalibrationUiState
+import com.rtatuner.app.core.calibration.MicCalibrationCurve
+import com.rtatuner.app.core.calibration.TargetCurve
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -151,6 +161,21 @@ fun DebugScreen(
                 }
             )
 
+            // Stage 5 Calibration & Target Curves Card
+            CalibrationControlsCard(
+                uiState = uiState,
+                onLoadMicCurve = { name, content -> viewModel.loadMicCurve(name, content) },
+                onSetMicCurveActive = { viewModel.setMicCurveActive(it) },
+                onClearMicCurve = { viewModel.clearMicCurve() },
+                onCalibrateSpl = { viewModel.calibrateSplReference(it) },
+                onSetSplMode = { viewModel.setSplMode(it) },
+                onSetTargetCurve = { viewModel.setTargetCurve(it) },
+                onSetTargetCurveActive = { viewModel.setTargetCurveActive(it) },
+                onStartNoiseCapture = { viewModel.startNoiseFloorCapture() },
+                onSetNoiseSubtractionActive = { viewModel.setNoiseSubtractionActive(it) },
+                onClearNoiseFloor = { viewModel.clearNoiseFloor() }
+            )
+
             // Hardware Mic Noise Floor Limitation Notice
             MicNoiseFloorNoticeCard()
 
@@ -167,12 +192,16 @@ fun DebugScreen(
             )
 
             // Broadband Level Meters (Peak / RMS / Clip)
+            val isSpl = uiState.calibration.splCalibration.isSplMode
+            val splOffset = if (isSpl) uiState.calibration.splCalibration.splOffsetDb else 0.0f
             LiveMetersCard(
                 peakDb = uiState.peakDb,
                 peakHoldDb = uiState.peakHoldDb,
                 rmsDb = uiState.rmsDb,
                 isClipping = uiState.isClipping,
                 isLive = uiState.status == CaptureStatus.RUNNING,
+                isSplMode = isSpl,
+                splOffsetDb = splOffset,
                 onResetPeak = { viewModel.resetPeakHold() }
             )
 
@@ -217,7 +246,7 @@ private fun HeaderSection(status: CaptureStatus) {
                     letterSpacing = 1.sp
                 )
                 Text(
-                    text = "STAGE 4 • TEST SIGNAL GENERATOR & 60FPS RTA",
+                    text = "STAGE 5 • CALIBRATION, TARGETS & 60FPS RTA",
                     color = Color(0xFF78909C),
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Bold,
@@ -424,7 +453,9 @@ private fun SurfaceSpectrumCard(
                         surfaceView.updateSpectralData(
                             octave31Db = uiState.octave31Db,
                             rawFftDb = uiState.rawFftDb,
-                            binResolutionHz = binResolution
+                            binResolutionHz = binResolution,
+                            unreliableBands = uiState.unreliableBands,
+                            targetDeltas31Db = uiState.targetDeltas31Db
                         )
                     }
                 )
@@ -726,8 +757,16 @@ private fun LiveMetersCard(
     rmsDb: Float,
     isClipping: Boolean,
     isLive: Boolean,
+    isSplMode: Boolean = false,
+    splOffsetDb: Float = 0.0f,
     onResetPeak: () -> Unit
 ) {
+    val rawSpl = if (isSplMode) splOffsetDb else 0.0f
+    val safeSpl = if (rawSpl.isNaN() || rawSpl.isInfinite()) 0.0f else rawSpl
+    val meterMinDb = if (isSplMode) -90.0f + safeSpl else -90.0f
+    val meterMaxDb = if (isSplMode) 0.0f + safeSpl else 0.0f
+    val unitStr = if (isSplMode) "dBSPL" else "dBFS"
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = Color(0xFF14171E)),
@@ -744,7 +783,7 @@ private fun LiveMetersCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "BROADBAND LEVEL METERS",
+                    text = if (isSplMode) "BROADBAND LEVEL METERS (SPL)" else "BROADBAND LEVEL METERS",
                     color = Color(0xFFECEFF1),
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
@@ -756,13 +795,19 @@ private fun LiveMetersCard(
 
             LevelMeter(
                 label = "PEAK LEVEL (FAST)",
-                levelDb = if (isLive) peakDb else -100f,
-                peakHoldDb = if (isLive) peakHoldDb else -100f
+                levelDb = if (isLive) peakDb else meterMinDb,
+                peakHoldDb = if (isLive) peakHoldDb else meterMinDb,
+                minDb = meterMinDb,
+                maxDb = meterMaxDb,
+                isSplMode = isSplMode
             )
 
             LevelMeter(
                 label = "RMS LEVEL (AVERAGE)",
-                levelDb = if (isLive) rmsDb else -100f
+                levelDb = if (isLive) rmsDb else meterMinDb,
+                minDb = meterMinDb,
+                maxDb = meterMaxDb,
+                isSplMode = isSplMode
             )
 
             Row(
@@ -771,20 +816,20 @@ private fun LiveMetersCard(
             ) {
                 MetricBox(
                     label = "LIVE RMS",
-                    value = String.format(Locale.US, "%.1f", if (isLive) rmsDb else -100f),
-                    unit = "dBFS",
+                    value = String.format(Locale.US, "%.1f", if (isLive) rmsDb else meterMinDb),
+                    unit = unitStr,
                     accent = Color(0xFF00E676)
                 )
                 MetricBox(
                     label = "LIVE PEAK",
-                    value = String.format(Locale.US, "%.1f", if (isLive) peakDb else -100f),
-                    unit = "dBFS",
+                    value = String.format(Locale.US, "%.1f", if (isLive) peakDb else meterMinDb),
+                    unit = unitStr,
                     accent = Color(0xFFFFEB3B)
                 )
                 MetricBox(
                     label = "PEAK HOLD",
-                    value = String.format(Locale.US, "%.1f", if (isLive) peakHoldDb else -100f),
-                    unit = "dBFS",
+                    value = String.format(Locale.US, "%.1f", if (isLive) peakHoldDb else meterMinDb),
+                    unit = unitStr,
                     accent = Color(0xFFFF5252)
                 )
             }
@@ -1295,6 +1340,637 @@ private fun SignalGeneratorCard(
                 }
             }
         }
+    }
+}
+
+private const val SAMPLE_UMIK1_CAL = """# miniDSP UMIK-1 Sample 90-degree Calibration File
+10.000   -1.85
+20.000   -0.82
+31.500   -0.45
+50.000   -0.12
+80.000    0.00
+100.000   0.05
+200.000   0.00
+500.000   0.00
+1000.000  0.00
+2000.000  0.10
+4000.000  0.35
+8000.000  0.95
+10000.000 1.35
+16000.000 2.40
+20000.000 3.80
+"""
+
+@Composable
+fun CalibrationControlsCard(
+    uiState: AudioCaptureUiState,
+    onLoadMicCurve: (name: String, content: String) -> Result<MicCalibrationCurve>,
+    onSetMicCurveActive: (Boolean) -> Unit,
+    onClearMicCurve: () -> Unit,
+    onCalibrateSpl: (Float) -> Unit,
+    onSetSplMode: (Boolean) -> Unit,
+    onSetTargetCurve: (TargetCurve?) -> Unit,
+    onSetTargetCurveActive: (Boolean) -> Unit,
+    onStartNoiseCapture: () -> Unit,
+    onSetNoiseSubtractionActive: (Boolean) -> Unit,
+    onClearNoiseFloor: () -> Unit
+) {
+    val calib = uiState.calibration
+    val context = LocalContext.current
+    var selectedTab by remember { mutableStateOf(0) } // 0: MIC CAL, 1: SPL REF, 2: TARGET, 3: NOISE
+    var showPasteDialog by remember { mutableStateOf(false) }
+    var showSplDialog by remember { mutableStateOf(false) }
+    var pasteNameInput by remember { mutableStateOf("Custom Mic Cal") }
+    var pasteContentInput by remember { mutableStateOf("") }
+    var parseErrorMsg by remember { mutableStateOf<String?>(null) }
+    var splTargetInput by remember { mutableStateOf("85.0") }
+
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                val content = context.contentResolver.openInputStream(uri)?.use { stream ->
+                    stream.bufferedReader().readText()
+                }
+                if (content != null) {
+                    val displayName = uri.lastPathSegment?.substringAfterLast('/') ?: "Imported Mic Cal"
+                    val result = onLoadMicCurve(displayName, content)
+                    if (result.isFailure) {
+                        parseErrorMsg = result.exceptionOrNull()?.message ?: "Failed to parse calibration file"
+                    } else {
+                        parseErrorMsg = null
+                    }
+                }
+            } catch (e: Exception) {
+                parseErrorMsg = "Error opening file: ${e.localizedMessage}"
+            }
+        }
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22)),
+        shape = RoundedCornerShape(8.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF30363D))
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            // Card Title Header
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Tune,
+                        contentDescription = null,
+                        tint = Color(0xFFFFB300),
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = "STAGE 5: CALIBRATION & TARGET CURVES",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+
+                // Explicit Calibration Status Tag (matching RTA Pro requirement)
+                Text(
+                    text = calib.micCurveStatusText,
+                    color = if (calib.isMicCurveActive) Color(0xFF00E676) else Color(0xFF78909C),
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(if (calib.isMicCurveActive) Color(0xFF1B5E20) else Color(0xFF263238))
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                )
+            }
+
+            // Tab Row: MIC CAL | SPL REF | TARGET | NOISE FLOOR
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(Color(0xFF0D1117))
+                    .padding(3.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                val tabs = listOf("MIC CAL", "SPL REF", "TARGET", "NOISE FLOOR")
+                tabs.forEachIndexed { idx, title ->
+                    ModeTab(
+                        title = title,
+                        isSelected = selectedTab == idx,
+                        onClick = { selectedTab = idx }
+                    )
+                }
+            }
+
+            // Tab 0: Microphone Frequency Response Calibration
+            if (selectedTab == 0) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(Color(0xFF0D1117))
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text(
+                                text = "MIC CORRECTION FILTER",
+                                color = Color(0xFFECEFF1),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Text(
+                                text = if (calib.micCurve != null) {
+                                    "${calib.micCurve.points.size} points (${calib.micCurve.points.first().freqHz.toInt()}Hz - ${calib.micCurve.points.last().freqHz.toInt()}Hz)"
+                                } else {
+                                    "No calibration profile loaded"
+                                },
+                                color = Color(0xFF90A4AE),
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+
+                        Switch(
+                            checked = calib.isMicCurveActive,
+                            onCheckedChange = { onSetMicCurveActive(it) },
+                            enabled = calib.micCurve != null,
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color(0xFF00E676),
+                                checkedTrackColor = Color(0xFF1B5E20),
+                                uncheckedThumbColor = Color(0xFF78909C),
+                                uncheckedTrackColor = Color(0xFF263238)
+                            )
+                        )
+                    }
+
+                    // Action Buttons for Mic Cal
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                val res = onLoadMicCurve("miniDSP UMIK-1 (Demo)", SAMPLE_UMIK1_CAL)
+                                if (res.isFailure) parseErrorMsg = res.exceptionOrNull()?.message
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E3A5F)),
+                            shape = RoundedCornerShape(4.dp),
+                            modifier = Modifier.weight(1f).height(32.dp)
+                        ) {
+                            Text("LOAD UMIK-1", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                        }
+
+                        Button(
+                            onClick = { filePickerLauncher.launch("*/*") },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E3B4E)),
+                            shape = RoundedCornerShape(4.dp),
+                            modifier = Modifier.weight(1f).height(32.dp)
+                        ) {
+                            Text("IMPORT FILE", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                        }
+
+                        Button(
+                            onClick = { showPasteDialog = true },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E3B4E)),
+                            shape = RoundedCornerShape(4.dp),
+                            modifier = Modifier.weight(1f).height(32.dp)
+                        ) {
+                            Text("PASTE CSV", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                        }
+
+                        if (calib.micCurve != null) {
+                            Button(
+                                onClick = { onClearMicCurve() },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4A148C)),
+                                shape = RoundedCornerShape(4.dp),
+                                modifier = Modifier.weight(0.7f).height(32.dp)
+                            ) {
+                                Text("CLEAR", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                            }
+                        }
+                    }
+
+                    if (parseErrorMsg != null) {
+                        Text(
+                            text = "Error: $parseErrorMsg",
+                            color = Color(0xFFFF5252),
+                            fontSize = 9.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+            }
+
+            // Tab 1: dB SPL Reference Calibration
+            if (selectedTab == 1) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(Color(0xFF0D1117))
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text(
+                                text = "SPL REFERENCE CALIBRATION",
+                                color = Color(0xFFECEFF1),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Text(
+                                text = "Offset: +${String.format(Locale.US, "%.1f", calib.splCalibration.splOffsetDb)} dB (${if (calib.splCalibration.isSplMode) "dBSPL Mode" else "dBFS Mode"})",
+                                color = Color(0xFF00E5FF),
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            SelectChip(
+                                label = "dBFS",
+                                isSelected = !calib.splCalibration.isSplMode,
+                                onClick = { onSetSplMode(false) }
+                            )
+                            SelectChip(
+                                label = "dB SPL",
+                                isSelected = calib.splCalibration.isSplMode,
+                                onClick = { onSetSplMode(true) }
+                            )
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Button(
+                            onClick = { showSplDialog = true },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00695C)),
+                            shape = RoundedCornerShape(4.dp),
+                            modifier = Modifier.weight(1f).height(32.dp)
+                        ) {
+                            Text("CALIBRATE TO REF METER", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                        }
+
+                        Button(
+                            onClick = { onCalibrateSpl(94.0f) },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF263238)),
+                            shape = RoundedCornerShape(4.dp),
+                            modifier = Modifier.weight(0.5f).height(32.dp)
+                        ) {
+                            Text("94 dB", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                        }
+
+                        Button(
+                            onClick = { onCalibrateSpl(85.0f) },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF263238)),
+                            shape = RoundedCornerShape(4.dp),
+                            modifier = Modifier.weight(0.5f).height(32.dp)
+                        ) {
+                            Text("85 dB", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                        }
+                    }
+                }
+            }
+
+            // Tab 2: Target Curve Overlay & Delta Tracking
+            if (selectedTab == 2) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(Color(0xFF0D1117))
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text(
+                                text = "TARGET RESPONSE OVERLAY",
+                                color = Color(0xFFECEFF1),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Text(
+                                text = calib.targetCurve?.name ?: "None",
+                                color = Color(0xFFFFD54F),
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+
+                        Switch(
+                            checked = calib.isTargetCurveActive,
+                            onCheckedChange = { onSetTargetCurveActive(it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color(0xFFFFD54F),
+                                checkedTrackColor = Color(0xFFB58900),
+                                uncheckedThumbColor = Color(0xFF78909C),
+                                uncheckedTrackColor = Color(0xFF263238)
+                            )
+                        )
+                    }
+
+                    // Preset Chips
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        SelectChip(
+                            label = "FLAT (0 dB)",
+                            isSelected = calib.targetCurve?.id == TargetCurve.FLAT.id,
+                            onClick = { onSetTargetCurve(TargetCurve.FLAT) }
+                        )
+                        SelectChip(
+                            label = "HARMAN (+9dB)",
+                            isSelected = calib.targetCurve?.id == TargetCurve.HARMAN_CAR.id,
+                            onClick = { onSetTargetCurve(TargetCurve.HARMAN_CAR) }
+                        )
+                        SelectChip(
+                            label = "AUDIO CONTROL (+6dB)",
+                            isSelected = calib.targetCurve?.id == TargetCurve.AUDIO_CONTROL_CAR.id,
+                            onClick = { onSetTargetCurve(TargetCurve.AUDIO_CONTROL_CAR) }
+                        )
+                    }
+
+                    // Real-Time Delta Readout
+                    val deltas = uiState.targetDeltas31Db
+                    if (calib.isTargetCurveActive && deltas != null) {
+                        val onTargetCount = deltas.count { kotlin.math.abs(it) <= 1.5f }
+                        val hotCount = deltas.count { it > 1.5f }
+                        val cutCount = deltas.count { it < -1.5f }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "ON TARGET (±1.5dB): $onTargetCount",
+                                color = Color(0xFF00E676),
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Text(
+                                text = "HOT: $hotCount",
+                                color = Color(0xFFFF5252),
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Text(
+                                text = "CUT: $cutCount",
+                                color = Color(0xFF40C4FF),
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Tab 3: Ambient Noise Floor Capture & Power Subtraction
+            if (selectedTab == 3) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(Color(0xFF0D1117))
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text(
+                                text = "POWER-DOMAIN NOISE SUBTRACTION",
+                                color = Color(0xFFECEFF1),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Text(
+                                text = if (calib.noiseFloor.isCaptured) "Noise profile active (31 bands)" else "No background noise captured",
+                                color = if (calib.noiseFloor.isCaptured) Color(0xFF00E676) else Color(0xFF90A4AE),
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+
+                        Switch(
+                            checked = calib.isNoiseSubtractionActive,
+                            onCheckedChange = { onSetNoiseSubtractionActive(it) },
+                            enabled = calib.noiseFloor.isCaptured,
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color(0xFF00E676),
+                                checkedTrackColor = Color(0xFF1B5E20),
+                                uncheckedThumbColor = Color(0xFF78909C),
+                                uncheckedTrackColor = Color(0xFF263238)
+                            )
+                        )
+                    }
+
+                    if (calib.isCapturingNoiseFloor) {
+                        LinearProgressIndicator(
+                            progress = { calib.noiseCaptureProgress },
+                            modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
+                            color = Color(0xFFFFB300),
+                            trackColor = Color(0xFF263238)
+                        )
+                        Text(
+                            text = "CAPTURING BACKGROUND SILENCE... KEEP AUDIO MUTED! (${String.format(Locale.US, "%.0f%%", calib.noiseCaptureProgress * 100f)})",
+                            color = Color(0xFFFFD54F),
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    } else {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Button(
+                                onClick = { onStartNoiseCapture() },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB71C1C)),
+                                shape = RoundedCornerShape(4.dp),
+                                modifier = Modifier.weight(1f).height(32.dp)
+                            ) {
+                                Text("CAPTURE NOISE (2s)", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                            }
+
+                            if (calib.noiseFloor.isCaptured) {
+                                Button(
+                                    onClick = { onClearNoiseFloor() },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF37474F)),
+                                    shape = RoundedCornerShape(4.dp),
+                                    modifier = Modifier.weight(0.5f).height(32.dp)
+                                ) {
+                                    Text("CLEAR", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                                }
+                            }
+                        }
+                    }
+
+                    Text(
+                        text = "Formula: 10*log10(10^(S/10) - 10^(N/10)). Live bands within 6 dB of noise floor are dimmed and marked as unreliable.",
+                        color = Color(0xFF78909C),
+                        fontSize = 8.5.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+        }
+    }
+
+    // Paste Custom Mic Cal Dialog
+    if (showPasteDialog) {
+        AlertDialog(
+            onDismissRequest = { showPasteDialog = false },
+            title = {
+                Text(
+                    text = "Import Calibration Data",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Paste frequency (Hz) and dB offset pairs (CSV, TSV, or whitespace delimited):",
+                        fontSize = 11.sp,
+                        color = Color(0xFFB0BEC5)
+                    )
+                    OutlinedTextField(
+                        value = pasteNameInput,
+                        onValueChange = { pasteNameInput = it },
+                        label = { Text("Curve Name", fontSize = 10.sp) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = pasteContentInput,
+                        onValueChange = { pasteContentInput = it },
+                        label = { Text("Paste Data (e.g. 1000  0.0)", fontSize = 10.sp) },
+                        placeholder = { Text("20.0  1.5\n100.0  0.2\n1000.0  0.0\n10000.0  -1.2") },
+                        modifier = Modifier.fillMaxWidth().height(140.dp),
+                        maxLines = 8
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val res = onLoadMicCurve(pasteNameInput, pasteContentInput)
+                        if (res.isSuccess) {
+                            showPasteDialog = false
+                            parseErrorMsg = null
+                        } else {
+                            parseErrorMsg = res.exceptionOrNull()?.message
+                        }
+                    }
+                ) {
+                    Text("APPLY", fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showPasteDialog = false }) {
+                    Text("CANCEL", fontFamily = FontFamily.Monospace)
+                }
+            }
+        )
+    }
+
+    // Calibrate dB SPL Reference Dialog
+    if (showSplDialog) {
+        AlertDialog(
+            onDismissRequest = { showSplDialog = false },
+            title = {
+                Text(
+                    text = "dB SPL Reference Calibration",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Play a steady reference tone (e.g., 1 kHz sine or pink noise) and measure with a handheld SPL meter.",
+                        fontSize = 11.sp,
+                        color = Color(0xFFB0BEC5)
+                    )
+                    Text(
+                        text = "Current Measured RMS: ${String.format(Locale.US, "%.1f", uiState.rmsDb)} dBFS",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF00E5FF),
+                        fontFamily = FontFamily.Monospace
+                    )
+                    OutlinedTextField(
+                        value = splTargetInput,
+                        onValueChange = { splTargetInput = it },
+                        label = { Text("Known Reference SPL (dBSPL)", fontSize = 10.sp) },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val targetSpl = splTargetInput.toFloatOrNull() ?: 85.0f
+                        onCalibrateSpl(targetSpl)
+                        showSplDialog = false
+                    }
+                ) {
+                    Text("CALIBRATE & ENABLE", fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSplDialog = false }) {
+                    Text("CANCEL", fontFamily = FontFamily.Monospace)
+                }
+            }
+        )
     }
 }
 

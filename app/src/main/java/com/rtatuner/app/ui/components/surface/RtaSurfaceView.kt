@@ -20,6 +20,7 @@ import com.rtatuner.app.ui.RtaDisplayConfig
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.abs
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
@@ -29,15 +30,14 @@ import kotlin.math.min
  *
  * Implements:
  * - Hardware-accelerated Canvas rendering (`lockHardwareCanvas`) on a dedicated thread (~60 FPS)
- * - Strict plot area gutters with hard canvas clipping (`canvas.clipRect`) to prevent bars
- *   from obscuring dB or frequency axis labels
+ * - Strict plot area gutters with hard canvas clipping (`canvas.clipRect`)
  * - Boundary-clamped log-frequency labels preventing clipping of low-frequency (20/25/31.5Hz) markers
  * - Continuous log-frequency raw FFT curve
- * - Configurable temporal Exponential Moving Average (EMA) smoothing
- * - Per-band peak-hold ballistics with linear decay
- * - User-adjustable dB dynamic range
+ * - Target curve overlay line (Harman, Flat, House curve) with continuous interpolation
+ * - Per-band target delta indicators (On-target green dot, Hot red chevron, Cut blue chevron)
+ * - Power-domain noise floor subtraction: visual dimming and marking of unreliable bands (SNR < 6 dB)
+ * - Seamless dBFS relative mode vs calibrated dB SPL mode
  * - Zero allocations inside the hot draw path
- * - Isolated pure-draw latency profiling decoupled from display VSYNC wait times
  */
 class RtaSurfaceView @JvmOverloads constructor(
     context: Context,
@@ -51,9 +51,9 @@ class RtaSurfaceView @JvmOverloads constructor(
         const val LOG_SPAN = 3.0f // log10(20000 / 20) = 3.0
 
         // Gutter layout dimensions in pixels
-        const val LEFT_GUTTER_PX = 46.0f
+        const val LEFT_GUTTER_PX = 48.0f
         const val BOTTOM_GUTTER_PX = 30.0f
-        const val TOP_GUTTER_PX = 8.0f
+        const val TOP_GUTTER_PX = 12.0f
         const val RIGHT_GUTTER_PX = 8.0f
 
         val OCTAVE_GRID_FREQS = floatArrayOf(
@@ -85,13 +85,17 @@ class RtaSurfaceView @JvmOverloads constructor(
     fun updateSpectralData(
         octave31Db: FloatArray,
         rawFftDb: FloatArray,
-        binResolutionHz: Float
+        binResolutionHz: Float,
+        unreliableBands: BooleanArray? = null,
+        targetDeltas31Db: FloatArray? = null
     ) {
         currentPayload.set(
             SpectralPayload(
                 octave31Db = octave31Db,
                 rawFftDb = rawFftDb,
-                binResolutionHz = binResolutionHz
+                binResolutionHz = binResolutionHz,
+                unreliableBands = unreliableBands,
+                targetDeltas31Db = targetDeltas31Db
             )
         )
     }
@@ -175,7 +179,18 @@ class RtaSurfaceView @JvmOverloads constructor(
             typeface = Typeface.MONOSPACE
             isAntiAlias = true
         }
+        private val gutterHeaderPaint = Paint().apply {
+            color = Color.parseColor("#00E676")
+            textSize = 18f
+            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            isAntiAlias = true
+        }
         private val barPaint = Paint().apply { isAntiAlias = false }
+        private val dimmedBarPaint = Paint().apply {
+            color = Color.parseColor("#37474F")
+            alpha = 110 // Dimmed for bands near noise floor
+            isAntiAlias = false
+        }
         private val rawLinePaint = Paint().apply {
             style = Paint.Style.STROKE
             strokeWidth = 2.5f
@@ -186,7 +201,35 @@ class RtaSurfaceView @JvmOverloads constructor(
             strokeWidth = 4.0f
             isAntiAlias = true
         }
+        private val unreliableTickPaint = Paint().apply {
+            color = Color.parseColor("#FFB74D") // Light Amber warning
+            strokeWidth = 3.0f
+            isAntiAlias = true
+        }
+        private val targetCurvePaint = Paint().apply {
+            color = Color.parseColor("#FFD600") // Bright Gold
+            strokeWidth = 3.0f
+            style = Paint.Style.STROKE
+            isAntiAlias = true
+        }
+        private val deltaOkPaint = Paint().apply {
+            color = Color.parseColor("#00E676")
+            style = Paint.Style.FILL
+            isAntiAlias = true
+        }
+        private val deltaHotPaint = Paint().apply {
+            color = Color.parseColor("#FF5252")
+            strokeWidth = 2.5f
+            isAntiAlias = true
+        }
+        private val deltaCutPaint = Paint().apply {
+            color = Color.parseColor("#40C4FF")
+            strokeWidth = 2.5f
+            isAntiAlias = true
+        }
+
         private val rawPath = Path()
+        private val targetPath = Path()
 
         // Telemetry counters
         private var frameCount = 0
@@ -208,10 +251,10 @@ class RtaSurfaceView @JvmOverloads constructor(
             val gradientShader = LinearGradient(
                 0f, plotTop, 0f, plotBottom,
                 intArrayOf(
-                    Color.parseColor("#FF1744"), // 0 dBFS Red
-                    Color.parseColor("#FF9100"), // -12 dBFS Orange
-                    Color.parseColor("#FFEA00"), // -24 dBFS Yellow
-                    Color.parseColor("#00E676"), // -48 dBFS Green
+                    Color.parseColor("#FF1744"), // 0 dBFS / High SPL Red
+                    Color.parseColor("#FF9100"), // Orange
+                    Color.parseColor("#FFEA00"), // Yellow
+                    Color.parseColor("#00E676"), // Green
                     Color.parseColor("#00B0FF")  // Floor Blue
                 ),
                 floatArrayOf(0.0f, 0.15f, 0.30f, 0.60f, 1.0f),
@@ -265,7 +308,6 @@ class RtaSurfaceView @JvmOverloads constructor(
                 var pureDrawDurationUs = 0L
 
                 try {
-                    // lockHardwareCanvas() leverages GPU Skia rendering on API 26+
                     canvas = try {
                         surfaceHolder.lockHardwareCanvas()
                     } catch (e: Exception) {
@@ -318,22 +360,39 @@ class RtaSurfaceView @JvmOverloads constructor(
             nowMs: Long
         ) {
             val alpha = config.emaPreset.alpha
+            val rawSpl = if (config.isSplMode) config.splOffsetDb else 0.0f
+            val splOffset = if (rawSpl.isNaN() || rawSpl.isInfinite()) 0.0f else rawSpl
+            val minDb = config.minDb + splOffset
 
             // Update 31-Band EMA Smoothing & Peak Hold
             for (i in 0 until Iso31Bands.NUM_BANDS) {
-                val rawVal = if (i < payload.octave31Db.size) payload.octave31Db[i] else config.minDb
-                val smoothed = (alpha * rawVal) + ((1.0f - alpha) * smoothedOctave[i])
-                smoothedOctave[i] = smoothed
+                val inputVal = if (i < payload.octave31Db.size) payload.octave31Db[i] else minDb
+                val rawVal = if (inputVal.isNaN() || inputVal.isInfinite()) minDb else inputVal
+
+                if (smoothedOctave[i].isNaN() || smoothedOctave[i].isInfinite()) {
+                    smoothedOctave[i] = rawVal
+                } else {
+                    smoothedOctave[i] = (alpha * rawVal) + ((1.0f - alpha) * smoothedOctave[i])
+                }
+                if (smoothedOctave[i].isNaN() || smoothedOctave[i].isInfinite()) {
+                    smoothedOctave[i] = minDb
+                }
 
                 // Peak hold logic
-                if (smoothed >= peakHoldOctave[i]) {
-                    peakHoldOctave[i] = smoothed
+                if (peakHoldOctave[i].isNaN() || peakHoldOctave[i].isInfinite()) {
+                    peakHoldOctave[i] = smoothedOctave[i]
+                    peakHoldTimeMs[i] = nowMs
+                } else if (smoothedOctave[i] >= peakHoldOctave[i]) {
+                    peakHoldOctave[i] = smoothedOctave[i]
                     peakHoldTimeMs[i] = nowMs
                 } else {
                     val timeSincePeak = nowMs - peakHoldTimeMs[i]
                     if (timeSincePeak > config.peakHoldDurationMs) {
                         val decayed = peakHoldOctave[i] - (config.peakDecayRateDbPerSec * dtSec)
-                        peakHoldOctave[i] = max(config.minDb, max(smoothed, decayed))
+                        peakHoldOctave[i] = max(minDb, max(smoothedOctave[i], decayed))
+                        if (peakHoldOctave[i].isNaN() || peakHoldOctave[i].isInfinite()) {
+                            peakHoldOctave[i] = minDb
+                        }
                     }
                 }
             }
@@ -343,10 +402,24 @@ class RtaSurfaceView @JvmOverloads constructor(
                 val rawSize = payload.rawFftDb.size
                 if (smoothedRawFft == null || smoothedRawFft!!.size != rawSize) {
                     smoothedRawFft = payload.rawFftDb.clone()
+                    smoothedRawFft?.let { arr ->
+                        for (k in arr.indices) {
+                            if (arr[k].isNaN() || arr[k].isInfinite()) arr[k] = minDb
+                        }
+                    }
                 } else {
                     val sArr = smoothedRawFft!!
                     for (k in 0 until rawSize) {
-                        sArr[k] = (alpha * payload.rawFftDb[k]) + ((1.0f - alpha) * sArr[k])
+                        val rawK = payload.rawFftDb[k]
+                        val safeK = if (rawK.isNaN() || rawK.isInfinite()) minDb else rawK
+                        if (sArr[k].isNaN() || sArr[k].isInfinite()) {
+                            sArr[k] = safeK
+                        } else {
+                            sArr[k] = (alpha * safeK) + ((1.0f - alpha) * sArr[k])
+                        }
+                        if (sArr[k].isNaN() || sArr[k].isInfinite()) {
+                            sArr[k] = minDb
+                        }
                     }
                 }
             }
@@ -355,24 +428,33 @@ class RtaSurfaceView @JvmOverloads constructor(
         private fun drawFrame(canvas: Canvas, config: RtaDisplayConfig) {
             val w = surfaceWidth.toFloat()
             val h = surfaceHeight.toFloat()
-            val minDb = config.minDb
-            val maxDb = config.maxDb
+
+            val rawSpl = if (config.isSplMode) config.splOffsetDb else 0.0f
+            val splOffset = if (rawSpl.isNaN() || rawSpl.isInfinite()) 0.0f else rawSpl
+            val minDb = config.minDb + splOffset
+            val maxDb = config.maxDb + splOffset
             val dbRange = maxDb - minDb
+
+            val payload = currentPayload.get()
+            val unreliableBands = payload?.unreliableBands
+            val targetDeltas = payload?.targetDeltas31Db
 
             // 1. Draw Overall Background
             canvas.drawRect(0f, 0f, w, h, bgPaint)
 
             // 2. Draw Plot Area Gridlines (behind spectrum content)
-            val dbSteps = when {
-                dbRange <= 60f -> floatArrayOf(0f, -12f, -24f, -36f, -48f, -60f)
-                dbRange <= 80f -> floatArrayOf(0f, -12f, -24f, -36f, -48f, -60f, -72f, -80f)
+            val nominalSpan = config.maxDb - config.minDb
+            val nominalSteps = when {
+                nominalSpan <= 60f -> floatArrayOf(0f, -12f, -24f, -36f, -48f, -60f)
+                nominalSpan <= 80f -> floatArrayOf(0f, -12f, -24f, -36f, -48f, -60f, -72f, -80f)
                 else -> floatArrayOf(0f, -12f, -24f, -36f, -48f, -60f, -72f, -84f, -90f)
             }
 
             // Horizontal dB Gridlines across the plot area
-            for (db in dbSteps) {
+            for (step in nominalSteps) {
+                val db = maxDb + step // in dBFS this is step; in SPL it is maxDb + step
                 val y = plotTop + plotHeight * ((maxDb - db) / dbRange)
-                val paint = if (db == 0f) octaveGridPaint else gridLinePaint
+                val paint = if (step == 0f) octaveGridPaint else gridLinePaint
                 canvas.drawLine(plotLeft, y, plotRight, y, paint)
             }
 
@@ -384,33 +466,68 @@ class RtaSurfaceView @JvmOverloads constructor(
             }
 
             // 3. Draw Spectrum Content with Hard Canvas Clipping
-            // This guarantees bars and curves can NEVER bleed into or paint over the gutters
             canvas.save()
             canvas.clipRect(plotLeft, plotTop, plotRight, plotBottom)
 
             if (config.displayMode == FftDisplayMode.OCTAVE_1_3) {
                 // --- 1/3-Octave Log-Spaced Bars ---
                 for (i in 0 until Iso31Bands.NUM_BANDS) {
-                    val db = smoothedOctave[i].coerceIn(minDb, maxDb)
+                    val rawOctave = smoothedOctave[i]
+                    val safeOctave = if (rawOctave.isNaN() || rawOctave.isInfinite()) minDb else rawOctave
+                    val db = safeOctave.coerceIn(minDb, maxDb)
                     val barHeight = plotHeight * ((db - minDb) / dbRange)
                     val barTop = plotBottom - barHeight
 
                     val left = barLefts[i]
                     val right = barRights[i]
+                    val isUnreliable = unreliableBands?.getOrNull(i) == true
 
-                    // Draw vertical gradient bar (from barTop down to plotBottom)
+                    // Draw bar (dimmed if within 6 dB of noise floor)
                     if (barHeight > 0f) {
-                        canvas.drawRect(left, barTop, right, plotBottom, barPaint)
+                        val paint = if (isUnreliable) dimmedBarPaint else barPaint
+                        canvas.drawRect(left, barTop, right, plotBottom, paint)
                     }
 
                     // Draw Peak-Hold horizontal tick
-                    val peakDb = peakHoldOctave[i].coerceIn(minDb, maxDb)
+                    val rawPeak = peakHoldOctave[i]
+                    val safePeak = if (rawPeak.isNaN() || rawPeak.isInfinite()) minDb else rawPeak
+                    val peakDb = safePeak.coerceIn(minDb, maxDb)
                     val peakY = plotTop + plotHeight * ((maxDb - peakDb) / dbRange)
-                    canvas.drawLine(left, peakY, right, peakY, peakTickPaint)
+                    val peakPaint = if (isUnreliable) unreliableTickPaint else peakTickPaint
+                    canvas.drawLine(left, peakY, right, peakY, peakPaint)
+
+                    // Draw noise unreliability warning tick at the base of the bar
+                    if (isUnreliable) {
+                        canvas.drawLine(left, plotBottom - 2f, right, plotBottom - 2f, unreliableTickPaint)
+                    }
+
+                    // Draw per-band target delta indicator if target curve is active
+                    if (targetDeltas != null && i < targetDeltas.size) {
+                        val rawDelta = targetDeltas[i]
+                        val delta = if (rawDelta.isNaN() || rawDelta.isInfinite()) 0.0f else rawDelta
+                        val centerX = (left + right) / 2f
+                        val deltaY = (barTop - 6f).coerceIn(plotTop + 4f, plotBottom - 6f)
+
+                        when {
+                            abs(delta) <= 1.5f -> {
+                                // Within +/-1.5 dB: Green dot
+                                canvas.drawCircle(centerX, deltaY, 2.5f, deltaOkPaint)
+                            }
+                            delta > 1.5f -> {
+                                // Hot > +1.5 dB: Red up chevron
+                                canvas.drawLine(centerX - 3f, deltaY + 2f, centerX, deltaY - 2f, deltaHotPaint)
+                                canvas.drawLine(centerX, deltaY - 2f, centerX + 3f, deltaY + 2f, deltaHotPaint)
+                            }
+                            else -> {
+                                // Cut < -1.5 dB: Blue down chevron
+                                canvas.drawLine(centerX - 3f, deltaY - 2f, centerX, deltaY + 2f, deltaCutPaint)
+                                canvas.drawLine(centerX, deltaY + 2f, centerX + 3f, deltaY - 2f, deltaCutPaint)
+                            }
+                        }
+                    }
                 }
             } else {
                 // --- Continuous Log-Frequency Raw FFT Curve ---
-                val payload = currentPayload.get()
                 val rawFft = smoothedRawFft ?: payload?.rawFftDb
                 val resHz = payload?.binResolutionHz ?: 23.4375f
 
@@ -422,7 +539,9 @@ class RtaSurfaceView @JvmOverloads constructor(
                         val freq = k * resHz
                         if (freq in MIN_FREQ_HZ..MAX_FREQ_HZ) {
                             val x = freqToPlotX(freq)
-                            val db = rawFft[k].coerceIn(minDb, maxDb)
+                            val rawDb = rawFft[k]
+                            val safeDb = if (rawDb.isNaN() || rawDb.isInfinite()) minDb else rawDb
+                            val db = safeDb.coerceIn(minDb, maxDb)
                             val y = plotTop + plotHeight * ((maxDb - db) / dbRange)
 
                             if (!started) {
@@ -436,20 +555,58 @@ class RtaSurfaceView @JvmOverloads constructor(
                     canvas.drawPath(rawPath, rawLinePaint)
                 }
             }
+
+            // Draw Target Curve Overlay Line if active
+            if (config.isTargetCurveActive && config.targetCurve != null) {
+                targetPath.reset()
+                var targetStarted = false
+                val tCurve = config.targetCurve!!
+                val targetBaseline = if (config.isSplMode) {
+                    config.targetBaselineDb + splOffset
+                } else {
+                    config.targetBaselineDb
+                }
+
+                for (i in 0 until Iso31Bands.NUM_BANDS) {
+                    val f = Iso31Bands.CENTER_FREQUENCIES[i]
+                    val x = freqToPlotX(f)
+                    val curveDb = tCurve.getTargetDbAt(f)
+                    val safeCurveDb = if (curveDb.isNaN() || curveDb.isInfinite()) 0.0f else curveDb
+                    val targetVal = (targetBaseline + safeCurveDb).coerceIn(minDb, maxDb)
+                    val y = plotTop + plotHeight * ((maxDb - targetVal) / dbRange)
+
+                    if (!targetStarted) {
+                        targetPath.moveTo(x, y)
+                        targetStarted = true
+                    } else {
+                        targetPath.lineTo(x, y)
+                    }
+                }
+                canvas.drawPath(targetPath, targetCurvePaint)
+            }
+
             canvas.restore()
 
             // 4. Draw Gutter Overlays & Axis Dividers
-            // Clear gutters with an opaque background strip to ensure absolute visual isolation
             canvas.drawRect(0f, 0f, plotLeft, h, gutterBgPaint)
             canvas.drawRect(0f, plotBottom, w, h, gutterBgPaint)
             canvas.drawLine(plotLeft, plotTop, plotLeft, plotBottom, gutterDividerPaint)
             canvas.drawLine(plotLeft, plotBottom, plotRight, plotBottom, gutterDividerPaint)
 
-            // 5. Draw dB Scale Labels in Left Gutter
-            for (db in dbSteps) {
+            // 5. Draw dB / SPL Scale Labels in Left Gutter
+            // Mode Header (SPL / dBFS)
+            canvas.drawText(
+                if (config.isSplMode) "SPL" else "dBFS",
+                4f,
+                plotTop + 4f,
+                gutterHeaderPaint
+            )
+
+            for (step in nominalSteps) {
+                val db = maxDb + step
                 val y = plotTop + plotHeight * ((maxDb - db) / dbRange)
                 val label = String.format(Locale.US, "%3.0f", db)
-                canvas.drawText(label, 6f, max(plotTop + 14f, y + 6f), gridTextPaint)
+                canvas.drawText(label, 6f, max(plotTop + 18f, y + 6f), gridTextPaint)
             }
 
             // 6. Draw Frequency Axis Labels in Bottom Gutter with Edge Clamping
@@ -460,10 +617,8 @@ class RtaSurfaceView @JvmOverloads constructor(
                 val x = freqToPlotX(f)
                 val textWidth = gridTextPaint.measureText(label)
 
-                // Clamp label text so it is never clipped on the left (20/31.5Hz) or right (20kHz)
                 val textX = (x - (textWidth / 2f)).coerceIn(plotLeft, plotRight - textWidth)
 
-                // Skip overlapping labels on extremely narrow screens
                 if (textX >= lastDrawnRightX + 4f || i == 0) {
                     canvas.drawText(label, textX, h - 8f, gridTextPaint)
                     lastDrawnRightX = textX + textWidth
@@ -481,6 +636,8 @@ class RtaSurfaceView @JvmOverloads constructor(
     private class SpectralPayload(
         val octave31Db: FloatArray,
         val rawFftDb: FloatArray,
-        val binResolutionHz: Float
+        val binResolutionHz: Float,
+        val unreliableBands: BooleanArray? = null,
+        val targetDeltas31Db: FloatArray? = null
     )
 }

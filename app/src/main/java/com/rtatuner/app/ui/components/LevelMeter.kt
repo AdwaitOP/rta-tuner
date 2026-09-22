@@ -39,13 +39,25 @@ fun LevelMeter(
     peakHoldDb: Float? = null,
     minDb: Float = -90.0f,
     maxDb: Float = 0.0f,
+    isSplMode: Boolean = false,
     modifier: Modifier = Modifier
 ) {
-    val clampedLevel = levelDb.coerceIn(minDb, maxDb)
-    val fraction = ((clampedLevel - minDb) / (maxDb - minDb)).coerceIn(0f, 1f)
+    val safeMinDb = if (minDb.isNaN() || minDb.isInfinite()) -90.0f else minDb
+    val safeMaxDb = if (maxDb.isNaN() || maxDb.isInfinite()) 0.0f else maxDb
+    val span = kotlin.math.max(1.0f, safeMaxDb - safeMinDb)
 
-    val clampedPeakHold = peakHoldDb?.coerceIn(minDb, maxDb)
-    val peakHoldFraction = clampedPeakHold?.let { ((it - minDb) / (maxDb - minDb)).coerceIn(0f, 1f) }
+    // Clamps safely to floor (silence) on NaN/Infinity rather than ceiling
+    val safeLevel = if (levelDb.isNaN() || levelDb.isInfinite()) safeMinDb else levelDb.coerceIn(safeMinDb, safeMaxDb)
+    val fraction = ((safeLevel - safeMinDb) / span).coerceIn(0f, 1f)
+
+    val safePeakHold = if (peakHoldDb == null || peakHoldDb.isNaN() || peakHoldDb.isInfinite()) {
+        null
+    } else {
+        peakHoldDb.coerceIn(safeMinDb, safeMaxDb)
+    }
+    val peakHoldFraction = safePeakHold?.let { ((it - safeMinDb) / span).coerceIn(0f, 1f) }
+
+    val unitStr = if (isSplMode) "dBSPL" else "dBFS"
 
     Column(modifier = modifier.fillMaxWidth()) {
         Row(
@@ -61,8 +73,8 @@ fun LevelMeter(
                 fontFamily = FontFamily.Monospace
             )
             Text(
-                text = String.format(Locale.US, "%5.1f dBFS", clampedLevel),
-                color = if (clampedLevel >= -3f) Color(0xFFFF5252) else Color(0xFFECEFF1),
+                text = String.format(Locale.US, "%5.1f %s", safeLevel, unitStr),
+                color = if (safeLevel >= safeMaxDb - 3f) Color(0xFFFF5252) else Color(0xFFECEFF1),
                 fontSize = 13.sp,
                 fontWeight = FontWeight.Bold,
                 fontFamily = FontFamily.Monospace

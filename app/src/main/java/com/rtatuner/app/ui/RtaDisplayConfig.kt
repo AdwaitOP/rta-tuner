@@ -25,5 +25,11 @@ data class RtaDisplayConfig(
     val minDb: Float = -80.0f,
     val maxDb: Float = 0.0f,
     val peakHoldDurationMs: Long = 1200L,
-    val peakDecayRateDbPerSec: Float = 25.0f
+    val peakDecayRateDbPerSec: Float = 25.0f,
+    val isSplMode: Boolean = false,
+    val splOffsetDb: Float = 0.0f,
+    val isTargetCurveActive: Boolean = false,
+    val targetCurve: com.rtatuner.app.core.calibration.TargetCurve? = null,
+    val targetBaselineDb: Float = -20.0f
 )
+

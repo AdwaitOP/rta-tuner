@@ -57,10 +57,13 @@ object AudioMath {
 
     /**
      * Converts a normalized linear amplitude [0.0..1.0] to decibels relative to Full Scale (dBFS).
+     * Strictly guards against NaN and Infinity, clamping safely to silence [MIN_DB_FS].
      */
     fun linearToDbFs(linear: Float): Float {
-        if (linear <= EPSILON) return MIN_DB_FS
+        if (linear.isNaN() || linear <= EPSILON) return MIN_DB_FS
+        if (linear.isInfinite()) return if (linear > 0f) 0.0f else MIN_DB_FS
         val db = 20.0f * log10(linear)
+        if (db.isNaN() || db.isInfinite()) return MIN_DB_FS
         return max(MIN_DB_FS, db)
     }
 
@@ -108,4 +111,59 @@ object AudioMath {
         }
         return buffer
     }
+
+    /**
+     * Result of power-domain noise subtraction.
+     */
+    data class NoiseSubtractionResult(
+        val correctedDb: Float,
+        val isUnreliable: Boolean, // True if SNR (signalDb - noiseDb) < 6.0 dB
+        val isBelowFloor: Boolean  // True if signalDb <= noiseDb
+    )
+
+    /**
+     * Subtracts captured ambient noise floor from live signal in the linear power domain:
+     * P_clean = max(epsilon, 10^(signal/10) - 10^(noise/10))
+     *
+     * Handles edge cases cleanly:
+     * - If signal or noise is NaN or Infinite: returns minFloorDb safely.
+     * - If signal <= noise: returns minFloorDb with isBelowFloor = true and isUnreliable = true.
+     * - If signal - noise < 6.0 dB: returns corrected dB with isUnreliable = true (SNR is low).
+     * - If signal - noise >= 6.0 dB: returns corrected dB with isUnreliable = false (reliable signal).
+     */
+    fun subtractNoiseFloor(
+        signalDb: Float,
+        noiseDb: Float,
+        minFloorDb: Float = MIN_DB_FS
+    ): NoiseSubtractionResult {
+        if (signalDb.isNaN() || noiseDb.isNaN() || signalDb.isInfinite() || noiseDb.isInfinite() || signalDb <= noiseDb) {
+            return NoiseSubtractionResult(
+                correctedDb = minFloorDb,
+                isUnreliable = true,
+                isBelowFloor = true
+            )
+        }
+
+        val snrDb = signalDb - noiseDb
+        val isUnreliable = snrDb < 6.0f
+
+        // Convert to linear power: P = 10^(dB / 10)
+        val pSignal = Math.pow(10.0, signalDb / 10.0)
+        val pNoise = Math.pow(10.0, noiseDb / 10.0)
+        val pClean = pSignal - pNoise
+
+        val corrected = if (pClean > 1e-12 && !pClean.isNaN() && !pClean.isInfinite()) {
+            val db = (10.0 * log10(pClean)).toFloat()
+            if (db.isNaN() || db.isInfinite()) minFloorDb else db.coerceAtLeast(minFloorDb)
+        } else {
+            minFloorDb
+        }
+
+        return NoiseSubtractionResult(
+            correctedDb = corrected,
+            isUnreliable = isUnreliable,
+            isBelowFloor = false
+        )
+    }
 }
+
