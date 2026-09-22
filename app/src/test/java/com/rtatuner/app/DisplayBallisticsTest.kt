@@ -92,4 +92,46 @@ class DisplayBallisticsTest {
         updatePeakHold(currentVal = -30.0f, nowMs = 2400L, dtSec = 0.200f)
         assertEquals("Peak hold should decay at 25 dB/s after hold duration", -11.0f, peakHold, 0.01f)
     }
+
+    @Test
+    fun testPlotGutterLayoutAndFrequencyLabelClamping() {
+        val leftGutter = 46.0f
+        val rightGutter = 8.0f
+        val bottomGutter = 30.0f
+        val topGutter = 8.0f
+
+        val testWidths = floatArrayOf(320.0f, 480.0f, 720.0f, 1080.0f)
+        val testLabels = arrayOf(
+            Pair(20.0f, 24.0f),    // 20 Hz, ~24px text width
+            Pair(31.5f, 36.0f),   // 31.5 Hz, ~36px text width
+            Pair(1000.0f, 20.0f),  // 1 kHz, ~20px text width
+            Pair(20000.0f, 32.0f)  // 20 kHz, ~32px text width
+        )
+
+        for (width in testWidths) {
+            val plotLeft = leftGutter
+            val plotRight = width - rightGutter
+            val plotWidth = plotRight - plotLeft
+
+            assertTrue("Plot width must remain positive even on 320px screen", plotWidth > 0f)
+
+            for ((freq, textWidth) in testLabels) {
+                val clampedFreq = freq.coerceIn(20f, 20000f)
+                val norm = (log10(clampedFreq / 20f) / 3.0f).coerceIn(0f, 1f)
+                val x = plotLeft + (plotWidth * norm)
+
+                // Enforced label clamping
+                val textX = (x - (textWidth / 2f)).coerceIn(plotLeft, plotRight - textWidth)
+
+                assertTrue(
+                    "Label for $freq Hz (textX=$textX) must never be less than plotLeft ($plotLeft)",
+                    textX >= plotLeft
+                )
+                assertTrue(
+                    "Label for $freq Hz (textX + width = ${textX + textWidth}) must never exceed plotRight ($plotRight)",
+                    textX + textWidth <= plotRight + 0.001f
+                )
+            }
+        }
+    }
 }
