@@ -1,0 +1,63 @@
+# Built application files
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# Files for the ART/Dalvik VM
+*.dex
+
+# Java class files
+*.class
+
+# Generated files & build directories
+bin/
+gen/
+out/
+build/
+/build/
+app/build/
+/app/build/
+
+# Gradle files & caches
+.gradle/
+/.gradle/
+
+# Local configuration file (SDK paths, local properties)
+local.properties
+
+# Log Files
+*.log
+
+# Android Studio captures & navigation temp files
+captures/
+.navigation/
+
+# IntelliJ IDEA & Android Studio project files
+*.iml
+.idea/
+!.idea/codeStyles/
+!.idea/copyright/
+!.idea/vcs.xml
+!.idea/misc.xml
+!.idea/compiler.xml
+!.idea/modules.xml
+
+# Kotlin compiler caches
+.kotlin/
+
+# Keystore files
+*.jks
+*.keystore
+
+# External native build folders
+.cxx/
+.externalNativeBuild/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Explicitly keep Gradle Wrapper tracked
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
