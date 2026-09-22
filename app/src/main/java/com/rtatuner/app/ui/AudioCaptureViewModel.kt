@@ -18,6 +18,11 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.max
 
+import com.rtatuner.app.core.audio.SignalGenerator
+import com.rtatuner.app.core.audio.SignalGeneratorState
+import com.rtatuner.app.core.audio.SweepRangePreset
+import com.rtatuner.app.core.audio.GeneratorMode
+
 /**
  * ViewModel orchestrating audio capture lifecycle, display configuration, and UI state.
  */
@@ -31,18 +36,30 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
 
     private var currentWindowSize = 2048
     private var captureManager: AudioCaptureManager = createCaptureManager(currentWindowSize)
+    val signalGenerator: SignalGenerator = SignalGenerator(sampleRate = 48000)
 
     private val _uiState = MutableStateFlow(AudioCaptureUiState())
     val uiState: StateFlow<AudioCaptureUiState> = _uiState.asStateFlow()
 
     private var captureCollectorJob: Job? = null
+    private var generatorCollectorJob: Job? = null
     private var ballisticsJob: Job? = null
     private var peakHoldDb = AudioMath.MIN_DB_FS
     private var peakHoldTimestamp = 0L
 
     init {
         startCollectingCaptureState()
+        startCollectingGeneratorState()
         startBallisticsTicker()
+    }
+
+    private fun startCollectingGeneratorState() {
+        generatorCollectorJob?.cancel()
+        generatorCollectorJob = viewModelScope.launch {
+            signalGenerator.state.collect { genState ->
+                _uiState.value = _uiState.value.copy(generator = genState)
+            }
+        }
     }
 
     private fun createCaptureManager(windowSize: Int): AudioCaptureManager {
@@ -75,7 +92,8 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
                     diagnostics = mgrState.diagnostics.copy(
                         renderFps = _uiState.value.diagnostics.renderFps,
                         renderDrawTimeUs = _uiState.value.diagnostics.renderDrawTimeUs
-                    )
+                    ),
+                    generator = _uiState.value.generator
                 )
             }
         }
@@ -179,10 +197,48 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    // --- Stage 4 Test Signal Generator Controls ---
+
+    fun startPinkNoise() {
+        signalGenerator.startPinkNoise(_uiState.value.generator.outputLevelDb)
+    }
+
+    fun startSineSweep() {
+        val gen = _uiState.value.generator
+        signalGenerator.startSineSweep(
+            range = gen.sweepRange,
+            durationSec = gen.sweepDurationSec,
+            isLooping = gen.isSweepLooping,
+            levelDb = gen.outputLevelDb
+        )
+    }
+
+    fun stopGenerator() {
+        signalGenerator.stop()
+    }
+
+    fun setGeneratorVolume(levelDb: Float) {
+        signalGenerator.setOutputLevel(levelDb)
+    }
+
+    fun setSweepDuration(durationSec: Float) {
+        signalGenerator.setSweepDuration(durationSec)
+    }
+
+    fun setSweepRange(range: SweepRangePreset) {
+        signalGenerator.setSweepRange(range)
+    }
+
+    fun setSweepLooping(looping: Boolean) {
+        signalGenerator.setSweepLooping(looping)
+    }
+
     override fun onCleared() {
         super.onCleared()
         ballisticsJob?.cancel()
         captureCollectorJob?.cancel()
+        generatorCollectorJob?.cancel()
         captureManager.stopCapture()
+        signalGenerator.stop()
     }
 }

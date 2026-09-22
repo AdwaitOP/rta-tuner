@@ -25,20 +25,28 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import com.rtatuner.app.core.audio.GeneratorMode
+import com.rtatuner.app.core.audio.SweepRangePreset
+import com.rtatuner.app.core.audio.SignalGeneratorState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -143,6 +151,21 @@ fun DebugScreen(
                 }
             )
 
+            // Hardware Mic Noise Floor Limitation Notice
+            MicNoiseFloorNoticeCard()
+
+            // Stage 4 Test Signal Generator Card
+            SignalGeneratorCard(
+                state = uiState.generator,
+                onStartPinkNoise = { viewModel.startPinkNoise() },
+                onStartSineSweep = { viewModel.startSineSweep() },
+                onStop = { viewModel.stopGenerator() },
+                onSetVolume = { viewModel.setGeneratorVolume(it) },
+                onSetDuration = { viewModel.setSweepDuration(it) },
+                onSetRange = { viewModel.setSweepRange(it) },
+                onToggleLooping = { viewModel.setSweepLooping(it) }
+            )
+
             // Broadband Level Meters (Peak / RMS / Clip)
             LiveMetersCard(
                 peakDb = uiState.peakDb,
@@ -194,7 +217,7 @@ private fun HeaderSection(status: CaptureStatus) {
                     letterSpacing = 1.sp
                 )
                 Text(
-                    text = "STAGE 3 • SURFACEVIEW 60FPS DISPLAY",
+                    text = "STAGE 4 • TEST SIGNAL GENERATOR & 60FPS RTA",
                     color = Color(0xFF78909C),
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Bold,
@@ -963,3 +986,315 @@ private fun ControlsSection(
         }
     }
 }
+
+@Composable
+private fun MicNoiseFloorNoticeCard() {
+    Surface(
+        color = Color(0xFF101720),
+        shape = RoundedCornerShape(6.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1E2D3D))
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = Icons.Default.Info,
+                contentDescription = null,
+                tint = Color(0xFF4DD0E1),
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Text(
+                text = "Hardware note: Internal mic 1/f self-noise naturally elevates readings below ~200Hz. Subwoofer reference calibration is mic-limited until Stage 7 (USB measurement mic).",
+                color = Color(0xFF90A4AE),
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+                lineHeight = 15.sp
+            )
+        }
+    }
+}
+
+@Composable
+private fun SignalGeneratorCard(
+    state: SignalGeneratorState,
+    onStartPinkNoise: () -> Unit,
+    onStartSineSweep: () -> Unit,
+    onStop: () -> Unit,
+    onSetVolume: (Float) -> Unit,
+    onSetDuration: (Float) -> Unit,
+    onSetRange: (SweepRangePreset) -> Unit,
+    onToggleLooping: (Boolean) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF14171E)),
+        shape = RoundedCornerShape(8.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF2E3846))
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            // Header Row
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.VolumeUp,
+                        contentDescription = null,
+                        tint = if (state.isPlaying) Color(0xFF00E676) else Color(0xFF78909C),
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "TEST SIGNAL GENERATOR",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+
+                Surface(
+                    color = if (state.isPlaying) Color(0xFF1B5E20) else Color(0xFF263238),
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        if (state.isPlaying) Color(0xFF81C784) else Color(0xFF546E7A)
+                    )
+                ) {
+                    Text(
+                        text = if (state.isPlaying) state.mode.name else "MUTED",
+                        color = if (state.isPlaying) Color(0xFF81C784) else Color(0xFF90A4AE),
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                    )
+                }
+            }
+
+            // Signal Type Buttons
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Pink Noise Button
+                Button(
+                    onClick = onStartPinkNoise,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (state.mode == GeneratorMode.PINK_NOISE && state.isPlaying)
+                            Color(0xFFE91E63) else Color(0xFF1E232E)
+                    ),
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = Modifier.weight(1f).height(38.dp)
+                ) {
+                    Text(
+                        text = "PINK NOISE",
+                        color = if (state.mode == GeneratorMode.PINK_NOISE && state.isPlaying)
+                            Color.White else Color(0xFFB0BEC5),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+
+                // Sine Sweep Button
+                Button(
+                    onClick = onStartSineSweep,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (state.mode == GeneratorMode.SINE_SWEEP && state.isPlaying)
+                            Color(0xFF0288D1) else Color(0xFF1E232E)
+                    ),
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = Modifier.weight(1f).height(38.dp)
+                ) {
+                    Text(
+                        text = "SINE SWEEP",
+                        color = if (state.mode == GeneratorMode.SINE_SWEEP && state.isPlaying)
+                            Color.White else Color(0xFFB0BEC5),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+
+                // Stop / Mute Button
+                Button(
+                    onClick = onStop,
+                    enabled = state.isPlaying,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFFB71C1C),
+                        disabledContainerColor = Color(0xFF1E232E)
+                    ),
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = Modifier.width(68.dp).height(38.dp)
+                ) {
+                    Text(
+                        text = "STOP",
+                        color = if (state.isPlaying) Color.White else Color(0xFF546E7A),
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+
+            // Output Volume Slider Row
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = String.format(Locale.US, "LEVEL: %3.0f dBFS", state.outputLevelDb),
+                    color = Color(0xFF90A4AE),
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.width(115.dp)
+                )
+                Slider(
+                    value = state.outputLevelDb,
+                    onValueChange = onSetVolume,
+                    valueRange = -30f..0f,
+                    steps = 29,
+                    colors = SliderDefaults.colors(
+                        thumbColor = Color(0xFF00E676),
+                        activeTrackColor = Color(0xFF00E676),
+                        inactiveTrackColor = Color(0xFF263238)
+                    ),
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            // Sweep Configuration Controls (Only when in SINE_SWEEP mode or idle)
+            if (state.mode == GeneratorMode.SINE_SWEEP) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(Color(0xFF0A0C10))
+                        .padding(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    // Duration Selector
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "DURATION:",
+                            color = Color(0xFF78909C),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            listOf(2.5f, 5.0f, 10.0f).forEach { sec ->
+                                SelectChip(
+                                    label = "${sec}s",
+                                    isSelected = state.sweepDurationSec == sec,
+                                    onClick = { onSetDuration(sec) }
+                                )
+                            }
+                        }
+                    }
+
+                    // Sweep Range Selector
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "RANGE:",
+                            color = Color(0xFF78909C),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            SweepRangePreset.values().forEach { preset ->
+                                SelectChip(
+                                    label = when (preset) {
+                                        SweepRangePreset.FULL_SPECTRUM -> "FULL"
+                                        SweepRangePreset.SUB_BASS -> "BASS"
+                                        SweepRangePreset.MID_HIGH -> "MID/HIGH"
+                                    },
+                                    isSelected = state.sweepRange == preset,
+                                    onClick = { onSetRange(preset) }
+                                )
+                            }
+                        }
+                    }
+
+                    // Loop Toggle
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "PLAYBACK:",
+                            color = Color(0xFF78909C),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            SelectChip(
+                                label = "LOOP",
+                                isSelected = state.isSweepLooping,
+                                onClick = { onToggleLooping(true) }
+                            )
+                            SelectChip(
+                                label = "SINGLE",
+                                isSelected = !state.isSweepLooping,
+                                onClick = { onToggleLooping(false) }
+                            )
+                        }
+                    }
+
+                    // Sweep Live Progress & Frequency Telemetry
+                    if (state.isPlaying) {
+                        Spacer(modifier = Modifier.height(2.dp))
+                        LinearProgressIndicator(
+                            progress = { state.currentSweepProgress },
+                            modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
+                            color = Color(0xFF0288D1),
+                            trackColor = Color(0xFF1E2836)
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = String.format(Locale.US, "FREQ: %.0f Hz", state.currentSweepFreqHz),
+                                color = Color(0xFF81D4FA),
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = String.format(Locale.US, "PROGRESS: %.0f%%", state.currentSweepProgress * 100f),
+                                color = Color(0xFF81D4FA),
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+

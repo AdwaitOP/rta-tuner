@@ -63,7 +63,8 @@ data class AudioCaptureUiState(
     val displayConfig: RtaDisplayConfig = RtaDisplayConfig(),
     val octave31Db: FloatArray = FloatArray(Iso31Bands.NUM_BANDS) { -100f },
     val rawFftDb: FloatArray = FloatArray(1025) { -100f },
-    val diagnostics: AudioCaptureDiagnostics = AudioCaptureDiagnostics()
+    val diagnostics: AudioCaptureDiagnostics = AudioCaptureDiagnostics(),
+    val generator: SignalGeneratorState = SignalGeneratorState()
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -82,6 +83,7 @@ data class AudioCaptureUiState(
         if (!octave31Db.contentEquals(other.octave31Db)) return false
         if (!rawFftDb.contentEquals(other.rawFftDb)) return false
         if (diagnostics != other.diagnostics) return false
+        if (generator != other.generator) return false
 
         return true
     }
@@ -98,6 +100,7 @@ data class AudioCaptureUiState(
         result = 31 * result + octave31Db.contentHashCode()
         result = 31 * result + rawFftDb.contentHashCode()
         result = 31 * result + diagnostics.hashCode()
+        result = 31 * result + generator.hashCode()
         return result
     }
 }
