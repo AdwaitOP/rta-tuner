@@ -58,6 +58,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.rtatuner.app.core.audio.AudioCaptureUiState
@@ -863,6 +864,8 @@ private fun ContextBadge(label: String, color: Color) {
             color = color,
             fontSize = 9.sp,
             fontFamily = FontFamily.Monospace,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
             modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
         )
     }
@@ -880,7 +883,7 @@ private fun SessionTabButton(
             .clip(RoundedCornerShape(4.dp))
             .background(if (isSelected) Color(0xFF00E5FF) else Color.Transparent)
             .clickable { onClick() }
-            .padding(vertical = 6.dp),
+            .padding(horizontal = 6.dp, vertical = 6.dp),
         contentAlignment = Alignment.Center
     ) {
         Text(
@@ -888,7 +891,9 @@ private fun SessionTabButton(
             color = if (isSelected) Color.Black else Color(0xFF90A4AE),
             fontSize = 10.sp,
             fontWeight = FontWeight.Bold,
-            fontFamily = FontFamily.Monospace
+            fontFamily = FontFamily.Monospace,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
         )
     }
 }

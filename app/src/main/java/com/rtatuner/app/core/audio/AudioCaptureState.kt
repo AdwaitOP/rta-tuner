@@ -37,6 +37,13 @@ data class AudioCaptureDiagnostics(
     val detectedInputRate: Int? = null,
     val detectedOutputRate: Int? = null,
     val inputDeviceName: String = "Default Mic",
+    val requestedDeviceName: String = "Auto (System Default)",
+    val actualRoutedDeviceName: String = "Default Mic",
+    val actualRoutedDeviceType: String = "Built-in",
+    val isUsbDevice: Boolean = false,
+    val isRoutingMismatch: Boolean = false,
+    val isBluetoothBandwidthLimited: Boolean = false,
+    val bluetoothWarningText: String? = null,
     val windowSize: Int = 2048,
     val hopSize: Int = 1024,
     val bufferSizeInBytes: Int = 0,
@@ -67,7 +74,15 @@ data class AudioCaptureUiState(
     val generator: SignalGeneratorState = SignalGeneratorState(),
     val calibration: com.rtatuner.app.core.calibration.CalibrationUiState = com.rtatuner.app.core.calibration.CalibrationUiState(),
     val unreliableBands: BooleanArray = BooleanArray(Iso31Bands.NUM_BANDS) { false },
-    val targetDeltas31Db: FloatArray? = null
+    val targetDeltas31Db: FloatArray? = null,
+    val availableInputDevices: List<AudioInputDeviceInfo> = emptyList(),
+    val selectedDeviceId: Int? = null,
+    val routedDeviceId: Int? = null,
+    val deviceAttachedPrompt: AudioInputDeviceInfo? = null,
+    val isRoutingMismatch: Boolean = false,
+    val routingMismatchMessage: String? = null,
+    val isBluetoothBandwidthLimited: Boolean = false,
+    val bluetoothWarningText: String? = null
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -92,6 +107,14 @@ data class AudioCaptureUiState(
         if (targetDeltas31Db != null) {
             if (other.targetDeltas31Db == null || !targetDeltas31Db.contentEquals(other.targetDeltas31Db)) return false
         } else if (other.targetDeltas31Db != null) return false
+        if (availableInputDevices != other.availableInputDevices) return false
+        if (selectedDeviceId != other.selectedDeviceId) return false
+        if (routedDeviceId != other.routedDeviceId) return false
+        if (deviceAttachedPrompt != other.deviceAttachedPrompt) return false
+        if (isRoutingMismatch != other.isRoutingMismatch) return false
+        if (routingMismatchMessage != other.routingMismatchMessage) return false
+        if (isBluetoothBandwidthLimited != other.isBluetoothBandwidthLimited) return false
+        if (bluetoothWarningText != other.bluetoothWarningText) return false
 
         return true
     }
@@ -112,6 +135,14 @@ data class AudioCaptureUiState(
         result = 31 * result + calibration.hashCode()
         result = 31 * result + unreliableBands.contentHashCode()
         result = 31 * result + (targetDeltas31Db?.contentHashCode() ?: 0)
+        result = 31 * result + availableInputDevices.hashCode()
+        result = 31 * result + (selectedDeviceId ?: 0)
+        result = 31 * result + (routedDeviceId ?: 0)
+        result = 31 * result + (deviceAttachedPrompt?.hashCode() ?: 0)
+        result = 31 * result + isRoutingMismatch.hashCode()
+        result = 31 * result + (routingMismatchMessage?.hashCode() ?: 0)
+        result = 31 * result + isBluetoothBandwidthLimited.hashCode()
+        result = 31 * result + (bluetoothWarningText?.hashCode() ?: 0)
         return result
     }
 }

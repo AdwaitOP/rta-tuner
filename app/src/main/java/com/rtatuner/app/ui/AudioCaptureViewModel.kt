@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.rtatuner.app.core.audio.AudioCaptureConfig
 import com.rtatuner.app.core.audio.AudioCaptureManager
 import com.rtatuner.app.core.audio.AudioCaptureUiState
+import com.rtatuner.app.core.audio.AudioInputDeviceInfo
 import com.rtatuner.app.core.audio.AudioMath
 import com.rtatuner.app.core.audio.CaptureStatus
 import com.rtatuner.app.core.audio.FftDisplayMode
@@ -49,6 +50,7 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
     }
 
     private var currentWindowSize = 2048
+    private var preferredDeviceId: Int? = null
     private var captureManager: AudioCaptureManager = createCaptureManager(currentWindowSize)
     val signalGenerator: SignalGenerator = SignalGenerator(sampleRate = 48000)
     val calibrationManager: CalibrationManager = CalibrationManager(application)
@@ -113,7 +115,8 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
             context = getApplication<Application>().applicationContext,
             config = AudioCaptureConfig(
                 windowSize = windowSize,
-                hopSize = windowSize / 2
+                hopSize = windowSize / 2,
+                preferredDeviceId = preferredDeviceId
             )
         )
     }
@@ -282,7 +285,7 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
         }
 
         val wasRunning = _uiState.value.status == CaptureStatus.RUNNING
-        captureManager.stopCapture()
+        captureManager.release()
 
         currentWindowSize = newSize
         captureManager = createCaptureManager(newSize)
@@ -556,6 +559,34 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    // ==========================================
+    // STAGE 7: INPUT DEVICE SELECTION & HOTPLUG
+    // ==========================================
+
+    fun setPreferredInputDevice(deviceId: Int?) {
+        preferredDeviceId = deviceId
+        captureManager.setPreferredInputDevice(deviceId)
+    }
+
+    fun dismissDevicePrompt() {
+        captureManager.dismissDevicePrompt()
+    }
+
+    fun switchToDevice(device: AudioInputDeviceInfo) {
+        captureManager.dismissDevicePrompt()
+        setPreferredInputDevice(device.id)
+    }
+
+    fun revertToBuiltInMicAndRetry() {
+        val builtIn = _uiState.value.availableInputDevices.firstOrNull { it.isBuiltIn }
+        setPreferredInputDevice(builtIn?.id)
+        startCapture()
+    }
+
+    fun refreshInputDevices() {
+        captureManager.refreshInputDevices()
+    }
+
     override fun onCleared() {
         super.onCleared()
         ballisticsJob?.cancel()
@@ -563,7 +594,7 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
         generatorCollectorJob?.cancel()
         calibrationCollectorJob?.cancel()
         sessionsCollectorJob?.cancel()
-        captureManager.stopCapture()
+        captureManager.release()
         signalGenerator.stop()
     }
 }

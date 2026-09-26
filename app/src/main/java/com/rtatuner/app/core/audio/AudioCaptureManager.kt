@@ -2,6 +2,7 @@ package com.rtatuner.app.core.audio
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -60,13 +61,87 @@ class AudioCaptureManager(
     private var captureThread: Thread? = null
     private var audioRecord: AudioRecord? = null
 
+    private var activeConfig: AudioCaptureConfig = config
+    private var requestedTargetDevice: AudioDeviceInfo? = null
+    private var routingListener: AudioRecord.OnRoutingChangedListener? = null
+
+    private val deviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
+            Log.i(TAG, "Audio devices added: ${addedDevices?.size ?: 0}")
+            refreshInputDevices()
+            val externalInput = addedDevices?.firstOrNull { device ->
+                device.isSource && (
+                    device.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                    device.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+                    device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                    device.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                    device.type == AudioDeviceInfo.TYPE_LINE_ANALOG
+                )
+            }
+            if (externalInput != null && externalInput.id != activeConfig.preferredDeviceId) {
+                val inputInfo = AudioInputDeviceInfo.fromAudioDeviceInfo(externalInput)
+                _uiState.value = _uiState.value.copy(deviceAttachedPrompt = inputInfo)
+            }
+        }
+
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+            Log.i(TAG, "Audio devices removed: ${removedDevices?.size ?: 0}")
+            refreshInputDevices()
+            if (isRunning.get()) {
+                val currentRoutedDeviceId = _uiState.value.routedDeviceId
+                val targetDeviceId = activeConfig.preferredDeviceId
+                val removedActive = removedDevices?.firstOrNull { dev ->
+                    dev.id == targetDeviceId || dev.id == currentRoutedDeviceId
+                }
+                if (removedActive != null) {
+                    val name = removedActive.productName?.toString()?.takeIf { it.isNotBlank() } ?: "Active microphone"
+                    val msg = "$name was disconnected during active capture."
+                    Log.w(TAG, msg)
+                    notifyCaptureError(msg)
+                }
+            }
+        }
+    }
+
+    init {
+        try {
+            audioManager.registerAudioDeviceCallback(deviceCallback, android.os.Handler(android.os.Looper.getMainLooper()))
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register AudioDeviceCallback", e)
+        }
+        refreshInputDevices()
+    }
+
+    fun refreshInputDevices() {
+        try {
+            val devices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+            val selectedId = activeConfig.preferredDeviceId
+            val currentRoutedDeviceId = _uiState.value.routedDeviceId
+
+            val deviceList = devices.map { device ->
+                AudioInputDeviceInfo.fromAudioDeviceInfo(
+                    device = device,
+                    isSelected = (selectedId != null && device.id == selectedId) || (selectedId == null && device.type == AudioDeviceInfo.TYPE_BUILTIN_MIC),
+                    isCurrentlyRouted = currentRoutedDeviceId != null && device.id == currentRoutedDeviceId
+                )
+            }
+
+            _uiState.value = _uiState.value.copy(
+                availableInputDevices = deviceList,
+                selectedDeviceId = selectedId
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to query audio input devices", e)
+        }
+    }
+
     /**
      * Resolves the primary native sample rate for input capture.
      * Prioritizes active input device capabilities, verifies with output rate,
      * and logs warnings on discrepancy.
      */
     fun resolveSampleRate(): SampleRateResolution {
-        val detectedInputRate = detectInputDeviceSampleRate()
+        val detectedInputRate = detectInputDeviceSampleRate(activeConfig.preferredDeviceId)
         val detectedOutputRate = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toIntOrNull()
 
         // Log discrepancy if input and output rates do not match
@@ -78,7 +153,7 @@ class AudioCaptureManager(
             )
         }
 
-        val chosenRate = config.targetSampleRate
+        val chosenRate = activeConfig.targetSampleRate
             ?: detectedInputRate
             ?: detectedOutputRate
             ?: DEFAULT_SAMPLE_RATE
@@ -90,9 +165,22 @@ class AudioCaptureManager(
         )
     }
 
-    private fun detectInputDeviceSampleRate(): Int? {
+    private fun detectInputDeviceSampleRate(targetDeviceId: Int? = null): Int? {
         try {
             val inputDevices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+            if (targetDeviceId != null) {
+                val target = inputDevices.firstOrNull { it.id == targetDeviceId }
+                if (target != null) {
+                    val rates = target.sampleRates
+                    if (rates.isNotEmpty()) {
+                        if (rates.contains(DEFAULT_SAMPLE_RATE)) return DEFAULT_SAMPLE_RATE
+                        if (rates.contains(FALLBACK_SAMPLE_RATE)) return FALLBACK_SAMPLE_RATE
+                        val maxRate = rates.filter { it > 0 }.maxOrNull()
+                        if (maxRate != null) return maxRate
+                    }
+                }
+            }
+
             for (device in inputDevices) {
                 // Look for built-in mic, headset, or USB input
                 val rates = device.sampleRates
@@ -183,14 +271,14 @@ class AudioCaptureManager(
         }
 
         // 2. Compute safe hardware buffer size (must be at least 2x our FFT window to prevent overrun)
-        val windowSize = config.windowSize
-        val hopSize = config.hopSize
+        val windowSize = activeConfig.windowSize
+        val hopSize = activeConfig.hopSize
         val windowBytes = windowSize * 2 // 16-bit PCM = 2 bytes per sample
         val hardwareBufferSize = max(minBufferSize, windowBytes * 2)
 
         // 3. Negotiate AudioSource (Try UNPROCESSED -> Fallback to MIC)
         val sourceNegotiation = createAudioRecordWithFallback(
-            preferredSource = config.preferredAudioSource,
+            preferredSource = activeConfig.preferredAudioSource,
             sampleRate = sampleRate,
             bufferSizeInBytes = hardwareBufferSize
         )
@@ -209,7 +297,35 @@ class AudioCaptureManager(
         val activeSourceName = sourceNegotiation.sourceName
         audioRecord = record
 
-        val inputDeviceName = getPrimaryInputDeviceName()
+        // Look up target device and apply setPreferredDevice
+        val targetDevice = activeConfig.preferredDeviceId?.let { prefId ->
+            try {
+                audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.id == prefId }
+            } catch (e: Exception) {
+                null
+            }
+        }
+        requestedTargetDevice = targetDevice
+
+        if (targetDevice != null) {
+            val setSuccess = record.setPreferredDevice(targetDevice)
+            Log.i(TAG, "setPreferredDevice(${targetDevice.productName}, id=${targetDevice.id}) returned $setSuccess")
+        }
+
+        // Attach routing listener
+        routingListener = AudioRecord.OnRoutingChangedListener { audRecord ->
+            updateActualRoutedDevice(audRecord.routedDevice, requestedTargetDevice)
+        }
+        try {
+            record.addOnRoutingChangedListener(
+                routingListener,
+                android.os.Handler(android.os.Looper.getMainLooper())
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register OnRoutingChangedListener", e)
+        }
+
+        val inputDeviceName = targetDevice?.productName?.toString() ?: getPrimaryInputDeviceName()
 
         _uiState.value = _uiState.value.copy(
             status = CaptureStatus.RUNNING,
@@ -221,6 +337,8 @@ class AudioCaptureManager(
                 detectedInputRate = rateResolution.detectedInputRate,
                 detectedOutputRate = rateResolution.detectedOutputRate,
                 inputDeviceName = inputDeviceName,
+                requestedDeviceName = targetDevice?.productName?.toString() ?: "Auto (System Default)",
+                actualRoutedDeviceName = inputDeviceName,
                 windowSize = windowSize,
                 hopSize = hopSize,
                 bufferSizeInBytes = hardwareBufferSize,
@@ -262,6 +380,7 @@ class AudioCaptureManager(
                 notifyCaptureError("AudioRecord failed to enter RECORDING state (${record.recordingState})")
                 return
             }
+            updateActualRoutedDevice(record.routedDevice, requestedTargetDevice)
         } catch (e: Exception) {
             Log.e(TAG, "Exception starting AudioRecord", e)
             notifyCaptureError("Failed to start audio recording: ${e.message}")
@@ -407,6 +526,14 @@ class AudioCaptureManager(
     private fun cleanupAudioRecord() {
         try {
             audioRecord?.let { record ->
+                routingListener?.let {
+                    try {
+                        record.removeOnRoutingChangedListener(it)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Error removing routing listener", e)
+                    }
+                }
+                routingListener = null
                 if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
                     record.stop()
                 }
@@ -416,6 +543,94 @@ class AudioCaptureManager(
             Log.w(TAG, "Exception releasing AudioRecord", e)
         } finally {
             audioRecord = null
+            routingListener = null
+        }
+    }
+
+    private fun updateActualRoutedDevice(routedDevice: AudioDeviceInfo?, targetDevice: AudioDeviceInfo?) {
+        val actualName = routedDevice?.productName?.toString()?.takeIf { it.isNotBlank() }
+            ?: if (routedDevice != null) {
+                AudioInputDeviceInfo.classifyDevice(routedDevice.type).second
+            } else {
+                "Default Mic (Auto)"
+            }
+        val actualType = routedDevice?.let { AudioInputDeviceInfo.classifyDevice(it.type).second } ?: "Built-in"
+        val isUsb = routedDevice?.let {
+            it.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+            it.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+            it.type == AudioDeviceInfo.TYPE_LINE_DIGITAL
+        } ?: false
+
+        val isMismatch = if (targetDevice != null && routedDevice != null) {
+            targetDevice.id != routedDevice.id
+        } else {
+            false
+        }
+
+        val mismatchMessage = if (isMismatch && targetDevice != null) {
+            val targetName = targetDevice.productName?.toString()?.takeIf { it.isNotBlank() } ?: "Device #${targetDevice.id}"
+            "Requested '$targetName' but audio is routed to '$actualName'."
+        } else null
+
+        val isBtLimited = routedDevice?.let { AudioInputDeviceInfo.isBandwidthLimited(it) } ?: false
+        val btWarning = if (isBtLimited) {
+            "Bluetooth SCO input active: voice bandwidth is limited (~8-16kHz). High frequencies above ~4-8kHz will be truncated."
+        } else null
+
+        val routedId = routedDevice?.id
+        val selectedId = activeConfig.preferredDeviceId
+
+        _uiState.value = _uiState.value.let { current ->
+            current.copy(
+                routedDeviceId = routedId,
+                selectedDeviceId = selectedId,
+                isRoutingMismatch = isMismatch,
+                routingMismatchMessage = mismatchMessage,
+                isBluetoothBandwidthLimited = isBtLimited,
+                bluetoothWarningText = btWarning,
+                availableInputDevices = current.availableInputDevices.map { dev ->
+                    dev.copy(
+                        isSelected = (selectedId != null && dev.id == selectedId) || (selectedId == null && dev.isBuiltIn),
+                        isCurrentlyRouted = routedId != null && dev.id == routedId
+                    )
+                },
+                diagnostics = current.diagnostics.copy(
+                    inputDeviceName = actualName,
+                    requestedDeviceName = targetDevice?.productName?.toString() ?: "Auto (System Default)",
+                    actualRoutedDeviceName = actualName,
+                    actualRoutedDeviceType = actualType,
+                    isUsbDevice = isUsb,
+                    isRoutingMismatch = isMismatch,
+                    isBluetoothBandwidthLimited = isBtLimited,
+                    bluetoothWarningText = btWarning
+                )
+            )
+        }
+        Log.i(TAG, "Active routed input device: $actualName (type: $actualType, id: $routedId), mismatch: $isMismatch, BT limited: $isBtLimited")
+    }
+
+    fun setPreferredInputDevice(deviceId: Int?) {
+        activeConfig = activeConfig.copy(preferredDeviceId = deviceId)
+        val wasRunning = isRunning.get()
+        if (wasRunning) {
+            stopCapture()
+        }
+        refreshInputDevices()
+        if (wasRunning) {
+            startCapture()
+        }
+    }
+
+    fun dismissDevicePrompt() {
+        _uiState.value = _uiState.value.copy(deviceAttachedPrompt = null)
+    }
+
+    fun release() {
+        stopCapture()
+        try {
+            audioManager.unregisterAudioDeviceCallback(deviceCallback)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to unregister AudioDeviceCallback", e)
         }
     }
 

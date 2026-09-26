@@ -13,5 +13,7 @@ data class AudioCaptureConfig(
     /** Specific requested sample rate, or null to auto-detect hardware native rate */
     val targetSampleRate: Int? = null,
     /** Preferred audio source (defaults to UNPROCESSED to avoid AGC / noise suppression) */
-    val preferredAudioSource: Int = MediaRecorder.AudioSource.UNPROCESSED
+    val preferredAudioSource: Int = MediaRecorder.AudioSource.UNPROCESSED,
+    /** Specific hardware input device ID (null for system default auto-routing) */
+    val preferredDeviceId: Int? = null
 )

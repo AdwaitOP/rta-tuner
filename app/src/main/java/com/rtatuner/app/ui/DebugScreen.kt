@@ -19,6 +19,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.wrapContentWidth
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -81,9 +83,11 @@ import com.rtatuner.app.core.audio.FftDisplayMode
 import com.rtatuner.app.core.session.RtaSnapshot
 import com.rtatuner.app.ui.components.LevelMeter
 import com.rtatuner.app.ui.components.SessionToolsCard
+import com.rtatuner.app.ui.components.AudioInputDeviceCard
 import com.rtatuner.app.ui.components.surface.RtaSurfaceView
 import androidx.compose.material.icons.filled.AcUnit
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Usb
 import java.util.Locale
 
 @Composable
@@ -149,7 +153,73 @@ fun DebugScreen(
             if (uiState.status == CaptureStatus.ERROR) {
                 CaptureErrorBanner(
                     errorMessage = uiState.errorMessage ?: "Unknown audio capture error",
-                    onRetry = { viewModel.retryCapture() }
+                    onRetry = { viewModel.retryCapture() },
+                    onRevertToBuiltIn = { viewModel.revertToBuiltInMicAndRetry() }
+                )
+            }
+
+            // Stage 7 Hotplug Switch Prompt Dialog
+            val attachedPrompt = uiState.deviceAttachedPrompt
+            if (attachedPrompt != null) {
+                AlertDialog(
+                    onDismissRequest = { viewModel.dismissDevicePrompt() },
+                    title = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Usb,
+                                contentDescription = null,
+                                tint = Color(0xFF00E5FF),
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "New Audio Input Detected",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(
+                                text = "A new audio input device was connected:",
+                                color = Color(0xFFB0BEC5),
+                                fontSize = 12.sp
+                            )
+                            Text(
+                                text = "${attachedPrompt.name} (${attachedPrompt.typeName})",
+                                color = Color.White,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Native rates: ${attachedPrompt.ratesSummary}",
+                                color = Color(0xFF78909C),
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Would you like to switch active capture to this device now?",
+                                color = Color(0xFFECEFF1),
+                                fontSize = 12.sp
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        Button(
+                            onClick = { viewModel.switchToDevice(attachedPrompt) },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF))
+                        ) {
+                            Text("SWITCH INPUT", color = Color.Black, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { viewModel.dismissDevicePrompt() }) {
+                            Text("KEEP CURRENT", fontFamily = FontFamily.Monospace)
+                        }
+                    }
                 )
             }
 
@@ -196,6 +266,13 @@ fun DebugScreen(
                 uiState = uiState,
                 frozenSnapshots = frozenSnapshots,
                 savedSessions = savedSessions
+            )
+
+            // Stage 7 Audio Input Hardware & Device Selection Card
+            AudioInputDeviceCard(
+                uiState = uiState,
+                onSelectDevice = { viewModel.setPreferredInputDevice(it) },
+                onRefreshDevices = { viewModel.refreshInputDevices() }
             )
 
 
@@ -269,7 +346,7 @@ private fun HeaderSection(status: CaptureStatus) {
                     letterSpacing = 1.sp
                 )
                 Text(
-                    text = "STAGE 5 • CALIBRATION, TARGETS & 60FPS RTA",
+                    text = "STAGE 7 • USB/EXT MIC, SESSIONS & 60FPS RTA",
                     color = Color(0xFF78909C),
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Bold,
@@ -312,7 +389,9 @@ private fun StatusBadge(status: CaptureStatus) {
                 color = textColor,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Bold,
-                fontFamily = FontFamily.Monospace
+                fontFamily = FontFamily.Monospace,
+                maxLines = 1,
+                softWrap = false
             )
         }
     }
@@ -575,49 +654,65 @@ private fun SurfaceSpectrumCard(
             }
 
 
-            // Telemetry & Advanced Settings Row
+            // Telemetry Row
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text(
-                        text = String.format(Locale.US, "RENDER: %.0f FPS (%d µs)", diag.renderFps, diag.renderDrawTimeUs),
-                        color = Color(0xFF00E676),
-                        fontSize = 10.sp,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = String.format(Locale.US, "AUDIO: %.0f FPS (%d µs)", diag.fps, diag.fftExecutionTimeUs),
-                        color = Color(0xFF81D4FA),
-                        fontSize = 10.sp,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
+                Text(
+                    text = String.format(Locale.US, "RENDER: %.0f FPS (%d µs)", diag.renderFps, diag.renderDrawTimeUs),
+                    color = Color(0xFF00E676),
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    softWrap = false
+                )
+                Text(
+                    text = String.format(Locale.US, "AUDIO: %.0f FPS (%d µs)", diag.fps, diag.fftExecutionTimeUs),
+                    color = Color(0xFF81D4FA),
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    softWrap = false
+                )
+            }
 
-                // Toggle for Peak-Hold Ballistics Drawer
+            // Peak-Hold Ballistics Toggle — own row so it always has full width
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Row(
                     modifier = Modifier
+                        .wrapContentWidth()
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(
+                            if (showAdvancedSettings) Color(0xFF00E676).copy(alpha = 0.10f)
+                            else Color.Transparent
+                        )
                         .clickable { showAdvancedSettings = !showAdvancedSettings }
-                        .padding(4.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     Icon(
                         imageVector = Icons.Default.Tune,
-                        contentDescription = null,
+                        contentDescription = "Peak-Hold Ballistics Settings",
                         tint = if (showAdvancedSettings) Color(0xFF00E676) else Color(0xFF78909C),
                         modifier = Modifier.size(14.dp)
                     )
-                    Spacer(modifier = Modifier.width(4.dp))
                     Text(
                         text = if (showAdvancedSettings) "HIDE SETTINGS" else "BALLISTICS",
                         color = if (showAdvancedSettings) Color(0xFF00E676) else Color(0xFF78909C),
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace
+                        fontFamily = FontFamily.Monospace,
+                        maxLines = 1,
+                        softWrap = false
                     )
                 }
             }
@@ -710,7 +805,9 @@ private fun SelectChip(
             color = if (isSelected) Color(0xFF00E676) else Color(0xFF78909C),
             fontSize = 9.sp,
             fontWeight = FontWeight.Bold,
-            fontFamily = FontFamily.Monospace
+            fontFamily = FontFamily.Monospace,
+            maxLines = 1,
+            softWrap = false
         )
     }
 }
@@ -723,6 +820,7 @@ private fun ModeTab(
 ) {
     Box(
         modifier = Modifier
+            .wrapContentWidth()
             .clip(RoundedCornerShape(4.dp))
             .background(if (isSelected) Color(0xFF00E676) else Color.Transparent)
             .clickable { onClick() }
@@ -733,7 +831,9 @@ private fun ModeTab(
             color = if (isSelected) Color.Black else Color(0xFF90A4AE),
             fontSize = 10.sp,
             fontWeight = FontWeight.Bold,
-            fontFamily = FontFamily.Monospace
+            fontFamily = FontFamily.Monospace,
+            maxLines = 1,
+            softWrap = false
         )
     }
 }
@@ -764,7 +864,8 @@ private fun WindowSizeChip(
 @Composable
 private fun CaptureErrorBanner(
     errorMessage: String,
-    onRetry: () -> Unit
+    onRetry: () -> Unit,
+    onRevertToBuiltIn: (() -> Unit)? = null
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -800,19 +901,36 @@ private fun CaptureErrorBanner(
                 fontFamily = FontFamily.Monospace
             )
 
-            Button(
-                onClick = onRetry,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF1744)),
-                shape = RoundedCornerShape(6.dp),
-                modifier = Modifier.align(Alignment.End)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = Icons.Default.Refresh,
-                    contentDescription = null,
-                    modifier = Modifier.size(16.dp)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("RESTART CAPTURE", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                if (onRevertToBuiltIn != null) {
+                    OutlinedButton(
+                        onClick = onRevertToBuiltIn,
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFFFCDD2)),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFFF5252).copy(alpha = 0.6f)),
+                        shape = RoundedCornerShape(6.dp)
+                    ) {
+                        Text("SWITCH TO BUILT-IN MIC", fontSize = 11.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
+
+                Button(
+                    onClick = onRetry,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF1744)),
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("RETRY", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
             }
         }
     }
@@ -959,6 +1077,7 @@ private fun ClipIndicatorBadge(isClipping: Boolean) {
 
     Box(
         modifier = Modifier
+            .wrapContentWidth()
             .clip(RoundedCornerShape(4.dp))
             .background(bgColor)
             .border(1.dp, if (isClipping) Color.White else Color.Transparent, RoundedCornerShape(4.dp))
@@ -969,7 +1088,9 @@ private fun ClipIndicatorBadge(isClipping: Boolean) {
             color = textColor,
             fontSize = 10.sp,
             fontWeight = FontWeight.Black,
-            fontFamily = FontFamily.Monospace
+            fontFamily = FontFamily.Monospace,
+            maxLines = 1,
+            softWrap = false
         )
     }
 }
@@ -1039,7 +1160,14 @@ private fun HardwareDiagnosticsCard(uiState: AudioCaptureUiState) {
             )
 
             DiagnosticRow("Active Audio Source", diag.activeAudioSource)
-            DiagnosticRow("Input Device Name", diag.inputDeviceName)
+            DiagnosticRow("Requested Input Device", diag.requestedDeviceName)
+            DiagnosticRow("Actual Routed Device", "${diag.actualRoutedDeviceName} (${diag.actualRoutedDeviceType})")
+            if (diag.isRoutingMismatch) {
+                DiagnosticRow("Routing Status", "MISMATCH (OS Overrode Routing)")
+            }
+            if (diag.isBluetoothBandwidthLimited) {
+                DiagnosticRow("Bandwidth Profile", "LIMITED (SCO 8-16 kHz)")
+            }
             DiagnosticRow(
                 "Sample Rate",
                 if (diag.actualSampleRate > 0) "${diag.actualSampleRate} Hz" else "Not started"
@@ -1235,6 +1363,8 @@ private fun SignalGeneratorCard(
                         fontSize = 9.sp,
                         fontWeight = FontWeight.Bold,
                         fontFamily = FontFamily.Monospace,
+                        maxLines = 1,
+                        softWrap = false,
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
                     )
                 }
@@ -1317,7 +1447,9 @@ private fun SignalGeneratorCard(
                     fontSize = 10.sp,
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Bold,
-                    modifier = Modifier.width(115.dp)
+                    maxLines = 1,
+                    softWrap = false,
+                    modifier = Modifier.wrapContentWidth()
                 )
                 Slider(
                     value = state.outputLevelDb,
