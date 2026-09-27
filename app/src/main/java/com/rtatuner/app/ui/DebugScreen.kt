@@ -262,14 +262,17 @@ fun DebugScreen(
                     confirmButton = {
                         Button(
                             onClick = { viewModel.switchToDevice(attachedPrompt) },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF))
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF00E5FF),
+                                contentColor = Color.Black
+                            )
                         ) {
                             Text("SWITCH INPUT", color = Color.Black, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                         }
                     },
                     dismissButton = {
                         TextButton(onClick = { viewModel.dismissDevicePrompt() }) {
-                            Text("KEEP CURRENT", fontFamily = FontFamily.Monospace)
+                            Text("KEEP CURRENT", color = Color(0xFF90A4AE), fontFamily = FontFamily.Monospace)
                         }
                     }
                 )
@@ -1162,16 +1165,20 @@ private fun CaptureErrorBanner(
 
                 Button(
                     onClick = onRetry,
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF1744)),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFFFF1744),
+                        contentColor = Color.White
+                    ),
                     shape = RoundedCornerShape(6.dp)
                 ) {
                     Icon(
                         imageVector = Icons.Default.Refresh,
                         contentDescription = null,
+                        tint = Color.White,
                         modifier = Modifier.size(16.dp)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("RETRY", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    Text("RETRY", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                 }
             }
         }
@@ -1211,7 +1218,10 @@ private fun PermissionRequestCard(onRequestPermission: () -> Unit) {
             )
             Button(
                 onClick = onRequestPermission,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E676)),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF00E676),
+                    contentColor = Color.Black
+                ),
                 shape = RoundedCornerShape(6.dp)
             ) {
                 Text(
@@ -1476,19 +1486,25 @@ private fun ControlsSection(
         if (status == CaptureStatus.RUNNING) {
             Button(
                 onClick = onStop,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828)),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFFC62828),
+                    contentColor = Color.White
+                ),
                 shape = RoundedCornerShape(6.dp),
                 modifier = Modifier.weight(1f).height(46.dp)
             ) {
-                Icon(Icons.Default.Stop, contentDescription = null)
+                Icon(Icons.Default.Stop, contentDescription = null, tint = Color.White)
                 Spacer(modifier = Modifier.width(6.dp))
-                Text("STOP CAPTURE", fontWeight = FontWeight.Bold)
+                Text("STOP CAPTURE", color = Color.White, fontWeight = FontWeight.Bold)
             }
         } else {
             Button(
                 onClick = onStart,
                 enabled = hasPermission,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E676)),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF00E676),
+                    contentColor = Color.Black
+                ),
                 shape = RoundedCornerShape(6.dp),
                 modifier = Modifier.weight(1f).height(46.dp)
             ) {
@@ -1622,7 +1638,9 @@ private fun SignalGeneratorCard(
                     onClick = onStartPinkNoise,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = if (state.mode == GeneratorMode.PINK_NOISE && state.isPlaying)
-                            Color(0xFFE91E63) else Color(0xFF1E232E)
+                            Color(0xFFE91E63) else Color(0xFF1E232E),
+                        contentColor = if (state.mode == GeneratorMode.PINK_NOISE && state.isPlaying)
+                            Color.White else Color(0xFFB0BEC5)
                     ),
                     shape = RoundedCornerShape(6.dp),
                     modifier = Modifier.weight(1f).height(38.dp)
@@ -1642,7 +1660,9 @@ private fun SignalGeneratorCard(
                     onClick = onStartSineSweep,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = if (state.mode == GeneratorMode.SINE_SWEEP && state.isPlaying)
-                            Color(0xFF0288D1) else Color(0xFF1E232E)
+                            Color(0xFF0288D1) else Color(0xFF1E232E),
+                        contentColor = if (state.mode == GeneratorMode.SINE_SWEEP && state.isPlaying)
+                            Color.White else Color(0xFFB0BEC5)
                     ),
                     shape = RoundedCornerShape(6.dp),
                     modifier = Modifier.weight(1f).height(38.dp)
@@ -1663,7 +1683,9 @@ private fun SignalGeneratorCard(
                     enabled = state.isPlaying,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Color(0xFFB71C1C),
-                        disabledContainerColor = Color(0xFF1E232E)
+                        contentColor = Color.White,
+                        disabledContainerColor = Color(0xFF1E232E),
+                        disabledContentColor = Color(0xFF546E7A)
                     ),
                     shape = RoundedCornerShape(6.dp),
                     modifier = Modifier.width(68.dp).height(38.dp)
@@ -2005,9 +2027,16 @@ fun CalibrationControlsCard(
                             enabled = calib.micCurve != null,
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = Color(0xFF00E676),
-                                checkedTrackColor = Color(0xFF1B5E20),
-                                uncheckedThumbColor = Color(0xFF78909C),
-                                uncheckedTrackColor = Color(0xFF263238)
+                                checkedTrackColor = Color(0xFF2E7D32),
+                                checkedBorderColor = Color(0xFF00E676),
+                                uncheckedThumbColor = Color(0xFFCFD8DC),
+                                uncheckedTrackColor = Color(0xFF37474F),
+                                uncheckedBorderColor = Color(0xFF78909C),
+                                disabledCheckedThumbColor = Color(0xFF81C784),
+                                disabledCheckedTrackColor = Color(0xFF1B5E20),
+                                disabledUncheckedThumbColor = Color(0xFF546E7A),
+                                disabledUncheckedTrackColor = Color(0xFF263238),
+                                disabledUncheckedBorderColor = Color(0xFF37474F)
                             )
                         )
                     }
@@ -2022,39 +2051,51 @@ fun CalibrationControlsCard(
                                 val res = onLoadMicCurve("miniDSP UMIK-1 (Demo)", SAMPLE_UMIK1_CAL)
                                 if (res.isFailure) parseErrorMsg = res.exceptionOrNull()?.message
                             },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E3A5F)),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF1E3A5F),
+                                contentColor = Color.White
+                            ),
                             shape = RoundedCornerShape(4.dp),
                             modifier = Modifier.weight(1f).height(32.dp)
                         ) {
-                            Text("LOAD UMIK-1", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                            Text("LOAD UMIK-1", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                         }
 
                         Button(
                             onClick = { filePickerLauncher.launch("*/*") },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E3B4E)),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF2E3B4E),
+                                contentColor = Color.White
+                            ),
                             shape = RoundedCornerShape(4.dp),
                             modifier = Modifier.weight(1f).height(32.dp)
                         ) {
-                            Text("IMPORT FILE", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                            Text("IMPORT FILE", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                         }
 
                         Button(
                             onClick = { showPasteDialog = true },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E3B4E)),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF2E3B4E),
+                                contentColor = Color.White
+                            ),
                             shape = RoundedCornerShape(4.dp),
                             modifier = Modifier.weight(1f).height(32.dp)
                         ) {
-                            Text("PASTE CSV", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                            Text("PASTE CSV", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                         }
 
                         if (calib.micCurve != null) {
                             Button(
                                 onClick = { onClearMicCurve() },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4A148C)),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFF4A148C),
+                                    contentColor = Color.White
+                                ),
                                 shape = RoundedCornerShape(4.dp),
                                 modifier = Modifier.weight(0.7f).height(32.dp)
                             ) {
-                                Text("CLEAR", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                                Text("CLEAR", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                             }
                         }
                     }
@@ -2121,29 +2162,38 @@ fun CalibrationControlsCard(
                     ) {
                         Button(
                             onClick = { showSplDialog = true },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00695C)),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF00695C),
+                                contentColor = Color.White
+                            ),
                             shape = RoundedCornerShape(4.dp),
                             modifier = Modifier.weight(1f).height(32.dp)
                         ) {
-                            Text("CALIBRATE TO REF METER", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                            Text("CALIBRATE TO REF METER", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                         }
 
                         Button(
                             onClick = { onCalibrateSpl(94.0f) },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF263238)),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF263238),
+                                contentColor = Color.White
+                            ),
                             shape = RoundedCornerShape(4.dp),
                             modifier = Modifier.weight(0.5f).height(32.dp)
                         ) {
-                            Text("94 dB", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                            Text("94 dB", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                         }
 
                         Button(
                             onClick = { onCalibrateSpl(85.0f) },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF263238)),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFF263238),
+                                contentColor = Color.White
+                            ),
                             shape = RoundedCornerShape(4.dp),
                             modifier = Modifier.weight(0.5f).height(32.dp)
                         ) {
-                            Text("85 dB", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                            Text("85 dB", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                         }
                     }
                 }
@@ -2186,8 +2236,10 @@ fun CalibrationControlsCard(
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = Color(0xFFFFD54F),
                                 checkedTrackColor = Color(0xFFB58900),
-                                uncheckedThumbColor = Color(0xFF78909C),
-                                uncheckedTrackColor = Color(0xFF263238)
+                                checkedBorderColor = Color(0xFFFFD54F),
+                                uncheckedThumbColor = Color(0xFFCFD8DC),
+                                uncheckedTrackColor = Color(0xFF37474F),
+                                uncheckedBorderColor = Color(0xFF78909C)
                             )
                         )
                     }
@@ -2288,9 +2340,16 @@ fun CalibrationControlsCard(
                             enabled = calib.noiseFloor.isCaptured,
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = Color(0xFF00E676),
-                                checkedTrackColor = Color(0xFF1B5E20),
-                                uncheckedThumbColor = Color(0xFF78909C),
-                                uncheckedTrackColor = Color(0xFF263238)
+                                checkedTrackColor = Color(0xFF2E7D32),
+                                checkedBorderColor = Color(0xFF00E676),
+                                uncheckedThumbColor = Color(0xFFCFD8DC),
+                                uncheckedTrackColor = Color(0xFF37474F),
+                                uncheckedBorderColor = Color(0xFF78909C),
+                                disabledCheckedThumbColor = Color(0xFF81C784),
+                                disabledCheckedTrackColor = Color(0xFF1B5E20),
+                                disabledUncheckedThumbColor = Color(0xFF546E7A),
+                                disabledUncheckedTrackColor = Color(0xFF263238),
+                                disabledUncheckedBorderColor = Color(0xFF37474F)
                             )
                         )
                     }
@@ -2316,21 +2375,27 @@ fun CalibrationControlsCard(
                         ) {
                             Button(
                                 onClick = { onStartNoiseCapture() },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB71C1C)),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFFB71C1C),
+                                    contentColor = Color.White
+                                ),
                                 shape = RoundedCornerShape(4.dp),
                                 modifier = Modifier.weight(1f).height(32.dp)
                             ) {
-                                Text("CAPTURE NOISE (2s)", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                                Text("CAPTURE NOISE (2s)", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                             }
 
                             if (calib.noiseFloor.isCaptured) {
                                 Button(
                                     onClick = { onClearNoiseFloor() },
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF37474F)),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = Color(0xFF37474F),
+                                        contentColor = Color.White
+                                    ),
                                     shape = RoundedCornerShape(4.dp),
                                     modifier = Modifier.weight(0.5f).height(32.dp)
                                 ) {
-                                    Text("CLEAR", fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                                    Text("CLEAR", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                                 }
                             }
                         }
@@ -2393,14 +2458,18 @@ fun CalibrationControlsCard(
                         } else {
                             parseErrorMsg = res.exceptionOrNull()?.message
                         }
-                    }
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF00E676),
+                        contentColor = Color.Black
+                    )
                 ) {
-                    Text("APPLY", fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                    Text("APPLY", color = Color.Black, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showPasteDialog = false }) {
-                    Text("CANCEL", fontFamily = FontFamily.Monospace)
+                    Text("CANCEL", color = Color(0xFF90A4AE), fontFamily = FontFamily.Monospace)
                 }
             }
         )
@@ -2448,14 +2517,18 @@ fun CalibrationControlsCard(
                         val targetSpl = splTargetInput.toFloatOrNull() ?: 85.0f
                         onCalibrateSpl(targetSpl)
                         showSplDialog = false
-                    }
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF00E676),
+                        contentColor = Color.Black
+                    )
                 ) {
-                    Text("CALIBRATE & ENABLE", fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                    Text("CALIBRATE & ENABLE", color = Color.Black, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showSplDialog = false }) {
-                    Text("CANCEL", fontFamily = FontFamily.Monospace)
+                    Text("CANCEL", color = Color(0xFF90A4AE), fontFamily = FontFamily.Monospace)
                 }
             }
         )

@@ -256,7 +256,10 @@ fun SessionToolsCard(
                         sessionToDelete = null
                         Toast.makeText(context, "Session deleted", Toast.LENGTH_SHORT).show()
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFFD32F2F),
+                        contentColor = Color.White
+                    )
                 ) {
                     Text("DELETE", color = Color.White, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                 }
@@ -296,7 +299,10 @@ fun SessionToolsCard(
                         viewModel.renameSnapshot(snap.id, newName)
                         snapshotToRename = null
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF))
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF00E5FF),
+                        contentColor = Color.Black
+                    )
                 ) {
                     Text("RENAME", color = Color.Black, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                 }
@@ -337,7 +343,10 @@ private fun FreezeAndExportContent(
                     Toast.makeText(context, "Current spectrum frozen as overlay", Toast.LENGTH_SHORT).show()
                 },
                 modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF)),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF00E5FF),
+                    contentColor = Color.Black
+                ),
                 shape = RoundedCornerShape(6.dp)
             ) {
                 Icon(
@@ -646,7 +655,10 @@ private fun SavedSessionsContent(
         Button(
             onClick = onOpenSaveDialog,
             modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E676)),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Color(0xFF00E676),
+                contentColor = Color.Black
+            ),
             shape = RoundedCornerShape(6.dp)
         ) {
             Icon(
@@ -788,7 +800,10 @@ private fun SavedSessionItem(
                 Button(
                     onClick = onOverlay,
                     modifier = Modifier.weight(1f),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF)),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF00E5FF),
+                        contentColor = Color.Black
+                    ),
                     shape = RoundedCornerShape(4.dp)
                 ) {
                     Icon(
@@ -1062,7 +1077,10 @@ private fun SaveSessionDialog(
                 onClick = {
                     onConfirm(sessionName, notes, includeLive, selectedFrozenIds.toList())
                 },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E676))
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF00E676),
+                    contentColor = Color.Black
+                )
             ) {
                 Text("SAVE SESSION", color = Color.Black, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
             }
@@ -1107,7 +1125,10 @@ private fun EditNotesDialog(
         confirmButton = {
             Button(
                 onClick = { onConfirm(notes) },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF))
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF00E5FF),
+                    contentColor = Color.Black
+                )
             ) {
                 Text("SAVE", color = Color.Black, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
             }

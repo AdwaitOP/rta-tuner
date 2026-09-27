@@ -30,7 +30,11 @@ class MainActivity : ComponentActivity() {
                     background = Color(0xFF0F1115),
                     surface = Color(0xFF161A22),
                     primary = Color(0xFF00E676),
-                    error = Color(0xFFFF1744)
+                    onPrimary = Color.Black,
+                    primaryContainer = Color(0xFF1E3A5F),
+                    onPrimaryContainer = Color.White,
+                    error = Color(0xFFFF1744),
+                    onError = Color.White
                 )
             ) {
                 Surface(
