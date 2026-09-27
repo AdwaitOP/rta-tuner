@@ -66,6 +66,9 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
     private val _savedSessions = MutableStateFlow<List<SessionWithSnapshots>>(emptyList())
     val savedSessions: StateFlow<List<SessionWithSnapshots>> = _savedSessions.asStateFlow()
 
+    private val _isFullscreenGraph = MutableStateFlow(false)
+    val isFullscreenGraph: StateFlow<Boolean> = _isFullscreenGraph.asStateFlow()
+
     private var captureCollectorJob: Job? = null
     private var generatorCollectorJob: Job? = null
     private var calibrationCollectorJob: Job? = null
@@ -166,6 +169,7 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
                     rawFftDb = calFrame.calibratedRawFftDb,
                     unreliableBands = calFrame.unreliableBands,
                     targetDeltas31Db = calFrame.targetDeltas31Db,
+                    shouldResetSmoothing = calFrame.shouldResetSmoothing,
                     diagnostics = mgrState.diagnostics.copy(
                         renderFps = _uiState.value.diagnostics.renderFps,
                         renderDrawTimeUs = _uiState.value.diagnostics.renderDrawTimeUs
@@ -585,6 +589,10 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
 
     fun refreshInputDevices() {
         captureManager.refreshInputDevices()
+    }
+
+    fun setFullscreenGraph(enabled: Boolean) {
+        _isFullscreenGraph.value = enabled
     }
 
     override fun onCleared() {

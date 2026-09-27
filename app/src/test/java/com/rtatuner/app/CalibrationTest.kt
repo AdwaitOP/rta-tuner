@@ -1,18 +1,22 @@
 package com.rtatuner.app
 
+import com.rtatuner.app.core.audio.AudioCaptureUiState
 import com.rtatuner.app.core.audio.AudioMath
+import com.rtatuner.app.core.calibration.CalibratedSpectralFrame
 import com.rtatuner.app.core.calibration.CalibrationCurveParser
 import com.rtatuner.app.core.calibration.MicCalibrationCurve
 import com.rtatuner.app.core.calibration.MicCalibrationPoint
 import com.rtatuner.app.core.calibration.TargetCurve
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.abs
 import kotlin.math.log10
 import kotlin.math.sqrt
+
 
 class CalibrationTest {
 
@@ -294,4 +298,46 @@ class CalibrationTest {
         assertTrue("SPL bass target (89 dBSPL) must be strictly below SPL ceiling (100 dBSPL)", splBassTarget < splMaxDb)
         assertEquals(89.0f, splBassTarget, 0.01f)
     }
+
+    @Test
+    fun testCalibratedSpectralFrameResetSmoothingFlag() {
+        val dummyBands = FloatArray(31) { -40.0f }
+        val dummyRaw = FloatArray(1024) { -40.0f }
+        val dummyUnreliable = BooleanArray(31) { false }
+
+        val defaultFrame = CalibratedSpectralFrame(
+            calibrated31Db = dummyBands,
+            calibratedRawFftDb = dummyRaw,
+            unreliableBands = dummyUnreliable,
+            targetDeltas31Db = null,
+            isSplMode = false,
+            splOffsetDb = 0.0f
+        )
+        assertFalse("Default shouldResetSmoothing must be false", defaultFrame.shouldResetSmoothing)
+
+        val resetFrame = defaultFrame.copy(shouldResetSmoothing = true)
+        assertTrue("Copied frame should have shouldResetSmoothing = true", resetFrame.shouldResetSmoothing)
+        assertNotEquals("Frames with different shouldResetSmoothing must not be equal", defaultFrame, resetFrame)
+        assertNotEquals("Hash codes should differ when shouldResetSmoothing differs", defaultFrame.hashCode(), resetFrame.hashCode())
+
+        val anotherResetFrame = defaultFrame.copy(shouldResetSmoothing = true)
+        assertEquals("Identical frames with shouldResetSmoothing = true must be equal", resetFrame, anotherResetFrame)
+        assertEquals(resetFrame.hashCode(), anotherResetFrame.hashCode())
+    }
+
+    @Test
+    fun testAudioCaptureUiStateResetSmoothingFlag() {
+        val defaultState = AudioCaptureUiState()
+        assertFalse("Default shouldResetSmoothing must be false", defaultState.shouldResetSmoothing)
+
+        val resetState = defaultState.copy(shouldResetSmoothing = true)
+        assertTrue("Copied state should have shouldResetSmoothing = true", resetState.shouldResetSmoothing)
+        assertNotEquals("States with different shouldResetSmoothing must not be equal", defaultState, resetState)
+        assertNotEquals(defaultState.hashCode(), resetState.hashCode())
+
+        val identicalResetState = defaultState.copy(shouldResetSmoothing = true)
+        assertEquals(resetState, identicalResetState)
+        assertEquals(resetState.hashCode(), identicalResetState.hashCode())
+    }
 }
+

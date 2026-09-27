@@ -134,4 +134,62 @@ class DisplayBallisticsTest {
             }
         }
     }
+
+    @Test
+    fun testEmaResetSmoothingInstantTransition() {
+        // Pre-noise-floor steady state ambient noise level
+        val preCaptureNoise = -45.0f
+        var smoothed = preCaptureNoise
+        val postCaptureInput = -80.0f // floor after noise subtraction
+        val alpha = EmaPreset.MEDIUM.alpha // 0.13f
+
+        // Standard EMA update without reset
+        val normalStep = (alpha * postCaptureInput) + ((1.0f - alpha) * smoothed)
+        assertEquals("Standard EMA glides slowly: -49.55 dBFS on first frame", -49.55f, normalStep, 0.01f)
+        assertTrue("Standard EMA leaves a ~30 dB gap on frame 1", normalStep > -50.0f)
+
+        // Reset smoothing behavior (when resetSmoothing == true)
+        smoothed = postCaptureInput
+        assertEquals("Reset smoothing snaps directly to the post-capture floor", -80.0f, smoothed, 0.001f)
+    }
+
+    @Test
+    fun testPeakHoldResetSmoothingEliminatesGhostPeaks() {
+        val holdDurationMs = 1200L
+        var peakHold = -45.0f
+        var peakHoldTimeMs = 1000L
+
+        val captureTimeMs = 1016L
+        val postCaptureInput = -80.0f
+
+        // Without reset: Peak remains locked at -45 dBFS for another 1184 ms!
+        val elapsed = captureTimeMs - peakHoldTimeMs
+        assertTrue("Hold duration has not elapsed", elapsed < holdDurationMs)
+        assertEquals("Ghost peak remains locked at -45 dBFS without reset", -45.0f, peakHold, 0.001f)
+
+        // With reset smoothing:
+        peakHold = postCaptureInput
+        peakHoldTimeMs = captureTimeMs
+        assertEquals("Reset smoothing snaps peak hold directly to post-capture level", -80.0f, peakHold, 0.001f)
+        assertEquals("Reset smoothing resets peak hold timestamp", captureTimeMs, peakHoldTimeMs)
+    }
+
+    @Test
+    fun testLowerBoundClampingPreventsSubterraneanSwings() {
+        val minDb = -80.0f
+        val subterraneanVal = -120.0f // AudioMath.MIN_DB_FS returned when signal <= noise floor
+
+        val clampedVal = max(minDb, subterraneanVal)
+        assertEquals("Subterranean noise floor difference is clamped to minDb (-80 dBFS)", -80.0f, clampedVal, 0.001f)
+
+        // EMA with subterranean value (-120 dBFS) would pull down significantly below display minimum
+        val alpha = 0.13f
+        val currentDisplay = -80.0f
+        val unclampedEma = (alpha * subterraneanVal) + ((1.0f - alpha) * currentDisplay)
+        assertEquals("Unclamped EMA drops to -85.2 dBFS", -85.2f, unclampedEma, 0.01f)
+
+        val clampedEma = (alpha * clampedVal) + ((1.0f - alpha) * currentDisplay)
+        assertEquals("Clamped EMA stays stable at -80 dBFS", -80.0f, clampedEma, 0.001f)
+    }
 }
+

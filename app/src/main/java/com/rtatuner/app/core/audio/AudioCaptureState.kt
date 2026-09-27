@@ -52,6 +52,7 @@ data class AudioCaptureDiagnostics(
     val fps: Float = 0f,
     val consecutiveZeroReads: Int = 0,
     val fftExecutionTimeUs: Long = 0L,
+    val filterBankExecutionTimeUs: Long = 0L,
     val renderFps: Float = 60.0f,
     val renderDrawTimeUs: Long = 0L
 )
@@ -82,7 +83,8 @@ data class AudioCaptureUiState(
     val isRoutingMismatch: Boolean = false,
     val routingMismatchMessage: String? = null,
     val isBluetoothBandwidthLimited: Boolean = false,
-    val bluetoothWarningText: String? = null
+    val bluetoothWarningText: String? = null,
+    val shouldResetSmoothing: Boolean = false
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -115,6 +117,7 @@ data class AudioCaptureUiState(
         if (routingMismatchMessage != other.routingMismatchMessage) return false
         if (isBluetoothBandwidthLimited != other.isBluetoothBandwidthLimited) return false
         if (bluetoothWarningText != other.bluetoothWarningText) return false
+        if (shouldResetSmoothing != other.shouldResetSmoothing) return false
 
         return true
     }
@@ -143,6 +146,7 @@ data class AudioCaptureUiState(
         result = 31 * result + (routingMismatchMessage?.hashCode() ?: 0)
         result = 31 * result + isBluetoothBandwidthLimited.hashCode()
         result = 31 * result + (bluetoothWarningText?.hashCode() ?: 0)
+        result = 31 * result + shouldResetSmoothing.hashCode()
         return result
     }
 }

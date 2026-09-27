@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
+import com.rtatuner.app.core.dsp.BiquadFilterBank
 import com.rtatuner.app.core.dsp.FftProcessor
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
@@ -391,6 +392,7 @@ class AudioCaptureManager(
         val readBuffer = ShortArray(hopSize)
         val slidingWindow = ShortArray(windowSize)
         val fftProcessor = FftProcessor(windowSize = windowSize, sampleRate = sampleRate)
+        val biquadFilterBank = BiquadFilterBank(sampleRate = sampleRate)
         var consecutiveZeroReads = 0
         var totalFrames = 0L
         var lastFpsTimeNs = System.nanoTime()
@@ -405,7 +407,10 @@ class AudioCaptureManager(
             if (readResult > 0) {
                 consecutiveZeroReads = 0
 
-                // 50% overlap sliding window update
+                // 1. Process continuous incoming hop through 64-bit continuous IIR biquad filter bank (persists state across hops)
+                val octave31FilterDb = biquadFilterBank.processHop(readBuffer, readResult)
+
+                // 2. 50% overlap sliding window update
                 val shiftCount = windowSize - hopSize
                 if (shiftCount > 0) {
                     System.arraycopy(slidingWindow, hopSize, slidingWindow, 0, shiftCount)
@@ -416,7 +421,7 @@ class AudioCaptureManager(
                 val (rmsDb, peakDb) = AudioMath.computeRmsAndPeakDb(slidingWindow, windowSize)
                 val isClipping = AudioMath.isClipping(readBuffer, readResult)
 
-                // Real-time FFT spectral analysis (Hann window, Radix-2 FFT, 1/3-octave ISO 31 bands)
+                // Real-time FFT spectral analysis (Hann window, Radix-2 FFT powering raw FFT line mode)
                 val fftResult = fftProcessor.processFrame(slidingWindow)
 
                 val nowNs = System.nanoTime()
@@ -435,7 +440,7 @@ class AudioCaptureManager(
                     rmsDb = rmsDb,
                     peakDb = peakDb,
                     isClipping = isClipping,
-                    fftResult = fftResult,
+                    fftResult = fftResult.copy(octave31Db = octave31FilterDb),
                     timestampNs = nowNs
                 )
 
@@ -447,13 +452,14 @@ class AudioCaptureManager(
                         rmsDb = rmsDb,
                         peakDb = peakDb,
                         isClipping = isClipping,
-                        octave31Db = fftResult.octave31Db,
+                        octave31Db = octave31FilterDb,
                         rawFftDb = fftResult.rawFftDb,
                         diagnostics = current.diagnostics.copy(
                             totalFramesCaptured = totalFrames,
                             fps = currentFps,
                             consecutiveZeroReads = 0,
-                            fftExecutionTimeUs = fftResult.executionTimeUs
+                            fftExecutionTimeUs = fftResult.executionTimeUs,
+                            filterBankExecutionTimeUs = biquadFilterBank.lastExecutionTimeUs
                         )
                     )
                 }

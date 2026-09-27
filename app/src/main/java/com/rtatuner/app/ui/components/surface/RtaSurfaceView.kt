@@ -89,7 +89,8 @@ class RtaSurfaceView @JvmOverloads constructor(
         binResolutionHz: Float,
         unreliableBands: BooleanArray? = null,
         targetDeltas31Db: FloatArray? = null,
-        frozenSnapshots: List<RtaSnapshot> = emptyList()
+        frozenSnapshots: List<RtaSnapshot> = emptyList(),
+        resetSmoothing: Boolean = false
     ) {
         currentPayload.set(
             SpectralPayload(
@@ -98,13 +99,15 @@ class RtaSurfaceView @JvmOverloads constructor(
                 binResolutionHz = binResolutionHz,
                 unreliableBands = unreliableBands,
                 targetDeltas31Db = targetDeltas31Db,
-                frozenSnapshots = frozenSnapshots
+                frozenSnapshots = frozenSnapshots,
+                resetSmoothing = resetSmoothing
             )
         )
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
         Log.i(TAG, "Surface created: launching dedicated render thread")
+        stopRenderThreadInternal()
         isSurfaceReady.set(true)
         val thread = RenderThread(holder)
         renderThread = thread
@@ -118,13 +121,26 @@ class RtaSurfaceView @JvmOverloads constructor(
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         Log.i(TAG, "Surface destroyed: terminating render thread")
         isSurfaceReady.set(false)
-        renderThread?.stopRendering()
+        stopRenderThreadInternal()
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        isSurfaceReady.set(false)
+        stopRenderThreadInternal()
+    }
+
+    private fun stopRenderThreadInternal() {
+        val thread = renderThread ?: return
+        renderThread = null
+        thread.stopRendering()
+        thread.interrupt()
         try {
-            renderThread?.join(500)
+            thread.join(500)
         } catch (e: InterruptedException) {
             Log.w(TAG, "Interrupted while joining render thread", e)
+            Thread.currentThread().interrupt()
         }
-        renderThread = null
     }
 
     /**
@@ -310,7 +326,7 @@ class RtaSurfaceView @JvmOverloads constructor(
             Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
             var lastLoopTimeNs = System.nanoTime()
 
-            while (isRunning.get() && isSurfaceReady.get()) {
+            while (isRunning.get() && isSurfaceReady.get() && !isInterrupted) {
                 val loopStartNs = System.nanoTime()
                 val dtSec = (loopStartNs - lastLoopTimeNs) / 1_000_000_000f
                 lastLoopTimeNs = loopStartNs
@@ -384,13 +400,15 @@ class RtaSurfaceView @JvmOverloads constructor(
             val rawSpl = if (config.isSplMode) config.splOffsetDb else 0.0f
             val splOffset = if (rawSpl.isNaN() || rawSpl.isInfinite()) 0.0f else rawSpl
             val minDb = config.minDb + splOffset
+            val shouldReset = payload.resetSmoothing
 
             // Update 31-Band EMA Smoothing & Peak Hold
             for (i in 0 until Iso31Bands.NUM_BANDS) {
                 val inputVal = if (i < payload.octave31Db.size) payload.octave31Db[i] else minDb
-                val rawVal = if (inputVal.isNaN() || inputVal.isInfinite()) minDb else inputVal
+                // Clamp from below to minDb so deep floor values (e.g. -120 dBFS) don't destabilize EMA
+                val rawVal = if (inputVal.isNaN() || inputVal.isInfinite()) minDb else max(minDb, inputVal)
 
-                if (smoothedOctave[i].isNaN() || smoothedOctave[i].isInfinite()) {
+                if (shouldReset || smoothedOctave[i].isNaN() || smoothedOctave[i].isInfinite()) {
                     smoothedOctave[i] = rawVal
                 } else {
                     smoothedOctave[i] = (alpha * rawVal) + ((1.0f - alpha) * smoothedOctave[i])
@@ -400,7 +418,7 @@ class RtaSurfaceView @JvmOverloads constructor(
                 }
 
                 // Peak hold logic
-                if (peakHoldOctave[i].isNaN() || peakHoldOctave[i].isInfinite()) {
+                if (shouldReset || peakHoldOctave[i].isNaN() || peakHoldOctave[i].isInfinite()) {
                     peakHoldOctave[i] = smoothedOctave[i]
                     peakHoldTimeMs[i] = nowMs
                 } else if (smoothedOctave[i] >= peakHoldOctave[i]) {
@@ -421,18 +439,18 @@ class RtaSurfaceView @JvmOverloads constructor(
             // Update Raw FFT EMA Smoothing
             if (config.displayMode == FftDisplayMode.RAW_FFT) {
                 val rawSize = payload.rawFftDb.size
-                if (smoothedRawFft == null || smoothedRawFft!!.size != rawSize) {
+                if (shouldReset || smoothedRawFft == null || smoothedRawFft!!.size != rawSize) {
                     smoothedRawFft = payload.rawFftDb.clone()
                     smoothedRawFft?.let { arr ->
                         for (k in arr.indices) {
-                            if (arr[k].isNaN() || arr[k].isInfinite()) arr[k] = minDb
+                            if (arr[k].isNaN() || arr[k].isInfinite() || arr[k] < minDb) arr[k] = minDb
                         }
                     }
                 } else {
                     val sArr = smoothedRawFft!!
                     for (k in 0 until rawSize) {
                         val rawK = payload.rawFftDb[k]
-                        val safeK = if (rawK.isNaN() || rawK.isInfinite()) minDb else rawK
+                        val safeK = if (rawK.isNaN() || rawK.isInfinite()) minDb else max(minDb, rawK)
                         if (sArr[k].isNaN() || sArr[k].isInfinite()) {
                             sArr[k] = safeK
                         } else {
@@ -715,7 +733,8 @@ class RtaSurfaceView @JvmOverloads constructor(
         val binResolutionHz: Float,
         val unreliableBands: BooleanArray? = null,
         val targetDeltas31Db: FloatArray? = null,
-        val frozenSnapshots: List<RtaSnapshot> = emptyList()
+        val frozenSnapshots: List<RtaSnapshot> = emptyList(),
+        val resetSmoothing: Boolean = false
     )
 }
 

@@ -87,7 +87,16 @@ import com.rtatuner.app.ui.components.AudioInputDeviceCard
 import com.rtatuner.app.ui.components.surface.RtaSurfaceView
 import androidx.compose.material.icons.filled.AcUnit
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Fullscreen
+import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Usb
+import android.app.Activity
+import android.content.pm.ActivityInfo
+import androidx.activity.compose.BackHandler
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.compose.runtime.DisposableEffect
 import java.util.Locale
 
 @Composable
@@ -99,7 +108,36 @@ fun DebugScreen(
     val uiState by viewModel.uiState.collectAsState()
     val frozenSnapshots by viewModel.frozenSnapshots.collectAsState()
     val savedSessions by viewModel.savedSessions.collectAsState()
+    val isFullscreenGraph by viewModel.isFullscreenGraph.collectAsState()
     var surfaceViewRef by remember { mutableStateOf<RtaSurfaceView?>(null) }
+
+    val activity = context as? Activity
+
+    BackHandler(enabled = isFullscreenGraph) {
+        viewModel.setFullscreenGraph(false)
+    }
+
+    DisposableEffect(isFullscreenGraph) {
+        val window = activity?.window
+        val insetsController = if (window != null) {
+            WindowCompat.getInsetsController(window, window.decorView)
+        } else null
+
+        if (isFullscreenGraph) {
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            insetsController?.hide(WindowInsetsCompat.Type.systemBars())
+            insetsController?.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        } else {
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            insetsController?.show(WindowInsetsCompat.Type.systemBars())
+        }
+
+        onDispose {
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            insetsController?.show(WindowInsetsCompat.Type.systemBars())
+        }
+    }
 
     var hasPermission by remember {
         mutableStateOf(
@@ -125,10 +163,24 @@ fun DebugScreen(
         }
     }
 
-    Scaffold(
-        modifier = modifier.fillMaxSize(),
-        containerColor = Color(0xFF0F1115)
-    ) { innerPadding ->
+    if (isFullscreenGraph) {
+        FullscreenGraphView(
+            uiState = uiState,
+            frozenSnapshots = frozenSnapshots,
+            onFreeze = { viewModel.freezeCurrentSnapshot() },
+            onUnfreezeSnapshot = { viewModel.unfreezeSnapshot(it) },
+            onToggleSnapshotVisibility = { viewModel.toggleSnapshotVisibility(it) },
+            onExitFullscreen = { viewModel.setFullscreenGraph(false) },
+            onSurfaceViewCreated = { surfaceViewRef = it },
+            onUpdateRenderTelemetry = { fps, drawTimeUs ->
+                viewModel.updateRenderTelemetry(fps, drawTimeUs)
+            }
+        )
+    } else {
+        Scaffold(
+            modifier = modifier.fillMaxSize(),
+            containerColor = Color(0xFF0F1115)
+        ) { innerPadding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -231,6 +283,7 @@ fun DebugScreen(
                 onClearAllFrozen = { viewModel.clearAllFrozenSnapshots() },
                 onToggleSnapshotVisibility = { viewModel.toggleSnapshotVisibility(it) },
                 onUnfreezeSnapshot = { viewModel.unfreezeSnapshot(it) },
+                onEnterFullscreen = { viewModel.setFullscreenGraph(true) },
                 onSurfaceViewCreated = { surfaceViewRef = it },
                 onToggleMode = { viewModel.setFftDisplayMode(it) },
                 onSelectWindowSize = { viewModel.setWindowSize(it) },
@@ -320,6 +373,171 @@ fun DebugScreen(
             Spacer(modifier = Modifier.height(16.dp))
         }
     }
+    }
+}
+
+@Composable
+private fun FullscreenGraphView(
+    uiState: AudioCaptureUiState,
+    frozenSnapshots: List<RtaSnapshot>,
+    onFreeze: () -> Unit,
+    onUnfreezeSnapshot: (String) -> Unit,
+    onToggleSnapshotVisibility: (String) -> Unit,
+    onExitFullscreen: () -> Unit,
+    onSurfaceViewCreated: ((RtaSurfaceView) -> Unit)? = null,
+    onUpdateRenderTelemetry: (Float, Long) -> Unit
+) {
+    val diag = uiState.diagnostics
+    val config = uiState.displayConfig
+    val binResolution = if (diag.windowSize > 0 && diag.actualSampleRate > 0) {
+        diag.actualSampleRate.toFloat() / diag.windowSize
+    } else {
+        23.4375f
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0E1117))
+    ) {
+        // High-performance SurfaceView filling the entire screen in landscape
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx ->
+                RtaSurfaceView(ctx).apply {
+                    this.displayConfig = config
+                    this.onRenderStatsUpdated = { fps, drawTimeUs ->
+                        onUpdateRenderTelemetry(fps, drawTimeUs)
+                    }
+                    onSurfaceViewCreated?.invoke(this)
+                }
+            },
+            update = { surfaceView ->
+                surfaceView.displayConfig = config
+                surfaceView.updateSpectralData(
+                    octave31Db = uiState.octave31Db,
+                    rawFftDb = uiState.rawFftDb,
+                    binResolutionHz = binResolution,
+                    unreliableBands = uiState.unreliableBands,
+                    targetDeltas31Db = uiState.targetDeltas31Db,
+                    frozenSnapshots = frozenSnapshots,
+                    resetSmoothing = uiState.shouldResetSmoothing
+                )
+            }
+        )
+
+        // Unobtrusive corner controls overlay in Top-Right
+        Row(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(top = 10.dp, end = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Active frozen snapshots badges
+            if (frozenSnapshots.isNotEmpty()) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    frozenSnapshots.forEach { snap ->
+                        val color = Color(snap.colorHex)
+                        Surface(
+                            color = Color(0xCC14171E),
+                            shape = RoundedCornerShape(4.dp),
+                            border = androidx.compose.foundation.BorderStroke(
+                                1.dp,
+                                if (snap.isVisible) color else Color(0xFF37474F)
+                            ),
+                            modifier = Modifier.clickable { onToggleSnapshotVisibility(snap.id) }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .clip(CircleShape)
+                                        .background(if (snap.isVisible) color else Color(0xFF546E7A))
+                                )
+                                Text(
+                                    text = snap.name,
+                                    color = if (snap.isVisible) Color.White else Color(0xFF78909C),
+                                    fontSize = 9.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Remove",
+                                    tint = Color(0xFFFF8A80),
+                                    modifier = Modifier
+                                        .size(10.dp)
+                                        .clickable { onUnfreezeSnapshot(snap.id) }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Freeze button overlay
+            Surface(
+                color = Color(0xD900E5FF),
+                shape = RoundedCornerShape(6.dp),
+                modifier = Modifier.clickable { onFreeze() }
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.AcUnit,
+                        contentDescription = "Freeze",
+                        tint = Color.Black,
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Text(
+                        text = "FREEZE",
+                        color = Color.Black,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+
+            // Exit fullscreen collapse button
+            Surface(
+                color = Color(0xCC263238),
+                shape = RoundedCornerShape(6.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF455A64)),
+                modifier = Modifier.clickable { onExitFullscreen() }
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.FullscreenExit,
+                        contentDescription = "Exit Fullscreen",
+                        tint = Color(0xFFECEFF1),
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = "EXIT",
+                        color = Color(0xFFECEFF1),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -405,6 +623,7 @@ private fun SurfaceSpectrumCard(
     onClearAllFrozen: () -> Unit = {},
     onToggleSnapshotVisibility: (String) -> Unit = {},
     onUnfreezeSnapshot: (String) -> Unit = {},
+    onEnterFullscreen: () -> Unit = {},
     onSurfaceViewCreated: ((RtaSurfaceView) -> Unit)? = null,
     onToggleMode: (FftDisplayMode) -> Unit,
     onSelectWindowSize: (Int) -> Unit,
@@ -433,7 +652,7 @@ private fun SurfaceSpectrumCard(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            // Row 1: Mode Toggle & Window Size Chips
+            // Row 1: Mode Toggle, Window Size Chips & Fullscreen Button
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -459,19 +678,41 @@ private fun SurfaceSpectrumCard(
                     )
                 }
 
-                // Window Size Selector (1024, 2048, 4096)
                 Row(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(Color(0xFF0C0E12))
-                        .border(1.dp, Color(0xFF242C38), RoundedCornerShape(6.dp))
-                        .padding(2.dp)
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    listOf(1024, 2048, 4096).forEach { size ->
-                        WindowSizeChip(
-                            size = size,
-                            isSelected = diag.windowSize == size,
-                            onClick = { onSelectWindowSize(size) }
+                    // Window Size Selector (1024, 2048, 4096)
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color(0xFF0C0E12))
+                            .border(1.dp, Color(0xFF242C38), RoundedCornerShape(6.dp))
+                            .padding(2.dp)
+                    ) {
+                        listOf(1024, 2048, 4096).forEach { size ->
+                            WindowSizeChip(
+                                size = size,
+                                isSelected = diag.windowSize == size,
+                                onClick = { onSelectWindowSize(size) }
+                            )
+                        }
+                    }
+
+                    // Fullscreen Expand Button
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color(0xFF0C0E12))
+                            .border(1.dp, Color(0xFF242C38), RoundedCornerShape(6.dp))
+                            .clickable { onEnterFullscreen() }
+                            .padding(horizontal = 6.dp, vertical = 4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Fullscreen,
+                            contentDescription = "Fullscreen View",
+                            tint = Color(0xFF00E5FF),
+                            modifier = Modifier.size(16.dp)
                         )
                     }
                 }
@@ -565,7 +806,8 @@ private fun SurfaceSpectrumCard(
                             binResolutionHz = binResolution,
                             unreliableBands = uiState.unreliableBands,
                             targetDeltas31Db = uiState.targetDeltas31Db,
-                            frozenSnapshots = frozenSnapshots
+                            frozenSnapshots = frozenSnapshots,
+                            resetSmoothing = uiState.shouldResetSmoothing
                         )
                     }
                 )

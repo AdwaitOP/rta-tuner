@@ -22,7 +22,8 @@ data class CalibratedSpectralFrame(
     val unreliableBands: BooleanArray, // True if SNR < 6 dB or signal <= noise floor
     val targetDeltas31Db: FloatArray?, // measured - target (null if target inactive)
     val isSplMode: Boolean,
-    val splOffsetDb: Float
+    val splOffsetDb: Float,
+    val shouldResetSmoothing: Boolean = false
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -36,6 +37,7 @@ data class CalibratedSpectralFrame(
         } else if (other.targetDeltas31Db != null) return false
         if (isSplMode != other.isSplMode) return false
         if (splOffsetDb != other.splOffsetDb) return false
+        if (shouldResetSmoothing != other.shouldResetSmoothing) return false
         return true
     }
 
@@ -46,6 +48,7 @@ data class CalibratedSpectralFrame(
         result = 31 * result + (targetDeltas31Db?.contentHashCode() ?: 0)
         result = 31 * result + isSplMode.hashCode()
         result = 31 * result + splOffsetDb.hashCode()
+        result = 31 * result + shouldResetSmoothing.hashCode()
         return result
     }
 }
@@ -107,6 +110,8 @@ class CalibrationManager(context: Context) {
     private var noiseCaptureDurationMs = 2000L
     private var noiseAccumFrames = 0
     private val noiseAccumPower = DoubleArray(Iso31Bands.NUM_BANDS) { 0.0 }
+    @Volatile
+    private var shouldResetSmoothing = false
 
     init {
         loadPersistedState()
@@ -211,7 +216,6 @@ class CalibrationManager(context: Context) {
         rawFftDb: FloatArray,
         binResolutionHz: Float
     ): CalibratedSpectralFrame {
-        val state = _uiState.value
         val numBands = Iso31Bands.NUM_BANDS
 
         val out31 = FloatArray(numBands)
@@ -240,8 +244,11 @@ class CalibrationManager(context: Context) {
             }
         }
 
+        // Read state AFTER any potential finalizeNoiseCapture() call to ensure consistency in this frame
+        val state = _uiState.value
         val noiseSnapshot = state.noiseFloor
-        val isSubtractingNoise = state.isNoiseSubtractionActive && noiseSnapshot.isCaptured
+        // During active noise capture, display raw ambient noise rather than subtracting old baseline
+        val isSubtractingNoise = !isCapturingNoise && state.isNoiseSubtractionActive && noiseSnapshot.isCaptured
         val rawSplOffset = if (state.splCalibration.isSplMode) state.splCalibration.splOffsetDb else 0.0f
         val splOffset = if (rawSplOffset.isNaN() || rawSplOffset.isInfinite()) 0.0f else rawSplOffset
 
@@ -308,13 +315,17 @@ class CalibrationManager(context: Context) {
             }
         }
 
+        val reset = shouldResetSmoothing
+        shouldResetSmoothing = false
+
         return CalibratedSpectralFrame(
             calibrated31Db = out31,
             calibratedRawFftDb = outRawFft,
             unreliableBands = unreliable,
             targetDeltas31Db = targetDeltas,
             isSplMode = state.splCalibration.isSplMode,
-            splOffsetDb = state.splCalibration.splOffsetDb
+            splOffsetDb = state.splCalibration.splOffsetDb,
+            shouldResetSmoothing = reset
         )
     }
 
@@ -446,6 +457,7 @@ class CalibrationManager(context: Context) {
         noiseAccumFrames = 0
         noiseAccumPower.fill(0.0)
         isCapturingNoise = true
+        shouldResetSmoothing = true
 
         _uiState.value = _uiState.value.copy(
             isCapturingNoiseFloor = true,
@@ -485,6 +497,7 @@ class CalibrationManager(context: Context) {
             .putBoolean(KEY_NOISE_SUBTRACTION_ACTIVE, true)
             .apply()
 
+        shouldResetSmoothing = true
         _uiState.value = _uiState.value.copy(
             noiseFloor = snapshot,
             isNoiseSubtractionActive = true,
@@ -494,11 +507,13 @@ class CalibrationManager(context: Context) {
     }
 
     fun setNoiseSubtractionActive(active: Boolean) {
+        shouldResetSmoothing = true
         prefs.edit().putBoolean(KEY_NOISE_SUBTRACTION_ACTIVE, active).apply()
         _uiState.value = _uiState.value.copy(isNoiseSubtractionActive = active)
     }
 
     fun clearNoiseFloor() {
+        shouldResetSmoothing = true
         prefs.edit()
             .remove(KEY_NOISE_FLOOR_BANDS)
             .remove(KEY_NOISE_FLOOR_TIMESTAMP)
