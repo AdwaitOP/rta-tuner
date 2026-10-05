@@ -45,7 +45,7 @@ import com.rtatuner.app.core.audio.AudioInputDeviceInfo
 import com.rtatuner.app.core.audio.DeviceCategory
 
 /**
- * UI Component for Stage 7: Input Device Enumeration, Routing Status,
+ * UI Component for Input Device Enumeration, Routing Status,
  * Sample Rate Renegotiation, and Hotplug Detection.
  */
 @Composable

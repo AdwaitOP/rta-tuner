@@ -123,4 +123,25 @@ class SignalGeneratorTest {
             prev = window
         }
     }
+
+    @Test
+    fun testSignalGeneratorStateErrorMessage() {
+        val defaultState = com.rtatuner.app.core.audio.SignalGeneratorState()
+        assertEquals(null, defaultState.errorMessage)
+
+        val errorState = defaultState.copy(errorMessage = "AudioTrack creation failed")
+        assertEquals("AudioTrack creation failed", errorState.errorMessage)
+    }
+
+    @Test
+    fun testSignalGeneratorInitialStateAndStopSafety() {
+        val generator = com.rtatuner.app.core.audio.SignalGenerator(sampleRate = 48000)
+        assertEquals(com.rtatuner.app.core.audio.GeneratorMode.OFF, generator.state.value.mode)
+        assertEquals(false, generator.state.value.isPlaying)
+        assertEquals(null, generator.state.value.errorMessage)
+
+        // Multiple consecutive stop calls when already stopped must be safe and idempotent
+        generator.stop()
+        assertEquals(false, generator.state.value.isPlaying)
+    }
 }

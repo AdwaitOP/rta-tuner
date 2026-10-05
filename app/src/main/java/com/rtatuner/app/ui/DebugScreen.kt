@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.GraphicEq
@@ -210,7 +211,7 @@ fun DebugScreen(
                 )
             }
 
-            // Stage 7 Hotplug Switch Prompt Dialog
+            // Hotplug Switch Prompt Dialog
             val attachedPrompt = uiState.deviceAttachedPrompt
             if (attachedPrompt != null) {
                 AlertDialog(
@@ -278,7 +279,7 @@ fun DebugScreen(
                 )
             }
 
-            // Stage 3 SurfaceView Spectrum Card with Stage 6 Frozen Overlays
+            // SurfaceView Spectrum Card with Frozen Overlays
             SurfaceSpectrumCard(
                 uiState = uiState,
                 frozenSnapshots = frozenSnapshots,
@@ -300,7 +301,7 @@ fun DebugScreen(
                 }
             )
 
-            // Stage 5 Calibration & Target Curves Card
+            // Calibration & Target Curves Card
             CalibrationControlsCard(
                 uiState = uiState,
                 onLoadMicCurve = { name, content -> viewModel.loadMicCurve(name, content) },
@@ -315,7 +316,7 @@ fun DebugScreen(
                 onClearNoiseFloor = { viewModel.clearNoiseFloor() }
             )
 
-            // Stage 6 Session Tools Card
+            // Session Tools Card
             SessionToolsCard(
                 viewModel = viewModel,
                 surfaceViewRef = surfaceViewRef,
@@ -324,7 +325,7 @@ fun DebugScreen(
                 savedSessions = savedSessions
             )
 
-            // Stage 7 Audio Input Hardware & Device Selection Card
+            // Audio Input Hardware & Device Selection Card
             AudioInputDeviceCard(
                 uiState = uiState,
                 onSelectDevice = { viewModel.setPreferredInputDevice(it) },
@@ -335,7 +336,7 @@ fun DebugScreen(
             // Hardware Mic Noise Floor Limitation Notice
             MicNoiseFloorNoticeCard()
 
-            // Stage 4 Test Signal Generator Card
+            // Test Signal Generator Card
             SignalGeneratorCard(
                 state = uiState.generator,
                 onStartPinkNoise = { viewModel.startPinkNoise() },
@@ -361,8 +362,37 @@ fun DebugScreen(
                 onResetPeak = { viewModel.resetPeakHold() }
             )
 
-            // Hardware & Engine Diagnostics Card
-            HardwareDiagnosticsCard(uiState = uiState)
+            // Advanced Diagnostics Card (collapsed by default)
+            var showHardwareDiag by remember { mutableStateOf(false) }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(
+                        if (showHardwareDiag) Color(0xFF14171E) else Color.Transparent
+                    )
+                    .clickable { showHardwareDiag = !showHardwareDiag }
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Info,
+                    contentDescription = "Toggle advanced diagnostics",
+                    tint = Color(0xFF546E7A),
+                    modifier = Modifier.size(16.dp)
+                )
+                Text(
+                    text = if (showHardwareDiag) "▾ ADVANCED DIAGNOSTICS" else "▸ ADVANCED DIAGNOSTICS",
+                    color = Color(0xFF78909C),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+            if (showHardwareDiag) {
+                HardwareDiagnosticsCard(uiState = uiState)
+            }
 
             // Audio Controls (Start / Stop / Reset)
             ControlsSection(
@@ -440,6 +470,7 @@ private fun FullscreenGraphView(
             // Active frozen snapshots badges
             if (frozenSnapshots.isNotEmpty()) {
                 Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -567,7 +598,7 @@ private fun HeaderSection(status: CaptureStatus) {
                     letterSpacing = 1.sp
                 )
                 Text(
-                    text = "STAGE 7 • USB/EXT MIC, SESSIONS & 60FPS RTA",
+                    text = "Real-Time Audio Spectrum Analyzer",
                     color = Color(0xFF78909C),
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Bold,
@@ -723,26 +754,31 @@ private fun SurfaceSpectrumCard(
 
             // Row 2: EMA Averaging Presets & dB Range Selector
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 // EMA Averaging Selector
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(end = 6.dp)
+                ) {
                     Text(
                         text = "AVG:",
                         color = Color(0xFF78909C),
-                        fontSize = 10.sp,
+                        fontSize = 9.sp,
                         fontWeight = FontWeight.Bold,
                         fontFamily = FontFamily.Monospace,
-                        modifier = Modifier.padding(end = 4.dp)
+                        modifier = Modifier.padding(end = 3.dp)
                     )
                     Row(
                         modifier = Modifier
                             .clip(RoundedCornerShape(6.dp))
                             .background(Color(0xFF0C0E12))
                             .border(1.dp, Color(0xFF242C38), RoundedCornerShape(6.dp))
-                            .padding(2.dp)
+                            .padding(1.dp)
                     ) {
                         EmaPreset.values().forEach { preset ->
                             SelectChip(
@@ -759,17 +795,17 @@ private fun SurfaceSpectrumCard(
                     Text(
                         text = "RANGE:",
                         color = Color(0xFF78909C),
-                        fontSize = 10.sp,
+                        fontSize = 9.sp,
                         fontWeight = FontWeight.Bold,
                         fontFamily = FontFamily.Monospace,
-                        modifier = Modifier.padding(end = 4.dp)
+                        modifier = Modifier.padding(end = 3.dp)
                     )
                     Row(
                         modifier = Modifier
                             .clip(RoundedCornerShape(6.dp))
                             .background(Color(0xFF0C0E12))
                             .border(1.dp, Color(0xFF242C38), RoundedCornerShape(6.dp))
-                            .padding(2.dp)
+                            .padding(1.dp)
                     ) {
                         listOf(-60f, -80f, -90f).forEach { minDb ->
                             SelectChip(
@@ -852,6 +888,9 @@ private fun SurfaceSpectrumCard(
 
                 if (frozenSnapshots.isNotEmpty()) {
                     Row(
+                        modifier = Modifier
+                            .weight(1f, fill = false)
+                            .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -899,30 +938,60 @@ private fun SurfaceSpectrumCard(
             }
 
 
-            // Telemetry Row
+            // Performance Diagnostics (collapsed by default)
+            var showDiagnostics by remember { mutableStateOf(false) }
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(
+                        if (showDiagnostics) Color(0xFF00E676).copy(alpha = 0.06f)
+                        else Color.Transparent
+                    )
+                    .clickable { showDiagnostics = !showDiagnostics }
+                    .padding(horizontal = 4.dp, vertical = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = String.format(Locale.US, "RENDER: %.0f FPS (%d µs)", diag.renderFps, diag.renderDrawTimeUs),
-                    color = Color(0xFF00E676),
-                    fontSize = 10.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    softWrap = false
+                Icon(
+                    imageVector = Icons.Default.Info,
+                    contentDescription = "Toggle diagnostics",
+                    tint = Color(0xFF546E7A),
+                    modifier = Modifier.size(12.dp)
                 )
                 Text(
-                    text = String.format(Locale.US, "AUDIO: %.0f FPS (%d µs)", diag.fps, diag.fftExecutionTimeUs),
-                    color = Color(0xFF81D4FA),
-                    fontSize = 10.sp,
-                    fontFamily = FontFamily.Monospace,
+                    text = if (showDiagnostics) "HIDE DIAGNOSTICS" else "DIAGNOSTICS",
+                    color = Color(0xFF546E7A),
+                    fontSize = 9.sp,
                     fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    softWrap = false
+                    fontFamily = FontFamily.Monospace
                 )
+            }
+            if (showDiagnostics) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = String.format(Locale.US, "RENDER: %.0f FPS (%d µs)", diag.renderFps, diag.renderDrawTimeUs),
+                        color = Color(0xFF00E676),
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        softWrap = false
+                    )
+                    Text(
+                        text = String.format(Locale.US, "AUDIO: %.0f FPS (%d µs)", diag.fps, diag.fftExecutionTimeUs),
+                        color = Color(0xFF81D4FA),
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        softWrap = false
+                    )
+                }
             }
 
             // Peak-Hold Ballistics Toggle — own row so it always has full width
@@ -1043,7 +1112,7 @@ private fun SelectChip(
             .clip(RoundedCornerShape(4.dp))
             .background(if (isSelected) Color(0xFF37474F) else Color.Transparent)
             .clickable { onClick() }
-            .padding(horizontal = 6.dp, vertical = 3.dp)
+            .padding(horizontal = 5.dp, vertical = 2.dp)
     ) {
         Text(
             text = label,
@@ -1404,7 +1473,7 @@ private fun HardwareDiagnosticsCard(uiState: AudioCaptureUiState) {
             verticalArrangement = Arrangement.spacedBy(9.dp)
         ) {
             Text(
-                text = "HARDWARE & PERFORMANCE TELEMETRY",
+                text = "HARDWARE & ENGINE DIAGNOSTICS",
                 color = Color(0xFFECEFF1),
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Bold,
@@ -1553,7 +1622,7 @@ private fun MicNoiseFloorNoticeCard() {
             )
             Spacer(modifier = Modifier.width(10.dp))
             Text(
-                text = "Hardware note: Internal mic 1/f self-noise naturally elevates readings below ~200Hz. Subwoofer reference calibration is mic-limited until Stage 7 (USB measurement mic).",
+                text = "Hardware note: Internal mic 1/f self-noise naturally elevates readings below ~200Hz. For more accurate sub-bass measurements, use an external USB measurement microphone.",
                 color = Color(0xFF90A4AE),
                 fontSize = 11.sp,
                 fontFamily = FontFamily.Monospace,
@@ -1625,6 +1694,36 @@ private fun SignalGeneratorCard(
                         softWrap = false,
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
                     )
+                }
+            }
+
+            // Error banner if any
+            if (state.errorMessage != null) {
+                Surface(
+                    color = Color(0xFFB71C1C).copy(alpha = 0.2f),
+                    shape = RoundedCornerShape(4.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFFF5252).copy(alpha = 0.5f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Warning,
+                            contentDescription = "Error",
+                            tint = Color(0xFFFF5252),
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = state.errorMessage,
+                            color = Color(0xFFFF8A80),
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 }
             }
 
@@ -1945,7 +2044,7 @@ fun CalibrationControlsCard(
                         modifier = Modifier.size(18.dp)
                     )
                     Text(
-                        text = "STAGE 5: CALIBRATION & TARGET CURVES",
+                        text = "CALIBRATION & TARGET CURVES",
                         color = Color.White,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold,

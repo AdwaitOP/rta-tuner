@@ -44,6 +44,7 @@ class SignalGenerator(
     private val isRunning = AtomicBoolean(false)
     private var playbackThread: Thread? = null
     private var audioTrack: AudioTrack? = null
+    private val trackLock = Any()
 
     // Fade state variables (protected by thread synchronization)
     @Volatile
@@ -59,7 +60,8 @@ class SignalGenerator(
         _state.value = _state.value.copy(
             mode = GeneratorMode.PINK_NOISE,
             isPlaying = true,
-            outputLevelDb = levelDb.coerceIn(-30.0f, 0.0f)
+            outputLevelDb = levelDb.coerceIn(-30.0f, 0.0f),
+            errorMessage = null
         )
         startPlaybackThread()
     }
@@ -79,7 +81,8 @@ class SignalGenerator(
             isPlaying = true,
             outputLevelDb = levelDb.coerceIn(-30.0f, 0.0f),
             currentSweepProgress = 0.0f,
-            currentSweepFreqHz = range.startFreqHz
+            currentSweepFreqHz = range.startFreqHz,
+            errorMessage = null
         )
         startPlaybackThread()
     }
@@ -99,17 +102,19 @@ class SignalGenerator(
         } catch (ignored: InterruptedException) {}
         playbackThread = null
 
-        audioTrack?.let { track ->
-            try {
-                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    track.stop()
+        synchronized(trackLock) {
+            audioTrack?.let { track ->
+                try {
+                    if (track.state == AudioTrack.STATE_INITIALIZED && track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                        track.stop()
+                    }
+                    track.release()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Exception cleaning up AudioTrack", e)
                 }
-                track.release()
-            } catch (e: Exception) {
-                Log.w(TAG, "Exception cleaning up AudioTrack", e)
             }
+            audioTrack = null
         }
-        audioTrack = null
         _state.value = _state.value.copy(isPlaying = false, mode = GeneratorMode.OFF)
     }
 
@@ -172,18 +177,36 @@ class SignalGenerator(
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create AudioTrack", e)
             isRunning.set(false)
-            _state.value = _state.value.copy(isPlaying = false, mode = GeneratorMode.OFF)
+            _state.value = _state.value.copy(
+                isPlaying = false,
+                mode = GeneratorMode.OFF,
+                errorMessage = "Failed to create AudioTrack: ${e.localizedMessage ?: e.message}"
+            )
             return
         }
-        audioTrack = track
+
+        synchronized(trackLock) {
+            audioTrack = track
+        }
 
         try {
             track.play()
         } catch (e: Exception) {
             Log.e(TAG, "AudioTrack.play() failed", e)
-            track.release()
+            synchronized(trackLock) {
+                try {
+                    track.release()
+                } catch (ignored: Exception) {}
+                if (audioTrack === track) {
+                    audioTrack = null
+                }
+            }
             isRunning.set(false)
-            _state.value = _state.value.copy(isPlaying = false, mode = GeneratorMode.OFF)
+            _state.value = _state.value.copy(
+                isPlaying = false,
+                mode = GeneratorMode.OFF,
+                errorMessage = "Failed to start AudioTrack: ${e.localizedMessage ?: e.message}"
+            )
             return
         }
 
@@ -296,9 +319,35 @@ class SignalGenerator(
                 pcmBuffer[i] = (clamped * 32767.0).toInt().toShort()
             }
 
-            // Write chunk to AudioTrack
+            // Write chunk to AudioTrack safely wrapped to handle post-release race or write failures
             if (isRunning.get() || fadeSamplesRemaining > 0) {
-                track.write(pcmBuffer, 0, CHUNK_SIZE)
+                val shouldContinue = try {
+                    val currentTrack = synchronized(trackLock) { audioTrack }
+                    if (currentTrack != null &&
+                        currentTrack.state == AudioTrack.STATE_INITIALIZED &&
+                        currentTrack.playState == AudioTrack.PLAYSTATE_PLAYING
+                    ) {
+                        val written = currentTrack.write(pcmBuffer, 0, CHUNK_SIZE)
+                        if (written < 0) {
+                            Log.w(TAG, "AudioTrack.write returned error code: $written")
+                            false
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                } catch (e: IllegalStateException) {
+                    Log.w(TAG, "AudioTrack.write called after release or invalid state", e)
+                    false
+                } catch (e: Exception) {
+                    Log.w(TAG, "AudioTrack.write failed with exception", e)
+                    false
+                }
+
+                if (!shouldContinue) {
+                    break
+                }
             }
 
             // Update UI progress telemetry for sweep mode
@@ -312,13 +361,20 @@ class SignalGenerator(
             }
         }
 
-        // Clean up AudioTrack
-        try {
-            if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                track.stop()
+        // Clean up AudioTrack safely
+        synchronized(trackLock) {
+            try {
+                if (track.state == AudioTrack.STATE_INITIALIZED) {
+                    if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                        track.stop()
+                    }
+                    track.release()
+                }
+            } catch (ignored: Exception) {}
+            if (audioTrack === track) {
+                audioTrack = null
             }
-            track.release()
-        } catch (ignored: Exception) {}
+        }
 
         _state.value = _state.value.copy(
             isPlaying = false,

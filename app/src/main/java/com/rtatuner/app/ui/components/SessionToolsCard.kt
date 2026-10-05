@@ -125,7 +125,7 @@ fun SessionToolsCard(
                             letterSpacing = 0.5.sp
                         )
                         Text(
-                            text = "STAGE 6 • FREEZE OVERLAYS, EXPORT & ROOM HISTORY",
+                            text = "Freeze overlays, export & room history",
                             color = Color(0xFF78909C),
                             fontSize = 9.sp,
                             fontFamily = FontFamily.Monospace

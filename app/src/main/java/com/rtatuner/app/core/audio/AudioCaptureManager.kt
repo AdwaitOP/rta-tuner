@@ -10,13 +10,11 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Process
 import android.util.Log
-import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.emptyFlow
 import com.rtatuner.app.core.dsp.BiquadFilterBank
 import com.rtatuner.app.core.dsp.FftProcessor
 import java.util.concurrent.atomic.AtomicBoolean
@@ -50,13 +48,8 @@ class AudioCaptureManager(
     // State flow for UI and diagnostics
     private val _uiState = MutableStateFlow(AudioCaptureUiState())
     val uiState: StateFlow<AudioCaptureUiState> = _uiState.asStateFlow()
-
-    // Non-blocking channel for high-speed audio frames
-    private val frameChannel = Channel<AudioFrame>(
-        capacity = 4,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST
-    )
-    val audioFrames: Flow<AudioFrame> = frameChannel.receiveAsFlow()
+    @Deprecated("Legacy unbuffered flow; observe uiState directly instead", ReplaceWith("uiState"))
+    val audioFrames: Flow<AudioFrame> = emptyFlow()
 
     private val isRunning = AtomicBoolean(false)
     private var captureThread: Thread? = null
@@ -422,7 +415,8 @@ class AudioCaptureManager(
                 val isClipping = AudioMath.isClipping(readBuffer, readResult)
 
                 // Real-time FFT spectral analysis (Hann window, Radix-2 FFT powering raw FFT line mode)
-                val fftResult = fftProcessor.processFrame(slidingWindow)
+                // Skips redundant 31-band binning since 64-bit continuous IIR BiquadFilterBank is authoritative for 1/3-octave view
+                val fftResult = fftProcessor.processFrame(slidingWindow, computeOctaveBands = false)
 
                 val nowNs = System.nanoTime()
                 totalFrames++
@@ -433,18 +427,6 @@ class AudioCaptureManager(
                     framesInSecond = 0
                     lastFpsTimeNs = nowNs
                 }
-
-                val frame = AudioFrame(
-                    samples = slidingWindow.copyOf(), // Cloned for downstream thread safety
-                    sampleRate = sampleRate,
-                    rmsDb = rmsDb,
-                    peakDb = peakDb,
-                    isClipping = isClipping,
-                    fftResult = fftResult.copy(octave31Db = octave31FilterDb),
-                    timestampNs = nowNs
-                )
-
-                frameChannel.trySend(frame)
 
                 // Update UI state diagnostics periodically (avoid overwhelming Main thread)
                 _uiState.value = _uiState.value.let { current ->

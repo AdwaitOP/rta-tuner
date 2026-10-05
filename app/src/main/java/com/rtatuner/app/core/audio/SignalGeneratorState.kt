@@ -33,5 +33,6 @@ data class SignalGeneratorState(
     val sweepRange: SweepRangePreset = SweepRangePreset.FULL_SPECTRUM,
     val isSweepLooping: Boolean = true,
     val currentSweepProgress: Float = 0.0f, // 0.0 to 1.0
-    val currentSweepFreqHz: Float = 20.0f
+    val currentSweepFreqHz: Float = 20.0f,
+    val errorMessage: String? = null
 )

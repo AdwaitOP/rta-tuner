@@ -27,7 +27,7 @@ data class FftResult(
  * High-performance DSP processor executing:
  * - Precomputed Hann windowing
  * - Radix-2 Real FFT via JTransforms
- * - Amplitude-calibrated dBFS magnitude conversion (0 dBFS for 1.0 pk sine)
+ * - RMS-calibrated dBFS magnitude conversion (-3.01 dBFS for 1.0 pk sine, matching true RMS and BiquadFilterBank)
  * - ISO 31-band 1/3-octave energy aggregation
  * - Zero allocations in processFrame()
  */
@@ -99,11 +99,21 @@ class FftProcessor(
         }
     }
 
+    companion object {
+        private val EMPTY_OCTAVE_BANDS = FloatArray(0)
+    }
+
     /**
-     * Executes windowing, FFT, magnitude conversion, and 1/3-octave smoothing.
+     * Executes windowing, FFT, magnitude conversion, and optional 1/3-octave smoothing.
      * Operates completely in-place on pre-allocated buffers.
+     *
+     * @param pcmSamples 16-bit PCM samples to analyze
+     * @param computeOctaveBands If false, skips redundant 31-band binning and buffer allocation (used when BiquadFilterBank is active)
      */
-    fun processFrame(pcmSamples: ShortArray): FftResult {
+    fun processFrame(
+        pcmSamples: ShortArray,
+        computeOctaveBands: Boolean = true
+    ): FftResult {
         val startTimeNs = System.nanoTime()
 
         val length = min(pcmSamples.size, windowSize)
@@ -132,8 +142,9 @@ class FftProcessor(
         rawDbBuffer[nyquistIndex] = AudioMath.linearToDbFs(nyquistMag)
 
         // Positive frequency bins (k = 1 until N/2):
-        // Scale by 2.0 / sumHannWeights for single-sided amplitude calibration
-        val scale = 2.0f / sumHannWeights
+        // Scale by sqrt(2) / sumHannWeights for single-sided RMS calibration
+        // Produces -3.01 dBFS for 1.0 pk sine, matching true RMS and BiquadFilterBank
+        val scale = sqrt(2.0f) / sumHannWeights
         for (k in 1 until nyquistIndex) {
             val re = fftBuffer[2 * k]
             val im = fftBuffer[2 * k + 1]
@@ -142,33 +153,35 @@ class FftProcessor(
             rawDbBuffer[k] = AudioMath.linearToDbFs(mag)
         }
 
-        // 4. Compute 1/3-Octave ISO 31-Band Energy Aggregation
-        for (b in 0 until Iso31Bands.NUM_BANDS) {
-            val mapping = bandMappings[b]
-            val bins = mapping.bins
+        // 4. Compute 1/3-Octave ISO 31-Band Energy Aggregation (skipped when BiquadFilterBank is active)
+        if (computeOctaveBands) {
+            for (b in 0 until Iso31Bands.NUM_BANDS) {
+                val mapping = bandMappings[b]
+                val bins = mapping.bins
 
-            val bandMag = when {
-                bins.size > 1 -> {
-                    // Sum the power (mag^2) across all bins in the band, normalized by ENBW to prevent window leakage inflation
-                    var powerSum = 0.0
-                    for (k in bins) {
-                        val m = linearMagnitudes[k]
-                        powerSum += (m * m)
+                val bandMag = when {
+                    bins.size > 1 -> {
+                        // Sum the power (mag^2) across all bins in the band, normalized by ENBW to prevent window leakage inflation
+                        var powerSum = 0.0
+                        for (k in bins) {
+                            val m = linearMagnitudes[k]
+                            powerSum += (m * m)
+                        }
+                        sqrt(powerSum / enbwFactor).toFloat()
                     }
-                    sqrt(powerSum / enbwFactor).toFloat()
+                    bins.size == 1 -> linearMagnitudes[bins[0]]
+                    else -> linearMagnitudes[mapping.nearestBin]
                 }
-                bins.size == 1 -> linearMagnitudes[bins[0]]
-                else -> linearMagnitudes[mapping.nearestBin]
-            }
 
-            octaveDbBuffer[b] = AudioMath.linearToDbFs(bandMag)
+                octaveDbBuffer[b] = AudioMath.linearToDbFs(bandMag)
+            }
         }
 
         val elapsedUs = (System.nanoTime() - startTimeNs) / 1000L
 
         return FftResult(
             rawFftDb = rawDbBuffer.copyOf(),
-            octave31Db = octaveDbBuffer.copyOf(),
+            octave31Db = if (computeOctaveBands) octaveDbBuffer.copyOf() else EMPTY_OCTAVE_BANDS,
             binResolutionHz = binResolutionHz,
             executionTimeUs = elapsedUs
         )

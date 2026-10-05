@@ -128,31 +128,37 @@ fun LevelMeter(
                     )
                 }
 
-                // Draw scale ticks across the meter
-                val tickMarks = listOf(-60f, -48f, -36f, -24f, -18f, -12f, -6f, -3f)
-                for (tickDb in tickMarks) {
-                    val tickFraction = (tickDb - minDb) / (maxDb - minDb)
-                    val tickX = size.width * tickFraction
-                    drawLine(
-                        color = Color(0x66FFFFFF),
-                        start = Offset(tickX, barHeight - 6.dp.toPx()),
-                        end = Offset(tickX, barHeight),
-                        strokeWidth = 1.dp.toPx()
-                    )
+                // Draw scale ticks across the meter (relative to safeMaxDb, shifting properly in SPL mode)
+                val relativeTickOffsets = listOf(60f, 48f, 36f, 24f, 18f, 12f, 6f, 3f)
+                for (offset in relativeTickOffsets) {
+                    val tickDb = safeMaxDb - offset
+                    if (tickDb > safeMinDb) {
+                        val tickFraction = ((tickDb - safeMinDb) / span).coerceIn(0f, 1f)
+                        val tickX = size.width * tickFraction
+                        drawLine(
+                            color = Color(0x66FFFFFF),
+                            start = Offset(tickX, barHeight - 6.dp.toPx()),
+                            end = Offset(tickX, barHeight),
+                            strokeWidth = 1.dp.toPx()
+                        )
+                    }
                 }
             }
         }
 
-        // Scale label ticks below the bar
+        // Scale label ticks below the bar (shifted dynamically for dBFS or dBSPL)
+        val labelOffsets = listOf(90f, 60f, 36f, 24f, 18f, 12f, 6f, 0f)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 2.dp),
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            listOf("-90", "-60", "-36", "-24", "-18", "-12", "-6", "0").forEach { mark ->
+            labelOffsets.forEach { offset ->
+                val markDb = safeMaxDb - offset
+                val labelText = String.format(Locale.US, "%.0f", markDb)
                 Text(
-                    text = mark,
+                    text = labelText,
                     color = Color(0xFF78909C),
                     fontSize = 9.sp,
                     fontFamily = FontFamily.Monospace
