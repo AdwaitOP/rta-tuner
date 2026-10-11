@@ -1,5 +1,6 @@
 package com.rtatuner.app.core.database
 
+import com.rtatuner.app.core.entitlement.FeatureAccessPolicy
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -11,7 +12,8 @@ import kotlinx.coroutines.withContext
  */
 class SessionRepository(
     private val sessionDao: TuningSessionDao,
-    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val featureAccessPolicy: FeatureAccessPolicy = FeatureAccessPolicy()
 ) {
 
     val allSessionsWithSnapshots: Flow<List<SessionWithSnapshots>> =
@@ -21,12 +23,7 @@ class SessionRepository(
         session: TuningSessionEntity,
         snapshots: List<SessionSnapshotEntity>
     ): Long = withContext(ioDispatcher) {
-        val sessionId = sessionDao.insertSession(session)
-        if (snapshots.isNotEmpty()) {
-            val linkedSnapshots = snapshots.map { it.copy(sessionId = sessionId) }
-            sessionDao.insertSnapshots(linkedSnapshots)
-        }
-        sessionId
+        sessionDao.saveSessionWithSnapshots(session, snapshots, featureAccessPolicy)
     }
 
     suspend fun updateSessionNotes(sessionId: Long, notes: String) = withContext(ioDispatcher) {

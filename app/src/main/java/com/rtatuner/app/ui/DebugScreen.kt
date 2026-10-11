@@ -74,6 +74,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import com.rtatuner.app.R
+import com.rtatuner.app.BuildConfig
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -84,8 +85,12 @@ import com.rtatuner.app.core.audio.AudioCaptureUiState
 import com.rtatuner.app.core.audio.CaptureStatus
 import com.rtatuner.app.core.audio.FftDisplayMode
 import com.rtatuner.app.core.session.RtaSnapshot
+import com.rtatuner.app.core.entitlement.FeatureAccessResult
+import com.rtatuner.app.core.entitlement.ProFeature
 import com.rtatuner.app.ui.components.LevelMeter
 import com.rtatuner.app.ui.components.SessionToolsCard
+import com.rtatuner.app.ui.components.ProUpgradeSheet
+import com.rtatuner.app.ui.components.ProFeatureNotice
 import com.rtatuner.app.ui.components.AudioInputDeviceCard
 import com.rtatuner.app.ui.components.surface.RtaSurfaceView
 import androidx.compose.material.icons.filled.AcUnit
@@ -112,7 +117,30 @@ fun DebugScreen(
     val frozenSnapshots by viewModel.frozenSnapshots.collectAsState()
     val savedSessions by viewModel.savedSessions.collectAsState()
     val isFullscreenGraph by viewModel.isFullscreenGraph.collectAsState()
+    val entitlement by viewModel.entitlementState.collectAsState()
+    val accessDenial by viewModel.accessDenial.collectAsState()
+    val policy = viewModel.featureAccessPolicy
+    val canFreeze = remember(entitlement, frozenSnapshots.size) {
+        policy.checkOverlayCapacity(frozenSnapshots.size) is FeatureAccessResult.Allowed
+    }
+    val canMicCalibrate = remember(entitlement) { policy.check(ProFeature.MIC_CALIBRATION) is FeatureAccessResult.Allowed }
+    val canSplCalibrate = remember(entitlement) { policy.check(ProFeature.SPL_CALIBRATION) is FeatureAccessResult.Allowed }
+    val canCorrectNoise = remember(entitlement) { policy.check(ProFeature.NOISE_FLOOR) is FeatureAccessResult.Allowed }
+    val canUseAdvancedTargets = remember(entitlement) { policy.check(ProFeature.ADVANCED_TARGETS) is FeatureAccessResult.Allowed }
+    val canUseSweep = remember(entitlement) { policy.check(ProFeature.SINE_SWEEP) is FeatureAccessResult.Allowed }
     var surfaceViewRef by remember { mutableStateOf<RtaSurfaceView?>(null) }
+
+    accessDenial?.let { denial ->
+        ProUpgradeSheet(
+            entitlement = entitlement,
+            feature = denial.feature,
+            message = denial.message,
+            onDismiss = { viewModel.dismissAccessDenial() },
+            onSimulateTier = {
+                if (viewModel.simulateEntitlement(it)) viewModel.dismissAccessDenial()
+            }
+        )
+    }
 
     val activity = context as? Activity
 
@@ -170,6 +198,7 @@ fun DebugScreen(
         FullscreenGraphView(
             uiState = uiState,
             frozenSnapshots = frozenSnapshots,
+            canFreeze = canFreeze,
             onFreeze = { viewModel.freezeCurrentSnapshot() },
             onUnfreezeSnapshot = { viewModel.unfreezeSnapshot(it) },
             onToggleSnapshotVisibility = { viewModel.toggleSnapshotVisibility(it) },
@@ -194,6 +223,14 @@ fun DebugScreen(
         ) {
             // Header Bar
             HeaderSection(status = uiState.status)
+
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text(if (entitlement.isPro && BuildConfig.DEBUG) "DEBUG · SIMULATED PRO" else if (entitlement.isPro) "PRO ACCESS" else "FREE · COMPLETE LIVE ANALYZER",
+                    color = Color(0xFF78909C), fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+                TextButton(onClick = { viewModel.requestProUpgrade() }) {
+                    Text("PRO · COMING SOON", color = Color(0xFF00E5FF), fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                }
+            }
 
             // Permission Banner
             if (!hasPermission) {
@@ -285,6 +322,7 @@ fun DebugScreen(
             SurfaceSpectrumCard(
                 uiState = uiState,
                 frozenSnapshots = frozenSnapshots,
+                canFreeze = canFreeze,
                 onFreeze = { viewModel.freezeCurrentSnapshot() },
                 onClearAllFrozen = { viewModel.clearAllFrozenSnapshots() },
                 onToggleSnapshotVisibility = { viewModel.toggleSnapshotVisibility(it) },
@@ -306,6 +344,11 @@ fun DebugScreen(
             // Calibration & Target Curves Card
             CalibrationControlsCard(
                 uiState = uiState,
+                canMicCalibrate = canMicCalibrate,
+                canSplCalibrate = canSplCalibrate,
+                canCorrectNoise = canCorrectNoise,
+                canUseAdvancedTargets = canUseAdvancedTargets,
+                onRequestPro = { viewModel.requestProUpgrade(it) },
                 onLoadMicCurve = { name, content -> viewModel.loadMicCurve(name, content) },
                 onSetMicCurveActive = { viewModel.setMicCurveActive(it) },
                 onClearMicCurve = { viewModel.clearMicCurve() },
@@ -341,6 +384,8 @@ fun DebugScreen(
             // Test Signal Generator Card
             SignalGeneratorCard(
                 state = uiState.generator,
+                canUseSweep = canUseSweep,
+                onRequestPro = { viewModel.requestProUpgrade(ProFeature.SINE_SWEEP) },
                 onStartPinkNoise = { viewModel.startPinkNoise() },
                 onStartSineSweep = { viewModel.startSineSweep() },
                 onStop = { viewModel.stopGenerator() },
@@ -415,6 +460,7 @@ fun DebugScreen(
 private fun FullscreenGraphView(
     uiState: AudioCaptureUiState,
     frozenSnapshots: List<RtaSnapshot>,
+    canFreeze: Boolean,
     onFreeze: () -> Unit,
     onUnfreezeSnapshot: (String) -> Unit,
     onToggleSnapshotVisibility: (String) -> Unit,
@@ -536,7 +582,7 @@ private fun FullscreenGraphView(
                         modifier = Modifier.size(14.dp)
                     )
                     Text(
-                        text = "FREEZE",
+                        text = if (canFreeze) "FREEZE" else "FREEZE · PRO",
                         color = Color.Black,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
@@ -655,6 +701,7 @@ private fun StatusBadge(status: CaptureStatus) {
 private fun SurfaceSpectrumCard(
     uiState: AudioCaptureUiState,
     frozenSnapshots: List<RtaSnapshot> = emptyList(),
+    canFreeze: Boolean = true,
     onFreeze: () -> Unit = {},
     onClearAllFrozen: () -> Unit = {},
     onToggleSnapshotVisibility: (String) -> Unit = {},
@@ -879,7 +926,7 @@ private fun SurfaceSpectrumCard(
                             modifier = Modifier.size(12.dp)
                         )
                         Text(
-                            text = "FREEZE",
+                            text = if (canFreeze) "FREEZE" else "FREEZE · PRO",
                             color = Color.Black,
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
@@ -1637,6 +1684,8 @@ private fun MicNoiseFloorNoticeCard() {
 @Composable
 private fun SignalGeneratorCard(
     state: SignalGeneratorState,
+    canUseSweep: Boolean,
+    onRequestPro: () -> Unit,
     onStartPinkNoise: () -> Unit,
     onStartSineSweep: () -> Unit,
     onStop: () -> Unit,
@@ -1729,6 +1778,10 @@ private fun SignalGeneratorCard(
                 }
             }
 
+            if (!canUseSweep) {
+                ProFeatureNotice(ProFeature.SINE_SWEEP, onRequestPro)
+            }
+
             // Signal Type Buttons
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1769,7 +1822,7 @@ private fun SignalGeneratorCard(
                     modifier = Modifier.weight(1f).height(38.dp)
                 ) {
                     Text(
-                        text = "SINE SWEEP",
+                        text = if (canUseSweep) "SINE SWEEP" else "SWEEP · PRO",
                         color = if (state.mode == GeneratorMode.SINE_SWEEP && state.isPlaying)
                             Color.White else Color(0xFFB0BEC5),
                         fontSize = 11.sp,
@@ -1831,7 +1884,7 @@ private fun SignalGeneratorCard(
             }
 
             // Sweep Configuration Controls (Only when in SINE_SWEEP mode or idle)
-            if (state.mode == GeneratorMode.SINE_SWEEP) {
+            if (state.mode == GeneratorMode.SINE_SWEEP || !canUseSweep) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1920,7 +1973,7 @@ private fun SignalGeneratorCard(
                     }
 
                     // Sweep Live Progress & Frequency Telemetry
-                    if (state.isPlaying) {
+                    if (state.isPlaying && state.mode == GeneratorMode.SINE_SWEEP) {
                         Spacer(modifier = Modifier.height(2.dp))
                         LinearProgressIndicator(
                             progress = { state.currentSweepProgress },
@@ -1975,6 +2028,11 @@ private const val SAMPLE_UMIK1_CAL = """# miniDSP UMIK-1 Sample 90-degree Calibr
 @Composable
 fun CalibrationControlsCard(
     uiState: AudioCaptureUiState,
+    canMicCalibrate: Boolean,
+    canSplCalibrate: Boolean,
+    canCorrectNoise: Boolean,
+    canUseAdvancedTargets: Boolean,
+    onRequestPro: (ProFeature) -> Unit,
     onLoadMicCurve: (name: String, content: String) -> Result<MicCalibrationCurve>,
     onSetMicCurveActive: (Boolean) -> Unit,
     onClearMicCurve: () -> Unit,
@@ -1996,10 +2054,17 @@ fun CalibrationControlsCard(
     var parseErrorMsg by remember { mutableStateOf<String?>(null) }
     var splTargetInput by remember { mutableStateOf("85.0") }
 
+    LaunchedEffect(canMicCalibrate, canSplCalibrate) {
+        if (!canMicCalibrate) showPasteDialog = false
+        if (!canSplCalibrate) showSplDialog = false
+    }
+
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri ->
-        if (uri != null) {
+        if (uri != null && !canMicCalibrate) {
+            onRequestPro(ProFeature.MIC_CALIBRATION)
+        } else if (uri != null) {
             try {
                 val content = context.contentResolver.openInputStream(uri)?.use { stream ->
                     stream.bufferedReader().readText()
@@ -2087,6 +2152,16 @@ fun CalibrationControlsCard(
                 }
             }
 
+            val lockedFeature = when (selectedTab) {
+                0 -> if (canMicCalibrate) null else ProFeature.MIC_CALIBRATION
+                1 -> if (canSplCalibrate) null else ProFeature.SPL_CALIBRATION
+                2 -> if (canUseAdvancedTargets) null else ProFeature.ADVANCED_TARGETS
+                else -> if (canCorrectNoise) null else ProFeature.NOISE_FLOOR
+            }
+            lockedFeature?.let { feature ->
+                ProFeatureNotice(feature, onLearnMore = { onRequestPro(feature) })
+            }
+
             // Tab 0: Microphone Frequency Response Calibration
             if (selectedTab == 0) {
                 Column(
@@ -2149,8 +2224,10 @@ fun CalibrationControlsCard(
                     ) {
                         Button(
                             onClick = {
-                                val res = onLoadMicCurve("miniDSP UMIK-1 (Demo)", SAMPLE_UMIK1_CAL)
-                                if (res.isFailure) parseErrorMsg = res.exceptionOrNull()?.message
+                                if (canMicCalibrate) {
+                                    val res = onLoadMicCurve("miniDSP UMIK-1 (Demo)", SAMPLE_UMIK1_CAL)
+                                    if (res.isFailure) parseErrorMsg = res.exceptionOrNull()?.message
+                                } else onRequestPro(ProFeature.MIC_CALIBRATION)
                             },
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = Color(0xFF1E3A5F),
@@ -2163,7 +2240,10 @@ fun CalibrationControlsCard(
                         }
 
                         Button(
-                            onClick = { filePickerLauncher.launch("*/*") },
+                            onClick = {
+                                if (canMicCalibrate) filePickerLauncher.launch("*/*")
+                                else onRequestPro(ProFeature.MIC_CALIBRATION)
+                            },
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = Color(0xFF2E3B4E),
                                 contentColor = Color.White
@@ -2175,7 +2255,10 @@ fun CalibrationControlsCard(
                         }
 
                         Button(
-                            onClick = { showPasteDialog = true },
+                            onClick = {
+                                if (canMicCalibrate) showPasteDialog = true
+                                else onRequestPro(ProFeature.MIC_CALIBRATION)
+                            },
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = Color(0xFF2E3B4E),
                                 contentColor = Color.White
@@ -2250,7 +2333,7 @@ fun CalibrationControlsCard(
                                 onClick = { onSetSplMode(false) }
                             )
                             SelectChip(
-                                label = "dB SPL",
+                                label = if (canSplCalibrate) "dB SPL" else "SPL · PRO",
                                 isSelected = calib.splCalibration.isSplMode,
                                 onClick = { onSetSplMode(true) }
                             )
@@ -2262,7 +2345,10 @@ fun CalibrationControlsCard(
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         Button(
-                            onClick = { showSplDialog = true },
+                            onClick = {
+                                if (canSplCalibrate) showSplDialog = true
+                                else onRequestPro(ProFeature.SPL_CALIBRATION)
+                            },
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = Color(0xFF00695C),
                                 contentColor = Color.White
@@ -2351,7 +2437,7 @@ fun CalibrationControlsCard(
                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
                         SelectChip(
-                            label = "FLAT (0 dB)",
+                            label = if (canUseAdvancedTargets) "FLAT (0 dB)" else "FLAT · PRO",
                             isSelected = calib.targetCurve?.id == TargetCurve.FLAT.id,
                             onClick = { onSetTargetCurve(TargetCurve.FLAT) }
                         )
@@ -2361,7 +2447,7 @@ fun CalibrationControlsCard(
                             onClick = { onSetTargetCurve(TargetCurve.HARMAN_CAR) }
                         )
                         SelectChip(
-                            label = "AUDIO CONTROL (+6dB)",
+                            label = if (canUseAdvancedTargets) "AUDIO CONTROL (+6dB)" else "AUDIOCONTROL · PRO",
                             isSelected = calib.targetCurve?.id == TargetCurve.AUDIO_CONTROL_CAR.id,
                             onClick = { onSetTargetCurve(TargetCurve.AUDIO_CONTROL_CAR) }
                         )
@@ -2483,7 +2569,7 @@ fun CalibrationControlsCard(
                                 shape = RoundedCornerShape(4.dp),
                                 modifier = Modifier.weight(1f).height(32.dp)
                             ) {
-                                Text("CAPTURE NOISE (2s)", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                                Text(if (canCorrectNoise) "CAPTURE NOISE (2s)" else "CAPTURE NOISE · PRO", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                             }
 
                             if (calib.noiseFloor.isCaptured) {

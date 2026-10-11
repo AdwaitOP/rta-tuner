@@ -15,6 +15,8 @@ import com.rtatuner.app.R
 import com.rtatuner.app.core.audio.AudioMath
 import com.rtatuner.app.core.database.SessionWithSnapshots
 import com.rtatuner.app.core.dsp.Iso31Bands
+import com.rtatuner.app.core.entitlement.FeatureAccessPolicy
+import com.rtatuner.app.core.entitlement.ProFeature
 import com.rtatuner.app.core.session.RtaSnapshot
 import java.io.File
 import java.io.FileOutputStream
@@ -158,7 +160,15 @@ object RtaExportManager {
     // SHARING HELPERS
     // ==========================================
 
-    fun shareCsv(context: Context, csvContent: String, baseFileName: String) {
+    fun shareCsv(
+        context: Context,
+        csvContent: String,
+        baseFileName: String,
+        featureAccessPolicy: FeatureAccessPolicy = FeatureAccessPolicy()
+    ) {
+        // Reject before touching the cache or opening a chooser. Keep this outside
+        // the Android error handler so callers can show the contextual upgrade UI.
+        featureAccessPolicy.requireAccess(ProFeature.CSV_EXPORT)
         try {
             val exportDir = File(context.cacheDir, EXPORTS_DIR).apply { mkdirs() }
             val timeTag = fileTimestampFormat.format(Date())

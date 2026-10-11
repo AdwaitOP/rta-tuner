@@ -143,5 +143,6 @@ class SignalGeneratorTest {
         // Multiple consecutive stop calls when already stopped must be safe and idempotent
         generator.stop()
         assertEquals(false, generator.state.value.isPlaying)
+        generator.close()
     }
 }

@@ -5,11 +5,22 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.Process
 import android.util.Log
+import com.rtatuner.app.core.entitlement.FeatureAccessPolicy
+import com.rtatuner.app.core.entitlement.FeatureAccessResult
+import com.rtatuner.app.core.entitlement.ProFeature
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import java.util.Random
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.ln
@@ -29,7 +40,9 @@ import kotlin.math.sin
  * - Real-time state broadcasting with instantaneous sweep frequency and progress telemetry.
  */
 class SignalGenerator(
-    private val sampleRate: Int = 48000
+    private val sampleRate: Int = 48000,
+    private val featurePolicy: FeatureAccessPolicy = FeatureAccessPolicy(),
+    scope: CoroutineScope? = null
 ) {
     companion object {
         private const val TAG = "SignalGenerator"
@@ -42,6 +55,9 @@ class SignalGenerator(
     val state: StateFlow<SignalGeneratorState> = _state.asStateFlow()
 
     private val isRunning = AtomicBoolean(false)
+    private val playbackGeneration = AtomicLong(0)
+    private val operationLock = Any()
+    private val ownedScope = if (scope == null) CoroutineScope(SupervisorJob() + Dispatchers.Default) else null
     private var playbackThread: Thread? = null
     private var audioTrack: AudioTrack? = null
     private val trackLock = Any()
@@ -55,14 +71,31 @@ class SignalGenerator(
     // Random generator for white noise
     private val random = Random()
 
-    fun startPinkNoise(levelDb: Float = _state.value.outputLevelDb) {
+    private val entitlementJob = (scope ?: requireNotNull(ownedScope)).launch(start = CoroutineStart.UNDISPATCHED) {
+        featurePolicy.entitlements.state.collect {
+            synchronized(operationLock) {
+                if (featurePolicy.check(ProFeature.SINE_SWEEP) is FeatureAccessResult.Denied &&
+                    _state.value.mode == GeneratorMode.SINE_SWEEP) {
+                    stopSync()
+                }
+            }
+        }
+    }
+
+    fun close() {
+        entitlementJob.cancel()
+        ownedScope?.cancel()
+        synchronized(operationLock) { stopSync() }
+    }
+
+    fun startPinkNoise(levelDb: Float = _state.value.outputLevelDb) = synchronized(operationLock) {
         stopSync()
-        _state.value = _state.value.copy(
+        _state.update { it.copy(
             mode = GeneratorMode.PINK_NOISE,
             isPlaying = true,
             outputLevelDb = levelDb.coerceIn(-30.0f, 0.0f),
             errorMessage = null
-        )
+        ) }
         startPlaybackThread()
     }
 
@@ -71,9 +104,11 @@ class SignalGenerator(
         durationSec: Float = _state.value.sweepDurationSec,
         isLooping: Boolean = _state.value.isSweepLooping,
         levelDb: Float = _state.value.outputLevelDb
-    ) {
+    ): FeatureAccessResult = synchronized(operationLock) {
+        val access = featurePolicy.check(ProFeature.SINE_SWEEP)
+        if (access is FeatureAccessResult.Denied) return@synchronized access
         stopSync()
-        _state.value = _state.value.copy(
+        _state.update { it.copy(
             mode = GeneratorMode.SINE_SWEEP,
             sweepRange = range,
             sweepDurationSec = durationSec,
@@ -83,8 +118,9 @@ class SignalGenerator(
             currentSweepProgress = 0.0f,
             currentSweepFreqHz = range.startFreqHz,
             errorMessage = null
-        )
+        ) }
         startPlaybackThread()
+        FeatureAccessResult.Allowed
     }
 
     fun stop() {
@@ -94,7 +130,11 @@ class SignalGenerator(
     }
 
     private fun stopSync() {
-        isRunning.set(false)
+        // A delayed AudioTrack initialization must not resurrect a revoked/stopped sweep.
+        synchronized(trackLock) {
+            playbackGeneration.incrementAndGet()
+            isRunning.set(false)
+        }
         isFadingOut = false
         playbackThread?.interrupt()
         try {
@@ -115,38 +155,50 @@ class SignalGenerator(
             }
             audioTrack = null
         }
-        _state.value = _state.value.copy(isPlaying = false, mode = GeneratorMode.OFF)
+        _state.update { it.copy(isPlaying = false, mode = GeneratorMode.OFF) }
     }
 
     fun setOutputLevel(levelDb: Float) {
-        _state.value = _state.value.copy(outputLevelDb = levelDb.coerceIn(-30.0f, 0.0f))
+        _state.update { it.copy(outputLevelDb = levelDb.coerceIn(-30.0f, 0.0f)) }
     }
 
-    fun setSweepDuration(durationSec: Float) {
-        _state.value = _state.value.copy(sweepDurationSec = durationSec.coerceIn(1.0f, 30.0f))
+    fun setSweepDuration(durationSec: Float): FeatureAccessResult = mutateSweepConfiguration {
+        _state.update { it.copy(sweepDurationSec = durationSec.coerceIn(1.0f, 30.0f)) }
     }
 
-    fun setSweepRange(range: SweepRangePreset) {
-        _state.value = _state.value.copy(sweepRange = range)
+    fun setSweepRange(range: SweepRangePreset): FeatureAccessResult = mutateSweepConfiguration {
+        _state.update { it.copy(sweepRange = range) }
     }
 
-    fun setSweepLooping(looping: Boolean) {
-        _state.value = _state.value.copy(isSweepLooping = looping)
+    fun setSweepLooping(looping: Boolean): FeatureAccessResult = mutateSweepConfiguration {
+        _state.update { it.copy(isSweepLooping = looping) }
+    }
+
+    private fun mutateSweepConfiguration(mutate: () -> Unit): FeatureAccessResult = synchronized(operationLock) {
+        val access = featurePolicy.check(ProFeature.SINE_SWEEP)
+        if (access is FeatureAccessResult.Denied) return@synchronized access
+        mutate()
+        FeatureAccessResult.Allowed
     }
 
     private fun startPlaybackThread() {
-        isRunning.set(true)
+        val generation = synchronized(trackLock) {
+            isRunning.set(true)
+            playbackGeneration.incrementAndGet()
+        }
         isFadingOut = false
+        fadeSamplesRemaining = 0
         fadeTotalSamples = (sampleRate * (FADE_DURATION_MS / 1000.0)).toInt()
 
         val thread = Thread({
-            runPlaybackLoop()
+            runPlaybackLoop(generation)
         }, "RtaSignalGeneratorThread")
         playbackThread = thread
         thread.start()
     }
 
-    private fun runPlaybackLoop() {
+    private fun runPlaybackLoop(generation: Long) {
+        if (!isCurrentPlayback(generation)) return
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
 
         val minBufferSize = AudioTrack.getMinBufferSize(
@@ -176,16 +228,20 @@ class SignalGenerator(
                 .build()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create AudioTrack", e)
-            isRunning.set(false)
-            _state.value = _state.value.copy(
+            finishPlayback(generation)
+            updatePlaybackState(generation) { it.copy(
                 isPlaying = false,
                 mode = GeneratorMode.OFF,
                 errorMessage = "Failed to create AudioTrack: ${e.localizedMessage ?: e.message}"
-            )
+            ) }
             return
         }
 
         synchronized(trackLock) {
+            if (!isCurrentPlayback(generation)) {
+                track.release()
+                return
+            }
             audioTrack = track
         }
 
@@ -201,12 +257,12 @@ class SignalGenerator(
                     audioTrack = null
                 }
             }
-            isRunning.set(false)
-            _state.value = _state.value.copy(
+            finishPlayback(generation)
+            updatePlaybackState(generation) { it.copy(
                 isPlaying = false,
                 mode = GeneratorMode.OFF,
                 errorMessage = "Failed to start AudioTrack: ${e.localizedMessage ?: e.message}"
-            )
+            ) }
             return
         }
 
@@ -227,7 +283,7 @@ class SignalGenerator(
         // Fade-in state
         var fadeInSampleCount = 0
 
-        while (isRunning.get()) {
+        while (isCurrentPlayback(generation)) {
             val currentState = _state.value
             val mode = currentState.mode
             val amplitude = 10.0.pow(currentState.outputLevelDb / 20.0)
@@ -309,7 +365,7 @@ class SignalGenerator(
                     sample *= window
                     fadeSamplesRemaining++
                     if (fadeSamplesRemaining >= fadeTotalSamples) {
-                        isRunning.set(false)
+                        finishPlayback(generation)
                         break
                     }
                 }
@@ -320,9 +376,11 @@ class SignalGenerator(
             }
 
             // Write chunk to AudioTrack safely wrapped to handle post-release race or write failures
-            if (isRunning.get() || fadeSamplesRemaining > 0) {
+            if (generation == playbackGeneration.get() && (isRunning.get() || fadeSamplesRemaining > 0)) {
                 val shouldContinue = try {
-                    val currentTrack = synchronized(trackLock) { audioTrack }
+                    val currentTrack = synchronized(trackLock) {
+                        if (generation == playbackGeneration.get()) audioTrack else null
+                    }
                     if (currentTrack != null &&
                         currentTrack.state == AudioTrack.STATE_INITIALIZED &&
                         currentTrack.playState == AudioTrack.PLAYSTATE_PLAYING
@@ -354,10 +412,10 @@ class SignalGenerator(
             if (mode == GeneratorMode.SINE_SWEEP) {
                 val progress = (sweepSampleIndex.toFloat() / totalSweepSamples).coerceIn(0.0f, 1.0f)
                 val currentFreq = f0 * (f1 / f0).pow(progress.toDouble())
-                _state.value = _state.value.copy(
+                updatePlaybackState(generation) { it.copy(
                     currentSweepProgress = progress,
                     currentSweepFreqHz = currentFreq.toFloat()
-                )
+                ) }
             }
         }
 
@@ -376,10 +434,22 @@ class SignalGenerator(
             }
         }
 
-        _state.value = _state.value.copy(
+        finishPlayback(generation)
+        updatePlaybackState(generation) { it.copy(
             isPlaying = false,
             mode = GeneratorMode.OFF,
             currentSweepProgress = 0.0f
-        )
+        ) }
+    }
+
+    private fun isCurrentPlayback(generation: Long): Boolean =
+        isRunning.get() && generation == playbackGeneration.get()
+
+    private fun finishPlayback(generation: Long) = synchronized(trackLock) {
+        if (generation == playbackGeneration.get()) isRunning.set(false)
+    }
+
+    private fun updatePlaybackState(generation: Long, transform: (SignalGeneratorState) -> SignalGeneratorState) {
+        _state.update { current -> if (generation == playbackGeneration.get()) transform(current) else current }
     }
 }
