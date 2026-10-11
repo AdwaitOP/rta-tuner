@@ -15,9 +15,13 @@ import com.rtatuner.app.R
 import com.rtatuner.app.core.audio.AudioMath
 import com.rtatuner.app.core.database.SessionWithSnapshots
 import com.rtatuner.app.core.dsp.Iso31Bands
+import com.rtatuner.app.core.entitlement.FeatureAccessPolicy
+import com.rtatuner.app.core.entitlement.ProFeature
 import com.rtatuner.app.core.session.RtaSnapshot
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
+import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -158,14 +162,40 @@ object RtaExportManager {
     // SHARING HELPERS
     // ==========================================
 
-    fun shareCsv(context: Context, csvContent: String, baseFileName: String) {
+    fun shareCsv(
+        context: Context,
+        csvContent: String,
+        baseFileName: String,
+        featureAccessPolicy: FeatureAccessPolicy = FeatureAccessPolicy()
+    ) = shareCsv(context, csvContent, baseFileName, featureAccessPolicy, ::FileOutputStream)
+
+    internal fun shareCsv(
+        context: Context,
+        csvContent: String,
+        baseFileName: String,
+        featureAccessPolicy: FeatureAccessPolicy,
+        openOutputStream: (File) -> OutputStream
+    ) {
+        // Reject before touching the cache or opening a chooser. Keep this outside
+        // the Android error handler so callers can show the contextual upgrade UI.
+        featureAccessPolicy.requireAccess(ProFeature.CSV_EXPORT)
+        var createdFile: File? = null
         try {
-            val exportDir = File(context.cacheDir, EXPORTS_DIR).apply { mkdirs() }
+            val exportDir = File(context.cacheDir, EXPORTS_DIR)
+            if (!exportDir.isDirectory && !exportDir.mkdirs()) {
+                throw IOException("Could not create CSV export directory")
+            }
             val timeTag = fileTimestampFormat.format(Date())
             val safeName = baseFileName.replace(Regex("[^a-zA-Z0-9_-]"), "_")
             val file = File(exportDir, "${safeName}_$timeTag.csv")
+            // Never truncate an earlier export if two requests use the same name
+            // and timestamp. Cleanup owns only the file created by this request.
+            if (!file.createNewFile()) {
+                throw IOException("CSV export file already exists: ${file.name}")
+            }
+            createdFile = file
 
-            FileOutputStream(file).use { out ->
+            openOutputStream(file).use { out ->
                 out.write(csvContent.toByteArray(Charsets.UTF_8))
             }
 
@@ -186,6 +216,16 @@ object RtaExportManager {
             context.startActivity(chooser)
         } catch (e: Exception) {
             Log.e(TAG, "Error sharing CSV", e)
+            createdFile?.let { file ->
+                try {
+                    if (!file.delete() && file.exists()) {
+                        Log.w(TAG, "Could not remove failed CSV export: ${file.name}")
+                    }
+                } catch (cleanupFailure: Exception) {
+                    Log.w(TAG, "Could not remove failed CSV export", cleanupFailure)
+                }
+            }
+            throw CsvShareException(e)
         }
     }
 

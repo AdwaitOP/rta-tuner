@@ -1,6 +1,8 @@
 package com.rtatuner.app.ui
 
 import android.app.Application
+import android.content.Context
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.rtatuner.app.core.audio.AudioCaptureConfig
@@ -10,12 +12,9 @@ import com.rtatuner.app.core.audio.AudioInputDeviceInfo
 import com.rtatuner.app.core.audio.AudioMath
 import com.rtatuner.app.core.audio.CaptureStatus
 import com.rtatuner.app.core.audio.FftDisplayMode
-import com.rtatuner.app.core.audio.GeneratorMode
 import com.rtatuner.app.core.audio.SignalGenerator
-import com.rtatuner.app.core.audio.SignalGeneratorState
 import com.rtatuner.app.core.audio.SweepRangePreset
 import com.rtatuner.app.core.calibration.CalibrationManager
-import com.rtatuner.app.core.calibration.CalibrationUiState
 import com.rtatuner.app.core.calibration.MicCalibrationCurve
 import com.rtatuner.app.core.calibration.TargetCurve
 import com.rtatuner.app.core.database.RtaDatabase
@@ -23,17 +22,30 @@ import com.rtatuner.app.core.database.SessionRepository
 import com.rtatuner.app.core.database.SessionSnapshotEntity
 import com.rtatuner.app.core.database.SessionWithSnapshots
 import com.rtatuner.app.core.database.TuningSessionEntity
+import com.rtatuner.app.core.entitlement.AppEntitlements
+import com.rtatuner.app.core.entitlement.EntitlementRepository
+import com.rtatuner.app.core.entitlement.EntitlementTier
+import com.rtatuner.app.core.entitlement.FeatureAccessDeniedException
+import com.rtatuner.app.core.entitlement.FeatureAccessPolicy
+import com.rtatuner.app.core.entitlement.FeatureAccessResult
+import com.rtatuner.app.core.entitlement.ProFeature
+import com.rtatuner.app.core.export.RtaExportManager
+import com.rtatuner.app.core.export.CsvExportResult
+import com.rtatuner.app.core.export.CsvShareException
+import com.rtatuner.app.core.session.FrozenSnapshotStore
 import com.rtatuner.app.core.session.RtaSnapshot
 import com.rtatuner.app.core.session.SnapshotPalette
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.UUID
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.max
@@ -41,7 +53,34 @@ import kotlin.math.max
 /**
  * ViewModel orchestrating audio capture lifecycle, signal generation, calibration, and UI state.
  */
-class AudioCaptureViewModel(application: Application) : AndroidViewModel(application) {
+class AudioCaptureViewModel(
+    application: Application,
+    private val entitlementRepository: EntitlementRepository
+) : AndroidViewModel(application) {
+
+    constructor(application: Application) : this(application, AppEntitlements.create())
+
+    val entitlementState = entitlementRepository.state
+    val featureAccessPolicy = FeatureAccessPolicy(entitlementRepository)
+    private val _accessDenial = MutableStateFlow<FeatureAccessResult.Denied?>(null)
+    val accessDenial = _accessDenial.asStateFlow()
+
+    private val csvExportErrorChannel = Channel<String>(Channel.BUFFERED)
+    val csvExportErrors = csvExportErrorChannel.receiveAsFlow()
+
+    fun dismissAccessDenial() { _accessDenial.value = null }
+
+    fun requestProUpgrade(feature: ProFeature = ProFeature.CSV_EXPORT) {
+        _accessDenial.value = FeatureAccessResult.Denied(feature, feature.benefit)
+    }
+
+    fun simulateEntitlement(tier: EntitlementTier): Boolean =
+        AppEntitlements.simulate(entitlementRepository, tier)
+
+    private fun reportAccess(result: FeatureAccessResult): FeatureAccessResult {
+        if (result is FeatureAccessResult.Denied) _accessDenial.value = result
+        return result
+    }
 
     companion object {
         private const val HOLD_DURATION_MS = 1200L
@@ -49,19 +88,26 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
         private const val BALLISTICS_TICK_MS = 33L // ~30 fps meter update
     }
 
-    private var currentWindowSize = 2048
+    private val captureControlLock = Any()
+    private val _fftWindowSize = MutableStateFlow(2048)
+    val fftWindowSize: StateFlow<Int> = _fftWindowSize.asStateFlow()
+    private val currentWindowSize: Int get() = _fftWindowSize.value
     private var preferredDeviceId: Int? = null
     private var captureManager: AudioCaptureManager = createCaptureManager(currentWindowSize)
-    val signalGenerator: SignalGenerator = SignalGenerator(sampleRate = 48000)
-    val calibrationManager: CalibrationManager = CalibrationManager(application)
+    val signalGenerator: SignalGenerator = SignalGenerator(
+        sampleRate = 48000, featurePolicy = featureAccessPolicy, scope = viewModelScope
+    )
+    val calibrationManager: CalibrationManager = CalibrationManager(
+        application, featurePolicy = featureAccessPolicy, scope = viewModelScope
+    )
     private val database = RtaDatabase.getInstance(application)
-    val sessionRepository = SessionRepository(database.tuningSessionDao())
+    val sessionRepository = SessionRepository(database.tuningSessionDao(), featureAccessPolicy = featureAccessPolicy)
 
     private val _uiState = MutableStateFlow(AudioCaptureUiState())
     val uiState: StateFlow<AudioCaptureUiState> = _uiState.asStateFlow()
 
-    private val _frozenSnapshots = MutableStateFlow<List<RtaSnapshot>>(emptyList())
-    val frozenSnapshots: StateFlow<List<RtaSnapshot>> = _frozenSnapshots.asStateFlow()
+    private val snapshotStore = FrozenSnapshotStore(featureAccessPolicy)
+    val frozenSnapshots: StateFlow<List<RtaSnapshot>> = snapshotStore.snapshots
 
     private val _savedSessions = MutableStateFlow<List<SessionWithSnapshots>>(emptyList())
     val savedSessions: StateFlow<List<SessionWithSnapshots>> = _savedSessions.asStateFlow()
@@ -73,12 +119,21 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
     private var generatorCollectorJob: Job? = null
     private var calibrationCollectorJob: Job? = null
     private var sessionsCollectorJob: Job? = null
+    private var entitlementCollectorJob: Job? = null
     private var ballisticsJob: Job? = null
     private var peakHoldDb = AudioMath.MIN_DB_FS
     private var peakHoldTimestamp = 0L
 
     init {
         startCollectingCaptureState()
+        entitlementCollectorJob = viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            entitlementState.collect {
+                synchronized(captureControlLock) {
+                    // Read current policy, since a queued tier emission may already be stale.
+                    ensureAllowedWindowLocked()
+                }
+            }
+        }
         startCollectingGeneratorState()
         startCollectingCalibrationState()
         startCollectingSavedSessions()
@@ -99,6 +154,7 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
         calibrationCollectorJob?.cancel()
         calibrationCollectorJob = viewModelScope.launch {
             calibrationManager.uiState.collect { calState ->
+                val previousConfig = _uiState.value.displayConfig
                 val updatedConfig = _uiState.value.displayConfig.copy(
                     isSplMode = calState.splCalibration.isSplMode,
                     splOffsetDb = calState.splCalibration.splOffsetDb,
@@ -109,6 +165,8 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
                     calibration = calState,
                     displayConfig = updatedConfig
                 )
+                if (previousConfig.isSplMode != updatedConfig.isSplMode ||
+                    previousConfig.splOffsetDb != updatedConfig.splOffsetDb) resetPeakHold()
             }
         }
     }
@@ -126,57 +184,63 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
 
     private fun startCollectingCaptureState() {
         captureCollectorJob?.cancel()
+        val source = captureManager
         captureCollectorJob = viewModelScope.launch {
-            captureManager.uiState.collect { mgrState ->
-                val now = System.currentTimeMillis()
+            source.uiState.collect { mgrState ->
+                synchronized(captureControlLock) {
+                    if (source !== captureManager) return@synchronized
+                    val now = System.currentTimeMillis()
 
-                // Pass raw audio spectral data through calibration engine (mic curve, noise subtraction, SPL, target deltas)
-                val diag = mgrState.diagnostics
-                val binRes = if (diag.windowSize > 0 && diag.actualSampleRate > 0) {
-                    diag.actualSampleRate.toFloat() / diag.windowSize
-                } else {
-                    23.4375f
+                    // Pass raw audio spectral data through calibration engine (mic curve, noise subtraction, SPL, target deltas)
+                    val diag = mgrState.diagnostics
+                    val binRes = if (diag.windowSize > 0 && diag.actualSampleRate > 0) {
+                        diag.actualSampleRate.toFloat() / diag.windowSize
+                    } else {
+                        23.4375f
+                    }
+
+                    val calFrame = calibrationManager.processFrame(
+                        raw31Bands = mgrState.octave31Db,
+                        rawFftDb = mgrState.rawFftDb,
+                        binResolutionHz = binRes
+                    )
+
+                    val rawSpl = if (calFrame.isSplMode) calFrame.splOffsetDb else 0.0f
+                    val splOffset = if (rawSpl.isNaN() || rawSpl.isInfinite()) 0.0f else rawSpl
+
+                    val rawPeak = if (mgrState.peakDb.isNaN() || mgrState.peakDb.isInfinite()) AudioMath.MIN_DB_FS else mgrState.peakDb
+                    val rawRms = if (mgrState.rmsDb.isNaN() || mgrState.rmsDb.isInfinite()) AudioMath.MIN_DB_FS else mgrState.rmsDb
+
+                    val effectivePeak = rawPeak + splOffset
+                    val effectiveRms = rawRms + splOffset
+
+                    // Broadband Peak hold ballistic update (clamped safely)
+                    if (peakHoldDb.isNaN() || peakHoldDb.isInfinite() || effectivePeak >= peakHoldDb) {
+                        peakHoldDb = effectivePeak
+                        peakHoldTimestamp = now
+                    }
+
+                    _uiState.value = mgrState.copy(
+                        rmsDb = effectiveRms,
+                        peakDb = effectivePeak,
+                        peakHoldDb = peakHoldDb,
+                        displayMode = _uiState.value.displayMode,
+                        displayConfig = _uiState.value.displayConfig,
+                        octave31Db = calFrame.calibrated31Db,
+                        rawFftDb = calFrame.calibratedRawFftDb,
+                        unreliableBands = calFrame.unreliableBands,
+                        targetDeltas31Db = calFrame.targetDeltas31Db,
+                        shouldResetSmoothing = calFrame.shouldResetSmoothing,
+                        diagnostics = mgrState.diagnostics.copy(
+                            windowSize = currentWindowSize,
+                            hopSize = currentWindowSize / 2,
+                            renderFps = _uiState.value.diagnostics.renderFps,
+                            renderDrawTimeUs = _uiState.value.diagnostics.renderDrawTimeUs
+                        ),
+                        generator = _uiState.value.generator,
+                        calibration = calibrationManager.uiState.value
+                    )
                 }
-
-                val calFrame = calibrationManager.processFrame(
-                    raw31Bands = mgrState.octave31Db,
-                    rawFftDb = mgrState.rawFftDb,
-                    binResolutionHz = binRes
-                )
-
-                val rawSpl = if (calFrame.isSplMode) calFrame.splOffsetDb else 0.0f
-                val splOffset = if (rawSpl.isNaN() || rawSpl.isInfinite()) 0.0f else rawSpl
-
-                val rawPeak = if (mgrState.peakDb.isNaN() || mgrState.peakDb.isInfinite()) AudioMath.MIN_DB_FS else mgrState.peakDb
-                val rawRms = if (mgrState.rmsDb.isNaN() || mgrState.rmsDb.isInfinite()) AudioMath.MIN_DB_FS else mgrState.rmsDb
-
-                val effectivePeak = rawPeak + splOffset
-                val effectiveRms = rawRms + splOffset
-
-                // Broadband Peak hold ballistic update (clamped safely)
-                if (peakHoldDb.isNaN() || peakHoldDb.isInfinite() || effectivePeak >= peakHoldDb) {
-                    peakHoldDb = effectivePeak
-                    peakHoldTimestamp = now
-                }
-
-                _uiState.value = mgrState.copy(
-                    rmsDb = effectiveRms,
-                    peakDb = effectivePeak,
-                    peakHoldDb = peakHoldDb,
-                    displayMode = _uiState.value.displayMode,
-                    displayConfig = _uiState.value.displayConfig,
-                    octave31Db = calFrame.calibrated31Db,
-                    rawFftDb = calFrame.calibratedRawFftDb,
-                    unreliableBands = calFrame.unreliableBands,
-                    targetDeltas31Db = calFrame.targetDeltas31Db,
-                    shouldResetSmoothing = calFrame.shouldResetSmoothing,
-                    diagnostics = mgrState.diagnostics.copy(
-                        renderFps = _uiState.value.diagnostics.renderFps,
-                        renderDrawTimeUs = _uiState.value.diagnostics.renderDrawTimeUs
-                    ),
-                    generator = _uiState.value.generator,
-                    calibration = calibrationManager.uiState.value
-                )
             }
         }
     }
@@ -221,17 +285,22 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun startCapture() {
-        resetPeakHold()
-        captureManager.startCapture()
+        synchronized(captureControlLock) {
+            ensureAllowedWindowLocked(resumeCapture = false)
+            resetPeakHold()
+            captureManager.startCapture()
+        }
     }
 
     fun stopCapture() {
-        captureManager.stopCapture()
+        synchronized(captureControlLock) { captureManager.stopCapture() }
     }
 
     fun retryCapture() {
-        captureManager.stopCapture()
-        startCapture()
+        synchronized(captureControlLock) {
+            captureManager.stopCapture()
+            startCapture()
+        }
     }
 
     fun resetPeakHold() {
@@ -245,12 +314,14 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun setFftDisplayMode(mode: FftDisplayMode) {
-        val updatedConfig = _uiState.value.displayConfig.copy(displayMode = mode)
-        captureManager.setDisplayMode(mode)
-        _uiState.value = _uiState.value.copy(
-            displayMode = mode,
-            displayConfig = updatedConfig
-        )
+        synchronized(captureControlLock) {
+            val updatedConfig = _uiState.value.displayConfig.copy(displayMode = mode)
+            captureManager.setDisplayMode(mode)
+            _uiState.value = _uiState.value.copy(
+                displayMode = mode,
+                displayConfig = updatedConfig
+            )
+        }
     }
 
     fun setEmaPreset(preset: EmaPreset) {
@@ -282,22 +353,42 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    fun setWindowSize(newSize: Int) {
-        if (newSize == currentWindowSize) return
-        require(newSize == 1024 || newSize == 2048 || newSize == 4096) {
-            "Unsupported window size: $newSize"
+    fun setWindowSize(newSize: Int): FeatureAccessResult = synchronized(captureControlLock) {
+        val access = featureAccessPolicy.checkFftWindow(newSize)
+        if (access is FeatureAccessResult.Denied) {
+            return@synchronized reportAccess(access)
         }
+        reportAccess(reconfigureWindowLocked(newSize))
+    }
 
-        val wasRunning = _uiState.value.status == CaptureStatus.RUNNING
+    /** Only the live configuration changes; stored sessions and overlays keep their metadata. */
+    private fun ensureAllowedWindowLocked(resumeCapture: Boolean = true): Boolean {
+        if (featureAccessPolicy.checkFftWindow(currentWindowSize) is FeatureAccessResult.Allowed) return false
+        reconfigureWindowLocked(2048, resumeCapture)
+        return true
+    }
+
+    private fun reconfigureWindowLocked(newSize: Int, resumeCapture: Boolean = true): FeatureAccessResult {
+        if (newSize == currentWindowSize) return FeatureAccessResult.Allowed
+        val wasRunning = captureManager.uiState.value.status == CaptureStatus.RUNNING
+        captureCollectorJob?.cancel()
         captureManager.release()
 
-        currentWindowSize = newSize
-        captureManager = createCaptureManager(newSize)
+        // Release may take time: a downgrade during it must not create a restricted manager.
+        val access = featureAccessPolicy.checkFftWindow(newSize)
+        val effectiveSize = if (access is FeatureAccessResult.Allowed) newSize else 2048
+        captureManager = createCaptureManager(effectiveSize)
+        captureManager.setDisplayMode(_uiState.value.displayMode)
+        _fftWindowSize.value = effectiveSize
+        _uiState.value = _uiState.value.copy(
+            diagnostics = _uiState.value.diagnostics.copy(windowSize = effectiveSize, hopSize = effectiveSize / 2)
+        )
         startCollectingCaptureState()
 
-        if (wasRunning) {
+        if (wasRunning && resumeCapture) {
             captureManager.startCapture()
         }
+        return access
     }
 
     // --- Stage 4 Test Signal Generator Controls ---
@@ -308,12 +399,12 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
 
     fun startSineSweep() {
         val gen = _uiState.value.generator
-        signalGenerator.startSineSweep(
+        reportAccess(signalGenerator.startSineSweep(
             range = gen.sweepRange,
             durationSec = gen.sweepDurationSec,
             isLooping = gen.isSweepLooping,
             levelDb = gen.outputLevelDb
-        )
+        ))
     }
 
     fun stopGenerator() {
@@ -325,29 +416,31 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun setSweepDuration(durationSec: Float) {
-        signalGenerator.setSweepDuration(durationSec)
+        reportAccess(signalGenerator.setSweepDuration(durationSec))
     }
 
     fun setSweepRange(range: SweepRangePreset) {
-        signalGenerator.setSweepRange(range)
+        reportAccess(signalGenerator.setSweepRange(range))
     }
 
     fun setSweepLooping(looping: Boolean) {
-        signalGenerator.setSweepLooping(looping)
+        reportAccess(signalGenerator.setSweepLooping(looping))
     }
 
     // --- Stage 5 Calibration & Target Curve Actions ---
 
     fun loadMicCurve(name: String, textContent: String): Result<MicCalibrationCurve> {
-        return calibrationManager.loadMicCurve(name, textContent)
+        return calibrationManager.loadMicCurve(name, textContent).also { result ->
+            (result.exceptionOrNull() as? FeatureAccessDeniedException)?.let { reportAccess(it.denial) }
+        }
     }
 
     fun setMicCurveActive(active: Boolean) {
-        calibrationManager.setMicCurveActive(active)
+        reportAccess(calibrationManager.setMicCurveActive(active))
     }
 
     fun clearMicCurve() {
-        calibrationManager.clearMicCurve()
+        reportAccess(calibrationManager.clearMicCurve())
     }
 
     fun calibrateSplReference(targetSplDb: Float) {
@@ -360,33 +453,33 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
         } else {
             -23.01f
         }
-        calibrationManager.calibrateSplReference(rawRmsDbFs, targetSplDb)
-        resetPeakHold()
+        if (reportAccess(calibrationManager.calibrateSplReference(rawRmsDbFs, targetSplDb)) == FeatureAccessResult.Allowed) {
+            resetPeakHold()
+        }
     }
 
     fun setSplMode(enabled: Boolean) {
-        calibrationManager.setSplMode(enabled)
-        resetPeakHold()
+        if (reportAccess(calibrationManager.setSplMode(enabled)) == FeatureAccessResult.Allowed) resetPeakHold()
     }
 
     fun setTargetCurve(curve: TargetCurve?) {
-        calibrationManager.setTargetCurve(curve)
+        reportAccess(calibrationManager.setTargetCurve(curve))
     }
 
     fun setTargetCurveActive(active: Boolean) {
-        calibrationManager.setTargetCurveActive(active)
+        reportAccess(calibrationManager.setTargetCurveActive(active))
     }
 
     fun startNoiseFloorCapture() {
-        calibrationManager.startNoiseFloorCapture(2000L)
+        reportAccess(calibrationManager.startNoiseFloorCapture(2000L))
     }
 
     fun setNoiseSubtractionActive(active: Boolean) {
-        calibrationManager.setNoiseSubtractionActive(active)
+        reportAccess(calibrationManager.setNoiseSubtractionActive(active))
     }
 
     fun clearNoiseFloor() {
-        calibrationManager.clearNoiseFloor()
+        reportAccess(calibrationManager.clearNoiseFloor())
     }
 
     private fun startCollectingSavedSessions() {
@@ -402,8 +495,8 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
     // STAGE 6: SNAPSHOT / FREEZE MANAGEMENT
     // ==========================================
 
-    fun freezeCurrentSnapshot(customName: String? = null) {
-        val currentSnapshots = _frozenSnapshots.value
+    fun freezeCurrentSnapshot(customName: String? = null): FeatureAccessResult {
+        val currentSnapshots = frozenSnapshots.value
         val calState = calibrationManager.uiState.value
         val isSpl = calState.splCalibration.isSplMode
         val splOffset = if (isSpl) calState.splCalibration.splOffsetDb else 0.0f
@@ -428,50 +521,30 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
             isVisible = true
         )
 
-        _frozenSnapshots.value = currentSnapshots + newSnapshot
+        return reportAccess(snapshotStore.add(newSnapshot))
     }
 
     fun unfreezeSnapshot(id: String) {
-        _frozenSnapshots.value = _frozenSnapshots.value.filterNot { it.id == id }
+        snapshotStore.remove(id)
     }
 
     fun clearAllFrozenSnapshots() {
-        _frozenSnapshots.value = emptyList()
+        snapshotStore.clear()
     }
 
     fun toggleSnapshotVisibility(id: String) {
-        _frozenSnapshots.value = _frozenSnapshots.value.map {
-            if (it.id == id) it.copy(isVisible = !it.isVisible) else it
-        }
+        snapshotStore.toggleVisibility(id)
     }
 
     fun renameSnapshot(id: String, newName: String) {
         if (newName.isBlank()) return
-        _frozenSnapshots.value = _frozenSnapshots.value.map {
-            if (it.id == id) it.copy(name = newName) else it
-        }
+        snapshotStore.rename(id, newName)
     }
 
-    fun loadSessionSnapshotsToOverlay(sessionWithSnapshots: SessionWithSnapshots) {
-        val loaded = sessionWithSnapshots.snapshots.mapIndexed { index, entity ->
-            RtaSnapshot(
-                id = UUID.randomUUID().toString(),
-                name = "${sessionWithSnapshots.session.name} - ${entity.name}",
-                timestamp = entity.timestamp,
-                bands31Db = entity.bands31Db.clone(),
-                isSplMode = entity.isSplMode,
-                splOffsetDb = entity.splOffsetDb,
-                calibrationName = entity.calibrationName,
-                targetCurveName = entity.targetCurveName,
-                windowSize = sessionWithSnapshots.session.windowSize,
-                isNoiseSubtractionActive = entity.isNoiseSubtractionActive,
-                activeNoiseFloorBands = entity.activeNoiseFloorBands?.clone(),
-                colorHex = entity.colorHex,
-                isVisible = true
-            )
-        }
-        _frozenSnapshots.value = _frozenSnapshots.value + loaded
-    }
+    fun loadSessionSnapshotsToOverlay(
+        sessionWithSnapshots: SessionWithSnapshots,
+        selectedSnapshotIds: List<Long>? = null
+    ): FeatureAccessResult = reportAccess(snapshotStore.loadSession(sessionWithSnapshots, selectedSnapshotIds))
 
     // ==========================================
     // STAGE 6: ROOM SESSION PERSISTENCE
@@ -525,9 +598,9 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
             }
 
             // Include selected frozen snapshots
-            val currentFrozen = _frozenSnapshots.value
+            val currentFrozen = frozenSnapshots.value
             for (frozen in currentFrozen) {
-                if (includeFrozenIds.isEmpty() || includeFrozenIds.contains(frozen.id)) {
+                if (includeFrozenIds.contains(frozen.id)) {
                     snapshotEntities.add(
                         SessionSnapshotEntity(
                             sessionId = 0,
@@ -546,8 +619,12 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
                 }
             }
 
-            val id = sessionRepository.saveSession(sessionEntity, snapshotEntities)
-            onComplete?.invoke(id)
+            try {
+                val id = sessionRepository.saveSession(sessionEntity, snapshotEntities)
+                onComplete?.invoke(id)
+            } catch (denied: FeatureAccessDeniedException) {
+                reportAccess(denied.denial)
+            }
         }
     }
 
@@ -563,13 +640,63 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    /** Authorization precedes formatting and the shared CSV writer checks again before I/O. */
+    private fun exportCsv(context: Context, name: String, content: () -> String): CsvExportResult {
+        val access = featureAccessPolicy.check(ProFeature.CSV_EXPORT)
+        if (access is FeatureAccessResult.Denied) {
+            reportAccess(access)
+            return CsvExportResult.AccessDenied(access)
+        }
+        return try {
+            RtaExportManager.shareCsv(context, content(), name, featureAccessPolicy)
+            CsvExportResult.ShareChooserLaunched
+        } catch (denied: FeatureAccessDeniedException) {
+            reportAccess(denied.denial)
+            CsvExportResult.AccessDenied(denied.denial)
+        } catch (failure: CsvShareException) {
+            reportCsvFailure(failure.cause as? Exception ?: failure)
+        } catch (failure: Exception) {
+            // Formatting errors precede the export manager's own error logging.
+            Log.e("AudioCaptureViewModel", "Could not format CSV for sharing", failure)
+            reportCsvFailure(failure)
+        }
+    }
+
+    private fun reportCsvFailure(cause: Exception): CsvExportResult.Failed {
+        csvExportErrorChannel.trySend("Could not share CSV. Please try again.")
+        return CsvExportResult.Failed(cause)
+    }
+
+    fun exportLiveCsv(context: Context): CsvExportResult = exportCsv(context, "cabinrta_live_spectrum") {
+        val state = uiState.value
+        val cal = calibrationManager.uiState.value
+        RtaExportManager.formatLiveCurveCsv(
+            liveBands31Db = state.octave31Db,
+            calibrationName = if (cal.isMicCurveActive) cal.micCurve?.name else null,
+            targetCurveName = if (cal.isTargetCurveActive) cal.targetCurve?.name else null,
+            isSplMode = cal.splCalibration.isSplMode,
+            splOffsetDb = if (cal.splCalibration.isSplMode) cal.splCalibration.splOffsetDb else 0f,
+            windowSize = currentWindowSize,
+            isNoiseSubtractionActive = cal.isNoiseSubtractionActive
+        )
+    }
+
+    fun exportSnapshotCsv(context: Context, snapshot: RtaSnapshot): CsvExportResult =
+        exportCsv(context, snapshot.name) { RtaExportManager.formatSnapshotCsv(snapshot) }
+
+    fun exportSessionCsv(context: Context, session: SessionWithSnapshots): CsvExportResult =
+        exportCsv(context, session.session.name) { RtaExportManager.formatSessionWithSnapshotsCsv(session) }
+
     // ==========================================
     // STAGE 7: INPUT DEVICE SELECTION & HOTPLUG
     // ==========================================
 
     fun setPreferredInputDevice(deviceId: Int?) {
-        preferredDeviceId = deviceId
-        captureManager.setPreferredInputDevice(deviceId)
+        synchronized(captureControlLock) {
+            preferredDeviceId = deviceId
+            // A replacement already receives this preference; avoid restarting it a second time.
+            if (!ensureAllowedWindowLocked()) captureManager.setPreferredInputDevice(deviceId)
+        }
     }
 
     fun dismissDevicePrompt() {
@@ -597,13 +724,16 @@ class AudioCaptureViewModel(application: Application) : AndroidViewModel(applica
 
     override fun onCleared() {
         super.onCleared()
+        csvExportErrorChannel.close()
         ballisticsJob?.cancel()
         captureCollectorJob?.cancel()
         generatorCollectorJob?.cancel()
         calibrationCollectorJob?.cancel()
         sessionsCollectorJob?.cancel()
-        captureManager.release()
-        signalGenerator.stop()
+        entitlementCollectorJob?.cancel()
+        synchronized(captureControlLock) { captureManager.release() }
+        calibrationManager.close()
+        signalGenerator.close()
     }
 }
 

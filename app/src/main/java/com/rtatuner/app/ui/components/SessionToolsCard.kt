@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.Layers
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Visibility
@@ -42,10 +43,13 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -64,12 +68,17 @@ import androidx.compose.ui.unit.sp
 import com.rtatuner.app.core.audio.AudioCaptureUiState
 import com.rtatuner.app.core.database.SessionWithSnapshots
 import com.rtatuner.app.core.export.RtaExportManager
+import com.rtatuner.app.core.entitlement.FeatureAccessResult
+import com.rtatuner.app.core.entitlement.ProFeature
 import com.rtatuner.app.core.session.RtaSnapshot
 import com.rtatuner.app.ui.AudioCaptureViewModel
 import com.rtatuner.app.ui.components.surface.RtaSurfaceView
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -82,12 +91,21 @@ fun SessionToolsCard(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val entitlement by viewModel.entitlementState.collectAsState()
+    val canExportCsv = remember(entitlement) {
+        viewModel.featureAccessPolicy.check(ProFeature.CSV_EXPORT) is FeatureAccessResult.Allowed
+    }
+    val canSaveNewSession = remember(entitlement, savedSessions.size) {
+        viewModel.featureAccessPolicy.checkSessionCapacity(savedSessions.size) is FeatureAccessResult.Allowed
+    }
     var selectedTab by remember { mutableStateOf(0) } // 0: Overlays & Export, 1: Saved Sessions
 
     var showSaveDialog by remember { mutableStateOf(false) }
     var sessionToEditNotes by remember { mutableStateOf<SessionWithSnapshots?>(null) }
     var sessionToDelete by remember { mutableStateOf<SessionWithSnapshots?>(null) }
     var snapshotToRename by remember { mutableStateOf<RtaSnapshot?>(null) }
+    var sessionToSelectSnapshot by remember { mutableStateOf<SessionWithSnapshots?>(null) }
+    var overlayCapacityMessage by remember { mutableStateOf<String?>(null) }
 
     Card(
         modifier = modifier.fillMaxWidth(),
@@ -168,7 +186,6 @@ fun SessionToolsCard(
                     FreezeAndExportContent(
                         viewModel = viewModel,
                         surfaceViewRef = surfaceViewRef,
-                        uiState = uiState,
                         frozenSnapshots = frozenSnapshots,
                         onRenameSnapshot = { snapshotToRename = it }
                     )
@@ -177,16 +194,34 @@ fun SessionToolsCard(
                     // --- TAB 1: SAVED SESSIONS (ROOM DB) ---
                     SavedSessionsContent(
                         savedSessions = savedSessions,
+                        canExportCsv = canExportCsv,
+                        canSaveNewSession = canSaveNewSession,
                         onOpenSaveDialog = { showSaveDialog = true },
                         onOverlaySession = { session ->
-                            viewModel.loadSessionSnapshotsToOverlay(session)
-                            Toast.makeText(context, "Loaded ${session.snapshots.size} snapshots to live RTA overlay", Toast.LENGTH_SHORT).show()
-                            selectedTab = 0 // switch to overlay tab
+                            if (session.snapshots.isEmpty()) {
+                                Toast.makeText(context, "This session has no saved snapshots", Toast.LENGTH_SHORT).show()
+                            } else {
+                                when (val access = viewModel.featureAccessPolicy.checkOverlayCapacity(frozenSnapshots.size, session.snapshots.size)) {
+                                    FeatureAccessResult.Allowed -> {
+                                        if (viewModel.loadSessionSnapshotsToOverlay(session) is FeatureAccessResult.Allowed) {
+                                            Toast.makeText(context, "Added ${session.snapshots.size} snapshots to the RTA overlay", Toast.LENGTH_SHORT).show()
+                                            selectedTab = 0
+                                        }
+                                    }
+                                    is FeatureAccessResult.Denied -> {
+                                        if (viewModel.featureAccessPolicy.checkOverlayCapacity(frozenSnapshots.size, 1) is FeatureAccessResult.Allowed) {
+                                            sessionToSelectSnapshot = session
+                                        } else {
+                                            overlayCapacityMessage = access.message
+                                        }
+                                    }
+                                }
+                            }
                         },
                         onExportSessionCsv = { session ->
-                            val csv = RtaExportManager.formatSessionWithSnapshotsCsv(session)
-                            RtaExportManager.shareCsv(context, csv, session.session.name)
+                            viewModel.exportSessionCsv(context, session)
                         },
+                        onLearnMore = { viewModel.requestProUpgrade(ProFeature.UNLIMITED_SESSIONS) },
                         onEditNotes = { sessionToEditNotes = it },
                         onDeleteSession = { sessionToDelete = it }
                     )
@@ -196,6 +231,47 @@ fun SessionToolsCard(
     }
 
     // --- DIALOGS ---
+
+    sessionToSelectSnapshot?.let { session ->
+        SavedSnapshotSelectorDialog(
+            session = session,
+            canLoadSnapshot = viewModel.featureAccessPolicy.checkOverlayCapacity(frozenSnapshots.size, 1) is FeatureAccessResult.Allowed,
+            onDismiss = { sessionToSelectSnapshot = null },
+            onLearnMore = { viewModel.requestProUpgrade(ProFeature.UNLIMITED_OVERLAYS) },
+            onSelect = { snapshotId ->
+                if (viewModel.loadSessionSnapshotsToOverlay(session, listOf(snapshotId)) is FeatureAccessResult.Allowed) {
+                    Toast.makeText(context, "Saved snapshot added to the RTA overlay", Toast.LENGTH_SHORT).show()
+                    sessionToSelectSnapshot = null
+                    selectedTab = 0
+                }
+            }
+        )
+    }
+
+    overlayCapacityMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = { overlayCapacityMessage = null },
+            containerColor = Color(0xFF14171E),
+            title = { Text("Overlay capacity reached", color = Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(message, color = Color(0xFFFFD54F), fontSize = 12.sp)
+                    Text("Loading adds to your current overlays. Clear or remove an existing overlay yourself, then try again. Your saved measurements remain intact.", color = Color(0xFFB0BEC5), fontSize = 12.sp)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { selectedTab = 0; overlayCapacityMessage = null }) {
+                    Text("OPEN OVERLAYS", color = Color(0xFF00E5FF), fontFamily = FontFamily.Monospace)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    overlayCapacityMessage = null
+                    viewModel.requestProUpgrade(ProFeature.UNLIMITED_OVERLAYS)
+                }) { Text("PRO DETAILS", color = Color(0xFFFFD54F), fontFamily = FontFamily.Monospace) }
+            }
+        )
+    }
 
     if (showSaveDialog) {
         SaveSessionDialog(
@@ -324,13 +400,23 @@ fun SessionToolsCard(
 private fun FreezeAndExportContent(
     viewModel: AudioCaptureViewModel,
     surfaceViewRef: RtaSurfaceView?,
-    uiState: AudioCaptureUiState,
     frozenSnapshots: List<RtaSnapshot>,
     onRenameSnapshot: (RtaSnapshot) -> Unit
 ) {
     val context = LocalContext.current
+    val entitlement by viewModel.entitlementState.collectAsState()
+    val canExportCsv = remember(entitlement) {
+        viewModel.featureAccessPolicy.check(ProFeature.CSV_EXPORT) is FeatureAccessResult.Allowed
+    }
+    val canFreeze = remember(entitlement, frozenSnapshots.size) {
+        viewModel.featureAccessPolicy.checkOverlayCapacity(frozenSnapshots.size) is FeatureAccessResult.Allowed
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (!canFreeze) {
+            Text("Free overlay capacity reached. Remove or clear an existing overlay to freeze another; Pro adds unlimited overlays.",
+                color = Color(0xFFFFD54F), fontSize = 10.sp, lineHeight = 15.sp)
+        }
         // Quick Action Buttons Row
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -339,8 +425,9 @@ private fun FreezeAndExportContent(
             // Freeze Button
             Button(
                 onClick = {
-                    viewModel.freezeCurrentSnapshot()
-                    Toast.makeText(context, "Current spectrum frozen as overlay", Toast.LENGTH_SHORT).show()
+                    if (viewModel.freezeCurrentSnapshot() is FeatureAccessResult.Allowed) {
+                        Toast.makeText(context, "Current spectrum frozen as overlay", Toast.LENGTH_SHORT).show()
+                    }
                 },
                 modifier = Modifier.weight(1f),
                 colors = ButtonDefaults.buttonColors(
@@ -357,7 +444,7 @@ private fun FreezeAndExportContent(
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = "FREEZE LIVE",
+                    text = if (canFreeze) "FREEZE LIVE" else "FREEZE · PRO",
                     color = Color.Black,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
@@ -426,37 +513,31 @@ private fun FreezeAndExportContent(
 
             OutlinedButton(
                 onClick = {
-                    val cal = uiState.calibration
-                    val csv = RtaExportManager.formatLiveCurveCsv(
-                        liveBands31Db = uiState.octave31Db,
-                        calibrationName = if (cal.isMicCurveActive) cal.micCurve?.name else null,
-                        targetCurveName = if (cal.isTargetCurveActive) cal.targetCurve?.name else null,
-                        isSplMode = cal.splCalibration.isSplMode,
-                        splOffsetDb = cal.splCalibration.splOffsetDb,
-                        windowSize = uiState.diagnostics.windowSize,
-                        isNoiseSubtractionActive = cal.isNoiseSubtractionActive
-                    )
-                    RtaExportManager.shareCsv(context, csv, "cabinrta_live_spectrum")
+                    viewModel.exportLiveCsv(context)
                 },
                 modifier = Modifier.weight(1f),
                 shape = RoundedCornerShape(6.dp),
                 border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF37474F))
             ) {
                 Icon(
-                    imageVector = Icons.Default.FileDownload,
+                    imageVector = if (canExportCsv) Icons.Default.FileDownload else Icons.Default.Lock,
                     contentDescription = null,
                     tint = Color(0xFF81C784),
                     modifier = Modifier.size(14.dp)
                 )
                 Spacer(modifier = Modifier.width(4.dp))
                 Text(
-                    text = "EXPORT CSV",
+                    text = if (canExportCsv) "EXPORT CSV" else "CSV · PRO",
                     color = Color(0xFF81C784),
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Bold,
                     fontFamily = FontFamily.Monospace
                 )
             }
+        }
+
+        if (!canExportCsv) {
+            ProFeatureNotice(ProFeature.CSV_EXPORT, onLearnMore = { viewModel.requestProUpgrade(ProFeature.CSV_EXPORT) })
         }
 
         // Frozen Snapshots Overlay List
@@ -481,10 +562,10 @@ private fun FreezeAndExportContent(
                 frozenSnapshots.forEach { snap ->
                     SnapshotOverlayItem(
                         snapshot = snap,
+                        canExportCsv = canExportCsv,
                         onToggleVisibility = { viewModel.toggleSnapshotVisibility(snap.id) },
                         onExportCsv = {
-                            val csv = RtaExportManager.formatSnapshotCsv(snap)
-                            RtaExportManager.shareCsv(context, csv, snap.name)
+                            viewModel.exportSnapshotCsv(context, snap)
                         },
                         onRename = { onRenameSnapshot(snap) },
                         onDelete = { viewModel.unfreezeSnapshot(snap.id) }
@@ -498,6 +579,7 @@ private fun FreezeAndExportContent(
 @Composable
 private fun SnapshotOverlayItem(
     snapshot: RtaSnapshot,
+    canExportCsv: Boolean,
     onToggleVisibility: () -> Unit,
     onExportCsv: () -> Unit,
     onRename: () -> Unit,
@@ -601,8 +683,8 @@ private fun SnapshotOverlayItem(
                 modifier = Modifier.size(28.dp)
             ) {
                 Icon(
-                    imageVector = Icons.Default.FileDownload,
-                    contentDescription = "Export CSV",
+                    imageVector = if (canExportCsv) Icons.Default.FileDownload else Icons.Default.Lock,
+                    contentDescription = if (canExportCsv) "Export CSV" else "CSV export · Pro",
                     tint = Color(0xFF81D4FA),
                     modifier = Modifier.size(16.dp)
                 )
@@ -642,18 +724,26 @@ private fun SnapshotOverlayItem(
 // =========================================================================
 
 @Composable
-private fun SavedSessionsContent(
+internal fun SavedSessionsContent(
     savedSessions: List<SessionWithSnapshots>,
+    canExportCsv: Boolean,
+    canSaveNewSession: Boolean,
     onOpenSaveDialog: () -> Unit,
     onOverlaySession: (SessionWithSnapshots) -> Unit,
     onExportSessionCsv: (SessionWithSnapshots) -> Unit,
     onEditNotes: (SessionWithSnapshots) -> Unit,
-    onDeleteSession: (SessionWithSnapshots) -> Unit
+    onDeleteSession: (SessionWithSnapshots) -> Unit,
+    onLearnMore: () -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (!canSaveNewSession) {
+            ProFeatureNotice(ProFeature.UNLIMITED_SESSIONS, onLearnMore)
+            Text("Free includes one saved session. Existing measurements and notes remain available; a new save needs room or Pro access.",
+                color = Color(0xFF90A4AE), fontSize = 10.sp, lineHeight = 15.sp)
+        }
         // Save New Session Button
         Button(
-            onClick = onOpenSaveDialog,
+            onClick = if (canSaveNewSession) onOpenSaveDialog else onLearnMore,
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(
                 containerColor = Color(0xFF00E676),
@@ -669,7 +759,7 @@ private fun SavedSessionsContent(
             )
             Spacer(modifier = Modifier.width(6.dp))
             Text(
-                text = "SAVE CURRENT TO SESSION HISTORY",
+                text = if (canSaveNewSession) "SAVE CURRENT TO SESSION HISTORY" else "SAVE NEW SESSION · PRO",
                 color = Color.Black,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Bold,
@@ -698,6 +788,7 @@ private fun SavedSessionsContent(
                 savedSessions.forEach { sessionWithSnapshots ->
                     SavedSessionItem(
                         sessionWithSnapshots = sessionWithSnapshots,
+                        canExportCsv = canExportCsv,
                         onOverlay = { onOverlaySession(sessionWithSnapshots) },
                         onExportCsv = { onExportSessionCsv(sessionWithSnapshots) },
                         onEditNotes = { onEditNotes(sessionWithSnapshots) },
@@ -712,6 +803,7 @@ private fun SavedSessionsContent(
 @Composable
 private fun SavedSessionItem(
     sessionWithSnapshots: SessionWithSnapshots,
+    canExportCsv: Boolean,
     onOverlay: () -> Unit,
     onExportCsv: () -> Unit,
     onEditNotes: () -> Unit,
@@ -828,13 +920,13 @@ private fun SavedSessionItem(
                     border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF37474F))
                 ) {
                     Icon(
-                        imageVector = Icons.Default.FileDownload,
-                        contentDescription = null,
+                        imageVector = if (canExportCsv) Icons.Default.FileDownload else Icons.Default.Lock,
+                        contentDescription = if (canExportCsv) "Export session CSV" else "Session CSV export · Pro",
                         tint = Color(0xFF81C784),
                         modifier = Modifier.size(14.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("CSV", color = Color(0xFF81C784), fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                    Text(if (canExportCsv) "CSV" else "PRO", color = Color(0xFF81C784), fontSize = 10.sp, fontFamily = FontFamily.Monospace)
                 }
 
                 OutlinedButton(
@@ -865,6 +957,66 @@ private fun SavedSessionItem(
             }
         }
     }
+}
+
+@Composable
+private fun SavedSnapshotSelectorDialog(
+    session: SessionWithSnapshots,
+    canLoadSnapshot: Boolean,
+    onDismiss: () -> Unit,
+    onLearnMore: () -> Unit,
+    onSelect: (Long) -> Unit
+) {
+    var selectedId by remember(session.session.id) { mutableStateOf<Long?>(null) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF14171E),
+        title = { Text("Choose one saved snapshot", color = Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Free includes one frozen overlay. Choose a snapshot from '${session.session.name}' to add to the RTA. All saved snapshots remain in your session.",
+                    color = Color(0xFFB0BEC5), fontSize = 12.sp, lineHeight = 18.sp)
+                if (!canLoadSnapshot) {
+                    Text("Overlay capacity is now full. Cancel, then remove or clear an existing overlay yourself before loading this snapshot.",
+                        color = Color(0xFFFFD54F), fontSize = 12.sp, lineHeight = 18.sp)
+                }
+                Column(Modifier.heightIn(max = 280.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    session.snapshots.forEach { snapshot ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp))
+                                .background(if (snapshot.id == selectedId) Color(0xFF1B303D) else Color(0xFF0E1217))
+                                .clickable { selectedId = snapshot.id }.padding(end = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = snapshot.id == selectedId,
+                                onClick = { selectedId = snapshot.id },
+                                colors = RadioButtonDefaults.colors(selectedColor = Color(0xFF00E5FF), unselectedColor = Color(0xFF78909C))
+                            )
+                            Column(Modifier.weight(1f)) {
+                                Text(snapshot.name, color = Color.White, fontSize = 12.sp)
+                                Text(SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(snapshot.timestamp)),
+                                    color = Color(0xFF78909C), fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                            }
+                        }
+                    }
+                }
+                TextButton(onClick = onLearnMore) {
+                    Text("PRO · LOAD MULTIPLE OVERLAYS", color = Color(0xFFFFD54F), fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { selectedId?.let(onSelect) },
+                enabled = selectedId != null && canLoadSnapshot,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E5FF), contentColor = Color.Black)
+            ) { Text("LOAD SNAPSHOT", fontFamily = FontFamily.Monospace, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("CANCEL", color = Color(0xFF90A4AE), fontFamily = FontFamily.Monospace) }
+        }
+    )
 }
 
 @Composable

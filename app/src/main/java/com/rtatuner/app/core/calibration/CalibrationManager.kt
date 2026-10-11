@@ -5,11 +5,21 @@ import android.content.SharedPreferences
 import android.util.Log
 import com.rtatuner.app.core.audio.AudioMath
 import com.rtatuner.app.core.dsp.Iso31Bands
+import com.rtatuner.app.core.entitlement.FeatureAccessPolicy
+import com.rtatuner.app.core.entitlement.FeatureAccessResult
+import com.rtatuner.app.core.entitlement.ProFeature
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.log10
 import kotlin.math.pow
 
@@ -73,7 +83,21 @@ data class CalibrationUiState(
  * Orchestrates mic calibration curves, dB SPL reference calibration, target curve overlays,
  * and power-domain noise floor capture & subtraction with persistence.
  */
-class CalibrationManager(context: Context) {
+class CalibrationManager internal constructor(
+    private val prefs: SharedPreferences,
+    private val featurePolicy: FeatureAccessPolicy = FeatureAccessPolicy(),
+    scope: CoroutineScope? = null,
+    private val nowMs: () -> Long = System::currentTimeMillis
+) {
+    constructor(
+        context: Context,
+        featurePolicy: FeatureAccessPolicy = FeatureAccessPolicy(),
+        scope: CoroutineScope? = null
+    ) : this(
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE),
+        featurePolicy,
+        scope
+    )
 
     companion object {
         private const val TAG = "CalibrationManager"
@@ -95,26 +119,52 @@ class CalibrationManager(context: Context) {
         private const val KEY_NOISE_SUBTRACTION_ACTIVE = "noise_subtraction_active"
     }
 
-    private val prefs: SharedPreferences =
-        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-
     private val _uiState = MutableStateFlow(CalibrationUiState())
     val uiState: StateFlow<CalibrationUiState> = _uiState.asStateFlow()
 
-    // Pre-allocated per-band calibration correction offsets
-    private val micOffsets31 = FloatArray(Iso31Bands.NUM_BANDS) { 0.0f }
+    // Requested preferences survive entitlement changes. Only effective state reaches DSP.
+    private var requestedState = CalibrationUiState()
+    private val stateLock = Any()
+    private val ownedScope = if (scope == null) CoroutineScope(SupervisorJob() + Dispatchers.Default) else null
+
+    /** Arrays are owned by this snapshot and never mutated after publication. */
+    private data class EffectiveFrameState(
+        val calibration: CalibrationUiState,
+        val micOffsets31: FloatArray
+    )
+
+    @Volatile
+    private var effectiveFrame = EffectiveFrameState(CalibrationUiState(), FloatArray(Iso31Bands.NUM_BANDS))
 
     // Noise floor capture accumulator
+    @Volatile
     private var isCapturingNoise = false
     private var noiseCaptureStartMs = 0L
     private var noiseCaptureDurationMs = 2000L
     private var noiseAccumFrames = 0
     private val noiseAccumPower = DoubleArray(Iso31Bands.NUM_BANDS) { 0.0 }
-    @Volatile
-    private var shouldResetSmoothing = false
+    private val shouldResetSmoothing = AtomicBoolean(false)
 
     init {
         loadPersistedState()
+    }
+
+    private val entitlementJob = (scope ?: requireNotNull(ownedScope)).launch(start = CoroutineStart.UNDISPATCHED) {
+        featurePolicy.entitlements.state.collect {
+            synchronized(stateLock) {
+                if (featurePolicy.check(ProFeature.NOISE_FLOOR) is FeatureAccessResult.Denied) {
+                    cancelNoiseCaptureLocked()
+                }
+                publishEffectiveStateLocked()
+                shouldResetSmoothing.set(true)
+            }
+        }
+    }
+
+    fun close() {
+        entitlementJob.cancel()
+        ownedScope?.cancel()
+        synchronized(stateLock) { cancelNoiseCaptureLocked() }
     }
 
     private fun loadPersistedState() {
@@ -178,7 +228,7 @@ class CalibrationManager(context: Context) {
                 "Calib.: None"
             }
 
-            _uiState.value = CalibrationUiState(
+            requestedState = CalibrationUiState(
                 micCurve = loadedMicCurve,
                 isMicCurveActive = micActive,
                 micCurveStatusText = statusText,
@@ -189,27 +239,34 @@ class CalibrationManager(context: Context) {
                 isNoiseSubtractionActive = noiseSubtractionActive
             )
 
-            recomputeMicOffsets()
+            publishEffectiveStateLocked()
         } catch (e: Exception) {
             Log.e(TAG, "Error loading calibration preferences", e)
         }
     }
 
-    private fun recomputeMicOffsets() {
-        val curve = _uiState.value.micCurve
-        val active = _uiState.value.isMicCurveActive
-        for (i in 0 until Iso31Bands.NUM_BANDS) {
-            micOffsets31[i] = if (active && curve != null) {
-                curve.getOffsetAt(Iso31Bands.CENTER_FREQUENCIES[i])
-            } else {
-                0.0f
-            }
+    private fun publishEffectiveStateLocked() {
+        val effective = effectiveCalibrationState(requestedState, featurePolicy)
+        val curve = effective.micCurve?.copy(points = effective.micCurve.points.toList())
+        val processingState = effective.copy(
+            micCurve = curve,
+            noiseFloor = effective.noiseFloor.copy(bands31Db = effective.noiseFloor.bands31Db.copyOf()),
+            targetCurve = effective.targetCurve?.let { it.copy(points = it.points.toList()) }
+        )
+        val offsets = FloatArray(Iso31Bands.NUM_BANDS) { i ->
+            if (effective.isMicCurveActive && curve != null) curve.getOffsetAt(Iso31Bands.CENTER_FREQUENCIES[i]) else 0.0f
         }
+        effectiveFrame = EffectiveFrameState(processingState, offsets)
+        _uiState.value = effective.copy(
+            micCurve = effective.micCurve?.let { it.copy(points = it.points.toList()) },
+            noiseFloor = effective.noiseFloor.copy(bands31Db = effective.noiseFloor.bands31Db.copyOf()),
+            targetCurve = effective.targetCurve?.let { it.copy(points = it.points.toList()) }
+        )
     }
 
     /**
      * Applies mic curve corrections, noise subtraction, target deltas, and SPL offset to a live frame.
-     * Operates zero-allocation inside the real-time capture stream.
+     * Reads one atomically published effective snapshot; there are no per-bin entitlement checks.
      */
     fun processFrame(
         raw31Bands: FloatArray,
@@ -222,30 +279,35 @@ class CalibrationManager(context: Context) {
         val unreliable = BooleanArray(numBands) { false }
 
         // Check if noise floor capture is in progress
-        if (isCapturingNoise) {
-            val now = System.currentTimeMillis()
-            val elapsed = now - noiseCaptureStartMs
-            val progress = (elapsed.toFloat() / noiseCaptureDurationMs).coerceIn(0.0f, 1.0f)
+        if (isCapturingNoise) synchronized(stateLock) {
+            if (isCapturingNoise) {
+                val now = nowMs()
+                val elapsed = now - noiseCaptureStartMs
+                val progress = (elapsed.toFloat() / noiseCaptureDurationMs).coerceIn(0.0f, 1.0f)
 
-            // Accumulate energy in linear power domain
-            noiseAccumFrames++
-            for (i in 0 until numBands) {
-                val db = raw31Bands[i]
-                noiseAccumPower[i] += 10.0.pow(db / 10.0)
-            }
+                // Accumulate energy in linear power domain
+                noiseAccumFrames++
+                for (i in 0 until numBands) {
+                    val db = raw31Bands[i]
+                    noiseAccumPower[i] += 10.0.pow(db / 10.0)
+                }
 
-            if (elapsed >= noiseCaptureDurationMs && noiseAccumFrames > 0) {
-                finalizeNoiseCapture()
-            } else {
-                _uiState.value = _uiState.value.copy(
-                    isCapturingNoiseFloor = true,
-                    noiseCaptureProgress = progress
-                )
+                if (elapsed >= noiseCaptureDurationMs && noiseAccumFrames > 0) {
+                    finalizeNoiseCapture()
+                } else {
+                    requestedState = requestedState.copy(
+                        isCapturingNoiseFloor = true,
+                        noiseCaptureProgress = progress
+                    )
+                    _uiState.value = _uiState.value.copy(isCapturingNoiseFloor = true, noiseCaptureProgress = progress)
+                }
             }
         }
 
         // Read state AFTER any potential finalizeNoiseCapture() call to ensure consistency in this frame
-        val state = _uiState.value
+        val frameState = effectiveFrame
+        val state = frameState.calibration
+        val micOffsets31 = frameState.micOffsets31
         val noiseSnapshot = state.noiseFloor
         // During active noise capture, display raw ambient noise rather than subtracting old baseline
         val isSubtractingNoise = !isCapturingNoise && state.isNoiseSubtractionActive && noiseSnapshot.isCaptured
@@ -315,8 +377,7 @@ class CalibrationManager(context: Context) {
             }
         }
 
-        val reset = shouldResetSmoothing
-        shouldResetSmoothing = false
+        val reset = shouldResetSmoothing.getAndSet(false)
 
         return CalibratedSpectralFrame(
             calibrated31Db = out31,
@@ -331,7 +392,9 @@ class CalibrationManager(context: Context) {
 
     // --- Mic Calibration Curve Actions ---
 
-    fun loadMicCurve(name: String, textContent: String): Result<MicCalibrationCurve> {
+    fun loadMicCurve(name: String, textContent: String): Result<MicCalibrationCurve> = synchronized(stateLock) {
+        val authorization = runCatching { featurePolicy.requireAccess(ProFeature.MIC_CALIBRATION) }
+        if (authorization.isFailure) return@synchronized Result.failure(authorization.exceptionOrNull()!!)
         val parseResult = CalibrationCurveParser.parse(name, textContent)
         if (parseResult.isSuccess) {
             val curve = parseResult.getOrThrow()
@@ -349,55 +412,53 @@ class CalibrationManager(context: Context) {
                 .putBoolean(KEY_MIC_CURVE_ACTIVE, true)
                 .apply()
 
-            _uiState.value = _uiState.value.copy(
+            requestedState = requestedState.copy(
                 micCurve = curve,
                 isMicCurveActive = true,
                 micCurveStatusText = "Calib.: Active (${curve.name})"
             )
-            recomputeMicOffsets()
+            publishEffectiveStateLocked()
         }
-        return parseResult
+        parseResult
     }
 
-    fun setMicCurveActive(active: Boolean) {
-        val curve = _uiState.value.micCurve
+    fun setMicCurveActive(active: Boolean): FeatureAccessResult = mutateWithAccess(ProFeature.MIC_CALIBRATION) {
+        val curve = requestedState.micCurve
         prefs.edit().putBoolean(KEY_MIC_CURVE_ACTIVE, active).apply()
         val statusText = if (active && curve != null) {
             "Calib.: Active (${curve.name})"
         } else {
             "Calib.: None"
         }
-        _uiState.value = _uiState.value.copy(
+        requestedState = requestedState.copy(
             isMicCurveActive = active,
             micCurveStatusText = statusText
         )
-        recomputeMicOffsets()
     }
 
-    fun clearMicCurve() {
+    fun clearMicCurve(): FeatureAccessResult = mutateWithAccess(ProFeature.MIC_CALIBRATION) {
         prefs.edit()
             .remove(KEY_MIC_CURVE_NAME)
             .remove(KEY_MIC_CURVE_POINTS)
             .putBoolean(KEY_MIC_CURVE_ACTIVE, false)
             .apply()
 
-        _uiState.value = _uiState.value.copy(
+        requestedState = requestedState.copy(
             micCurve = null,
             isMicCurveActive = false,
             micCurveStatusText = "Calib.: None"
         )
-        recomputeMicOffsets()
     }
 
     // --- dB SPL Reference Calibration Actions ---
 
-    fun calibrateSplReference(measuredRmsDbFs: Float, knownSplDb: Float) {
+    fun calibrateSplReference(measuredRmsDbFs: Float, knownSplDb: Float): FeatureAccessResult = mutateWithAccess(ProFeature.SPL_CALIBRATION) {
         // Real SPL meters measure RMS acoustic power (e.g. Fast/Slow time-weighting Leq).
         // Using RMS instead of Peak eliminates systematic errors caused by signal crest factors.
         if (measuredRmsDbFs.isNaN() || measuredRmsDbFs.isInfinite() ||
             knownSplDb.isNaN() || knownSplDb.isInfinite()) {
             Log.w(TAG, "Rejecting invalid SPL calibration inputs: rms=$measuredRmsDbFs, knownSpl=$knownSplDb")
-            return
+            return@mutateWithAccess
         }
 
         // Clamp to sane acoustic ranges (target 40-140 dBSPL, measured -100 to 0 dBFS)
@@ -406,7 +467,7 @@ class CalibrationManager(context: Context) {
         val offset = safeSpl - safeRms
         if (offset.isNaN() || offset.isInfinite()) {
             Log.w(TAG, "Computed invalid SPL offset: $offset")
-            return
+            return@mutateWithAccess
         }
 
         prefs.edit()
@@ -414,58 +475,76 @@ class CalibrationManager(context: Context) {
             .putBoolean(KEY_SPL_MODE, true)
             .apply()
 
-        _uiState.value = _uiState.value.copy(
+        requestedState = requestedState.copy(
             splCalibration = SplCalibration(isSplMode = true, splOffsetDb = offset)
         )
     }
 
-    fun setSplMode(enabled: Boolean) {
+    fun setSplMode(enabled: Boolean): FeatureAccessResult = mutateWithAccess(ProFeature.SPL_CALIBRATION) {
         prefs.edit().putBoolean(KEY_SPL_MODE, enabled).apply()
-        _uiState.value = _uiState.value.copy(
-            splCalibration = _uiState.value.splCalibration.copy(isSplMode = enabled)
+        requestedState = requestedState.copy(
+            splCalibration = requestedState.splCalibration.copy(isSplMode = enabled)
         )
     }
 
-    fun setSplOffset(offsetDb: Float) {
-        if (offsetDb.isNaN() || offsetDb.isInfinite()) return
+    fun setSplOffset(offsetDb: Float): FeatureAccessResult = mutateWithAccess(ProFeature.SPL_CALIBRATION) {
+        if (offsetDb.isNaN() || offsetDb.isInfinite()) return@mutateWithAccess
         prefs.edit().putFloat(KEY_SPL_OFFSET_DB, offsetDb).apply()
-        _uiState.value = _uiState.value.copy(
-            splCalibration = _uiState.value.splCalibration.copy(splOffsetDb = offsetDb)
+        requestedState = requestedState.copy(
+            splCalibration = requestedState.splCalibration.copy(splOffsetDb = offsetDb)
         )
     }
 
     // --- Target Curve Actions ---
 
-    fun setTargetCurve(curve: TargetCurve?) {
+    fun setTargetCurve(curve: TargetCurve?): FeatureAccessResult = synchronized(stateLock) {
+        if (curve != null && curve != TargetCurve.HARMAN_CAR) {
+            val result = featurePolicy.check(ProFeature.ADVANCED_TARGETS)
+            if (result is FeatureAccessResult.Denied) return@synchronized result
+        }
         prefs.edit()
             .putString(KEY_TARGET_CURVE_ID, curve?.id ?: "")
             .apply()
 
-        _uiState.value = _uiState.value.copy(targetCurve = curve)
+        requestedState = requestedState.copy(targetCurve = curve)
+        publishEffectiveStateLocked()
+        FeatureAccessResult.Allowed
     }
 
-    fun setTargetCurveActive(active: Boolean) {
+    fun setTargetCurveActive(active: Boolean): FeatureAccessResult = synchronized(stateLock) {
+        if (requestedState.targetCurve != null && requestedState.targetCurve != TargetCurve.HARMAN_CAR) {
+            val result = featurePolicy.check(ProFeature.ADVANCED_TARGETS)
+            if (result is FeatureAccessResult.Denied) return@synchronized result
+        }
         prefs.edit().putBoolean(KEY_TARGET_CURVE_ACTIVE, active).apply()
-        _uiState.value = _uiState.value.copy(isTargetCurveActive = active)
+        requestedState = requestedState.copy(isTargetCurveActive = active)
+        publishEffectiveStateLocked()
+        FeatureAccessResult.Allowed
     }
 
     // --- Noise Floor Capture & Subtraction Actions ---
 
-    fun startNoiseFloorCapture(durationMs: Long = 2000L) {
-        noiseCaptureDurationMs = durationMs
-        noiseCaptureStartMs = System.currentTimeMillis()
+    fun startNoiseFloorCapture(durationMs: Long = 2000L): FeatureAccessResult = mutateWithAccess(ProFeature.NOISE_FLOOR) {
+        noiseCaptureDurationMs = durationMs.coerceAtLeast(1L)
+        noiseCaptureStartMs = nowMs()
         noiseAccumFrames = 0
         noiseAccumPower.fill(0.0)
         isCapturingNoise = true
-        shouldResetSmoothing = true
+        shouldResetSmoothing.set(true)
 
-        _uiState.value = _uiState.value.copy(
+        requestedState = requestedState.copy(
             isCapturingNoiseFloor = true,
             noiseCaptureProgress = 0.0f
         )
     }
 
     private fun finalizeNoiseCapture() {
+        // Finalization is an operation boundary: revoke even if the observer has not run yet.
+        if (featurePolicy.check(ProFeature.NOISE_FLOOR) is FeatureAccessResult.Denied) {
+            cancelNoiseCaptureLocked()
+            publishEffectiveStateLocked()
+            return
+        }
         isCapturingNoise = false
         val numBands = Iso31Bands.NUM_BANDS
         val capturedBands = FloatArray(numBands)
@@ -481,7 +560,7 @@ class CalibrationManager(context: Context) {
             }
         }
 
-        val timestamp = System.currentTimeMillis()
+        val timestamp = nowMs()
         val snapshot = NoiseFloorSnapshot(
             bands31Db = capturedBands,
             captureTimestampMs = timestamp,
@@ -497,23 +576,25 @@ class CalibrationManager(context: Context) {
             .putBoolean(KEY_NOISE_SUBTRACTION_ACTIVE, true)
             .apply()
 
-        shouldResetSmoothing = true
-        _uiState.value = _uiState.value.copy(
+        shouldResetSmoothing.set(true)
+        requestedState = requestedState.copy(
             noiseFloor = snapshot,
             isNoiseSubtractionActive = true,
             isCapturingNoiseFloor = false,
             noiseCaptureProgress = 1.0f
         )
+        publishEffectiveStateLocked()
     }
 
-    fun setNoiseSubtractionActive(active: Boolean) {
-        shouldResetSmoothing = true
+    fun setNoiseSubtractionActive(active: Boolean): FeatureAccessResult = mutateWithAccess(ProFeature.NOISE_FLOOR) {
+        shouldResetSmoothing.set(true)
         prefs.edit().putBoolean(KEY_NOISE_SUBTRACTION_ACTIVE, active).apply()
-        _uiState.value = _uiState.value.copy(isNoiseSubtractionActive = active)
+        requestedState = requestedState.copy(isNoiseSubtractionActive = active)
     }
 
-    fun clearNoiseFloor() {
-        shouldResetSmoothing = true
+    fun clearNoiseFloor(): FeatureAccessResult = mutateWithAccess(ProFeature.NOISE_FLOOR) {
+        shouldResetSmoothing.set(true)
+        cancelNoiseCaptureLocked()
         prefs.edit()
             .remove(KEY_NOISE_FLOOR_BANDS)
             .remove(KEY_NOISE_FLOOR_TIMESTAMP)
@@ -521,9 +602,27 @@ class CalibrationManager(context: Context) {
             .putBoolean(KEY_NOISE_SUBTRACTION_ACTIVE, false)
             .apply()
 
-        _uiState.value = _uiState.value.copy(
+        requestedState = requestedState.copy(
             noiseFloor = NoiseFloorSnapshot(),
             isNoiseSubtractionActive = false
         )
+    }
+
+    private fun mutateWithAccess(feature: ProFeature, mutate: () -> Unit): FeatureAccessResult = synchronized(stateLock) {
+        val access = featurePolicy.check(feature)
+        if (access is FeatureAccessResult.Denied) return@synchronized access
+        mutate()
+        publishEffectiveStateLocked()
+        FeatureAccessResult.Allowed
+    }
+
+    private fun cancelNoiseCaptureLocked() {
+        if (!isCapturingNoise) return
+        isCapturingNoise = false
+        noiseAccumFrames = 0
+        noiseAccumPower.fill(0.0)
+        requestedState = requestedState.copy(isCapturingNoiseFloor = false, noiseCaptureProgress = 0.0f)
+        _uiState.value = _uiState.value.copy(isCapturingNoiseFloor = false, noiseCaptureProgress = 0.0f)
+        shouldResetSmoothing.set(true)
     }
 }

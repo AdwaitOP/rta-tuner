@@ -7,6 +7,8 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
 import androidx.room.Update
+import com.rtatuner.app.core.entitlement.FeatureAccessPolicy
+import com.rtatuner.app.core.entitlement.getOrThrow
 import kotlinx.coroutines.flow.Flow
 
 /**
@@ -14,6 +16,28 @@ import kotlinx.coroutines.flow.Flow
  */
 @Dao
 interface TuningSessionDao {
+
+    @Query("SELECT COUNT(*) FROM tuning_sessions")
+    suspend fun countSessions(): Int
+
+    /**
+     * Room serializes the capacity check and all inserts in one database transaction.
+     * This also protects saves made through separate repository instances and rolls
+     * the session back if any snapshot cannot be persisted.
+     */
+    @Transaction
+    suspend fun saveSessionWithSnapshots(
+        session: TuningSessionEntity,
+        snapshots: List<SessionSnapshotEntity>,
+        featureAccessPolicy: FeatureAccessPolicy
+    ): Long {
+        featureAccessPolicy.checkSessionCapacity(countSessions()).getOrThrow()
+        val sessionId = insertSession(session)
+        if (snapshots.isNotEmpty()) {
+            insertSnapshots(snapshots.map { it.copy(sessionId = sessionId) })
+        }
+        return sessionId
+    }
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertSession(session: TuningSessionEntity): Long
