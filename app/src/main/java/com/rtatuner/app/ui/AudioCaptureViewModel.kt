@@ -2,6 +2,7 @@ package com.rtatuner.app.ui
 
 import android.app.Application
 import android.content.Context
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.rtatuner.app.core.audio.AudioCaptureConfig
@@ -29,6 +30,8 @@ import com.rtatuner.app.core.entitlement.FeatureAccessPolicy
 import com.rtatuner.app.core.entitlement.FeatureAccessResult
 import com.rtatuner.app.core.entitlement.ProFeature
 import com.rtatuner.app.core.export.RtaExportManager
+import com.rtatuner.app.core.export.CsvExportResult
+import com.rtatuner.app.core.export.CsvShareException
 import com.rtatuner.app.core.session.FrozenSnapshotStore
 import com.rtatuner.app.core.session.RtaSnapshot
 import com.rtatuner.app.core.session.SnapshotPalette
@@ -36,10 +39,12 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.max
@@ -58,6 +63,9 @@ class AudioCaptureViewModel(
     val featureAccessPolicy = FeatureAccessPolicy(entitlementRepository)
     private val _accessDenial = MutableStateFlow<FeatureAccessResult.Denied?>(null)
     val accessDenial = _accessDenial.asStateFlow()
+
+    private val csvExportErrorChannel = Channel<String>(Channel.BUFFERED)
+    val csvExportErrors = csvExportErrorChannel.receiveAsFlow()
 
     fun dismissAccessDenial() { _accessDenial.value = null }
 
@@ -587,18 +595,33 @@ class AudioCaptureViewModel(
     }
 
     /** Authorization precedes formatting and the shared CSV writer checks again before I/O. */
-    private fun exportCsv(context: Context, name: String, content: () -> String): FeatureAccessResult {
+    private fun exportCsv(context: Context, name: String, content: () -> String): CsvExportResult {
         val access = featureAccessPolicy.check(ProFeature.CSV_EXPORT)
-        if (access is FeatureAccessResult.Denied) return reportAccess(access)
+        if (access is FeatureAccessResult.Denied) {
+            reportAccess(access)
+            return CsvExportResult.AccessDenied(access)
+        }
         return try {
             RtaExportManager.shareCsv(context, content(), name, featureAccessPolicy)
-            FeatureAccessResult.Allowed
+            CsvExportResult.ShareChooserLaunched
         } catch (denied: FeatureAccessDeniedException) {
             reportAccess(denied.denial)
+            CsvExportResult.AccessDenied(denied.denial)
+        } catch (failure: CsvShareException) {
+            reportCsvFailure(failure.cause as? Exception ?: failure)
+        } catch (failure: Exception) {
+            // Formatting errors precede the export manager's own error logging.
+            Log.e("AudioCaptureViewModel", "Could not format CSV for sharing", failure)
+            reportCsvFailure(failure)
         }
     }
 
-    fun exportLiveCsv(context: Context): FeatureAccessResult = exportCsv(context, "cabinrta_live_spectrum") {
+    private fun reportCsvFailure(cause: Exception): CsvExportResult.Failed {
+        csvExportErrorChannel.trySend("Could not share CSV. Please try again.")
+        return CsvExportResult.Failed(cause)
+    }
+
+    fun exportLiveCsv(context: Context): CsvExportResult = exportCsv(context, "cabinrta_live_spectrum") {
         val state = uiState.value
         val cal = calibrationManager.uiState.value
         RtaExportManager.formatLiveCurveCsv(
@@ -612,10 +635,10 @@ class AudioCaptureViewModel(
         )
     }
 
-    fun exportSnapshotCsv(context: Context, snapshot: RtaSnapshot): FeatureAccessResult =
+    fun exportSnapshotCsv(context: Context, snapshot: RtaSnapshot): CsvExportResult =
         exportCsv(context, snapshot.name) { RtaExportManager.formatSnapshotCsv(snapshot) }
 
-    fun exportSessionCsv(context: Context, session: SessionWithSnapshots): FeatureAccessResult =
+    fun exportSessionCsv(context: Context, session: SessionWithSnapshots): CsvExportResult =
         exportCsv(context, session.session.name) { RtaExportManager.formatSessionWithSnapshotsCsv(session) }
 
     // ==========================================
@@ -652,6 +675,7 @@ class AudioCaptureViewModel(
 
     override fun onCleared() {
         super.onCleared()
+        csvExportErrorChannel.close()
         ballisticsJob?.cancel()
         captureCollectorJob?.cancel()
         generatorCollectorJob?.cancel()

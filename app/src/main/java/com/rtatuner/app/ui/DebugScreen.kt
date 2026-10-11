@@ -45,6 +45,8 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
@@ -106,6 +108,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.runtime.DisposableEffect
 import java.util.Locale
+import kotlinx.coroutines.flow.Flow
 
 @Composable
 fun DebugScreen(
@@ -119,6 +122,8 @@ fun DebugScreen(
     val isFullscreenGraph by viewModel.isFullscreenGraph.collectAsState()
     val entitlement by viewModel.entitlementState.collectAsState()
     val accessDenial by viewModel.accessDenial.collectAsState()
+    val csvSnackbarHostState = remember { SnackbarHostState() }
+    CsvExportErrorEffect(viewModel.csvExportErrors, csvSnackbarHostState)
     val policy = viewModel.featureAccessPolicy
     val canFreeze = remember(entitlement, frozenSnapshots.size) {
         policy.checkOverlayCapacity(frozenSnapshots.size) is FeatureAccessResult.Allowed
@@ -211,7 +216,8 @@ fun DebugScreen(
     } else {
         Scaffold(
             modifier = modifier.fillMaxSize(),
-            containerColor = Color(0xFF0F1115)
+            containerColor = Color(0xFF0F1115),
+            snackbarHost = { SnackbarHost(csvSnackbarHostState) }
         ) { innerPadding ->
         Column(
             modifier = Modifier
@@ -453,6 +459,13 @@ fun DebugScreen(
             Spacer(modifier = Modifier.height(16.dp))
         }
     }
+    }
+}
+
+@Composable
+internal fun CsvExportErrorEffect(errors: Flow<String>, snackbarHostState: SnackbarHostState) {
+    LaunchedEffect(errors, snackbarHostState) {
+        errors.collect { message -> snackbarHostState.showSnackbar(message) }
     }
 }
 

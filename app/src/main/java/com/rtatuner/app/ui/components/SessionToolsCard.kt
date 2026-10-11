@@ -724,7 +724,7 @@ private fun SnapshotOverlayItem(
 // =========================================================================
 
 @Composable
-private fun SavedSessionsContent(
+internal fun SavedSessionsContent(
     savedSessions: List<SessionWithSnapshots>,
     canExportCsv: Boolean,
     canSaveNewSession: Boolean,
@@ -743,7 +743,7 @@ private fun SavedSessionsContent(
         }
         // Save New Session Button
         Button(
-            onClick = onOpenSaveDialog,
+            onClick = if (canSaveNewSession) onOpenSaveDialog else onLearnMore,
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(
                 containerColor = Color(0xFF00E676),

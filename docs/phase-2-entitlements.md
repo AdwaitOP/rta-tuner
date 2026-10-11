@@ -12,7 +12,7 @@ This phase centralizes access enforcement and adds the contextual upgrade interf
 
 ## Architecture
 
-`EntitlementRepository` exposes `StateFlow<EntitlementState>` with `FREE` and `PRO_LIFETIME` tiers. `FeatureAccessPolicy` owns all capability checks and numerical limits. Actions return `FeatureAccessResult` or throw its structured `FeatureAccessDeniedException` before mutation; `AudioCaptureViewModel` publishes contextual denials for Compose.
+`EntitlementRepository` exposes `StateFlow<EntitlementState>` with `FREE` and `PRO_LIFETIME` tiers. `FeatureAccessPolicy` owns all capability checks and numerical limits. Authorization checks return `FeatureAccessResult` or throw its structured `FeatureAccessDeniedException` before mutation; `AudioCaptureViewModel` publishes contextual denials for Compose. CSV application actions separately return `CsvExportResult` for denial, chooser initiation, or operational failure.
 
 One repository and policy are shared by the ViewModel's calibration manager, generator, overlay store, session repository, and export operations. Constructors support injected providers for tests and future verified ownership. The release source set's `AppEntitlements.create()` always returns `FreeEntitlementRepository`; its simulation operation returns `false`. `DebugEntitlementRepository` exists only in the debug source set, starts Free, and stores simulation in memory. Creating a new provider resets it to Free. Tests use a separate test-only fake.
 
@@ -89,7 +89,7 @@ Production paths below are under `app/src/main/java/com/rtatuner/app/` unless a 
 - Tests under `app/src/test/java/com/rtatuner/app/`: `FeatureAccessPolicyTest.kt`, `FrozenSnapshotStoreTest.kt`, `CalibrationEntitlementTest.kt`, `SignalGeneratorEntitlementTest.kt`, `SessionRepositoryEntitlementTest.kt`, `RtaExportEntitlementTest.kt`, `AudioCaptureEntitlementIntegrationTest.kt`, `CsvFileProviderFixture.kt`, and `core/entitlement/FakeEntitlementRepository.kt`. Existing `SignalGeneratorTest.kt` adds lifecycle cleanup; all 66 existing regression tests are retained.
 - Review report: `docs/phase-2-entitlements.md`.
 
-## Verification
+## Verification of the original Phase 2 implementation
 
 Executed with the installed Android SDK, JetBrains JDK 21.0.7 and Gradle 8.13 on 11 October 2026:
 
@@ -120,7 +120,35 @@ FFT algorithms, microphone routing, and database schema receive no implementatio
 - Pro has no purchase or restoration flow in Phase 2. Release remains Free until verified ownership is supplied. The coming-soon sheet has no functional Buy control or regional price.
 - JVM Android behavior is exercised with Robolectric and Compose appearance is smoke-checked on the Pixel 9 Pro emulator. Physical microphone routing, rendered PNG sharing, and real-device audio still require device validation. Lint warnings/hints remain; no lint baseline or suppression was added.
 - The repository's existing debug signing configuration for release packaging is unchanged; store distribution needs production signing configuration.
-- Export I/O errors retain the pre-existing logging behavior. Entitlement denials are structured and surfaced contextually.
+- CSV operational failures retain technical logging and now propagate to a friendly Snackbar. Chooser initiation confirms only that Android's share chooser was launched, not delivery to another app. Same-name exports within one timestamp second fail safely and can be retried, preserving the existing filename convention and prior files.
 - Phase 3 must introduce the configured one-time lifetime Play product, a Billing-backed `EntitlementRepository`, and verified ownership publication. It must handle pending/cancelled purchases, acknowledgement, restore/requery, refunds/revocations, and reconnection/offline state without trusting local simulation or unverified flags.
 - Product details and localized price must come from Billing. Purchase UI must distinguish pending, verified, failed, and restored ownership, while retaining the existing Free operations and data-preservation rules.
 - Verified state changes must continue using the same policy and lifecycle collectors. Billing integration needs tests for failed verification, restore, pending purchases, revocation during active processing, and release builds without any debug bypass.
+
+## Independent audit corrections: P2-A and P2-B
+
+Corrections build on audited commit `b9a888d9e6d9d43dc47f09afb9ea14234c10154f` on `codex/cabinrta-pro-entitlements` as a new commit; the audited commit and `main` are unchanged.
+
+- **P2-A PASS:** The session Save button invokes the existing `UNLIMITED_SESSIONS` upgrade callback immediately when displayed capacity is full. Available Free capacity and Pro retain the Save dialog. The existing Room transaction still checks the actual count at persistence time, preserving historical sessions, snapshots, notes and deletion. Evidence: `SessionSaveButtonTest` (four production Compose button/recomposition cases) and `SessionSaveStaleCapacityTest` (stale-dialog rejection with retained data; eight concurrent callers produce one commit) passed in both variants. Original historical-data/notes/deletion tests remain passing.
+- **P2-B PASS:** All three CSV actions return `AccessDenied`, `ShareChooserLaunched`, or `Failed`. `shareCsv` logs and propagates `CsvShareException`; normal failures produce a friendly Snackbar instead of an upgrade sheet or success claim. Authorization remains before formatting and file I/O. Existing CSV content, filename convention and FileProvider behavior are retained. Exclusive file creation prevents overwriting prior exports; failed attempts close streams and remove only their newly created file. Evidence: `RtaExportFailureTest` (eight creation, stream opening/partial writing, URI, chooser, logging and retention cases), `AudioCaptureEntitlementIntegrationTest` (nine cases, including all three CSV application actions) and `CsvExportErrorSnackbarTest` (actual friendly Snackbar display) passed in both variants.
+- **Scope:** No DSP/FFT, microphone/capture, Room schema, calibration, entitlement-transition, Billing or `branding/concepts/` changes.
+- **Audit verification:** Executed `:app:assembleDebug :app:assembleRelease :app:testDebugUnitTest :app:testReleaseUnitTest :app:lint --console=plain` with Gradle 8.13/JDK 21.0.7 on 11 October 2026: `BUILD SUCCESSFUL` (120 tasks executed). Debug and minified release APKs built; complete JVM suites passed **122 tests each across 20 suites**, with zero failures/errors/skips. There are 19 additional tests beyond the audited implementation. Lint passed with **0 errors, 70 warnings and 4 hints**, matching the audited warning count. `git diff --check` passed. The Compose host registration is test-only; no app manifest changes were needed. Existing physical-device validation and lint limitations remain, and sharing success means chooser initiation only.
+
+Exact correction files (repository-relative paths):
+
+```text
+app/build.gradle.kts
+gradle/libs.versions.toml
+app/src/main/java/com/rtatuner/app/core/export/CsvExportResult.kt
+app/src/main/java/com/rtatuner/app/core/export/RtaExportManager.kt
+app/src/main/java/com/rtatuner/app/ui/AudioCaptureViewModel.kt
+app/src/main/java/com/rtatuner/app/ui/DebugScreen.kt
+app/src/main/java/com/rtatuner/app/ui/components/SessionToolsCard.kt
+app/src/test/java/com/rtatuner/app/AudioCaptureEntitlementIntegrationTest.kt
+app/src/test/java/com/rtatuner/app/ComposeHostActivityRule.kt
+app/src/test/java/com/rtatuner/app/CsvExportErrorSnackbarTest.kt
+app/src/test/java/com/rtatuner/app/RtaExportFailureTest.kt
+app/src/test/java/com/rtatuner/app/SessionSaveButtonTest.kt
+app/src/test/java/com/rtatuner/app/SessionSaveStaleCapacityTest.kt
+docs/phase-2-entitlements.md
+```
