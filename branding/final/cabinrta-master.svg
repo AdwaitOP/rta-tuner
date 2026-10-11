@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Deep Obsidian / Navy Acoustic Chamber Background -->
+    <radialGradient id="master-bg" cx="50%" cy="36%" r="68%">
+      <stop offset="0%" stop-color="#141D2D"/>
+      <stop offset="55%" stop-color="#0B1019"/>
+      <stop offset="100%" stop-color="#05070C"/>
+    </radialGradient>
+
+    <!-- Cabin Shell Gradient: Polished Aero Cobalt Titanium -->
+    <linearGradient id="cabin-fill" x1="20%" y1="10%" x2="80%" y2="90%">
+      <stop offset="0%" stop-color="#2D3C54"/>
+      <stop offset="50%" stop-color="#1B2536"/>
+      <stop offset="100%" stop-color="#101722"/>
+    </linearGradient>
+
+    <!-- Cabin Perimeter Highlight -->
+    <linearGradient id="cabin-stroke" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.95"/>
+      <stop offset="45%" stop-color="#00E5FF" stop-opacity="0.5"/>
+      <stop offset="100%" stop-color="#0369A1" stop-opacity="0.2"/>
+    </linearGradient>
+
+    <!-- Frequency Curve Gradient: Electric Cyan -> Neon Emerald -->
+    <linearGradient id="curve-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00B0FF"/>
+      <stop offset="45%" stop-color="#00E5FF"/>
+      <stop offset="80%" stop-color="#00E676"/>
+      <stop offset="100%" stop-color="#69F0AE"/>
+    </linearGradient>
+
+    <!-- Target Curve Underglow / Fill Gradient -->
+    <linearGradient id="curve-area" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#00E5FF" stop-opacity="0.18"/>
+      <stop offset="65%" stop-color="#00E5FF" stop-opacity="0.03"/>
+      <stop offset="100%" stop-color="#00E5FF" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Drop Shadow Filter for Optical Depth -->
+    <filter id="emblem-shadow" x="-15%" y="-15%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#000000" flood-opacity="0.7"/>
+    </filter>
+  </defs>
+
+  <!-- App Background Plate -->
+  <rect width="512" height="512" rx="112" fill="url(#master-bg)"/>
+
+  <!-- Optical Centered Emblem Group (Shifted +6px horizontally for ideal mass balance) -->
+  <g transform="translate(6, 0)" filter="url(#emblem-shadow)">
+
+    <!-- Automotive Cabin C-Shell Envelope -->
+    <!-- Solid, muscular wall thickness (34-40px) with aerodynamic chamfers and bullet caps -->
+    <path d="
+      M 362,172
+      C 320,134 268,122 218,130
+      C 158,140 118,190 118,256
+      C 118,322 158,372 218,382
+      C 268,390 320,378 362,340
+      C 370,332 362,320 348,320
+      C 316,320 284,342 234,348
+      C 186,342 158,308 158,256
+      C 158,204 186,170 234,164
+      C 284,170 316,192 348,192
+      C 362,192 370,180 362,172 Z"
+      fill="url(#cabin-fill)"
+      stroke="url(#cabin-stroke)"
+      stroke-width="3"
+      stroke-linejoin="round"
+    />
+
+    <!-- Roofline Aero Reflection Highlight -->
+    <path d="
+      M 346,182
+      C 310,154 264,146 222,152
+      C 178,160 148,192 140,234
+      C 142,202 168,172 210,160
+      C 254,148 302,154 340,178
+      C 348,182 350,178 346,182 Z"
+      fill="#38BDF8"
+      opacity="0.55"
+    />
+
+    <!-- Target Curve Underfill Acoustic Energy Area -->
+    <path d="
+      M 140,258
+      C 172,216 204,208 234,220
+      C 256,230 268,266 296,272
+      C 328,278 364,254 396,234
+      L 396,320
+      C 364,320 328,320 296,320
+      C 268,320 256,320 234,320
+      C 204,320 172,320 140,320 Z"
+      fill="url(#curve-area)"
+    />
+
+    <!-- Car Audio Target Frequency Response Curve -->
+    <!-- Heavy 22px stroke for micro-scale legibility; authentic bass shelf and treble roll-off -->
+    <path d="
+      M 140,258
+      C 172,216 204,208 234,220
+      C 256,230 268,266 296,272
+      C 328,278 364,254 396,234"
+      fill="none"
+      stroke="url(#curve-grad)"
+      stroke-width="22"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+
+    <!-- High-DPI White Core Stroke for Razor-Sharp Edge Definition -->
+    <path d="
+      M 140,258
+      C 172,216 204,208 234,220
+      C 256,230 268,266 296,272
+      C 328,278 364,254 396,234"
+      fill="none"
+      stroke="#FFFFFF"
+      stroke-width="5"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      opacity="0.95"
+    />
+
+    <!-- Calibration Sweet-Spot Focal Sensor (Simplified for Zero Small-Size Noise) -->
+    <!-- Outer concentric target ring -->
+    <circle cx="260" cy="254" r="15" fill="none" stroke="#00E5FF" stroke-width="3"/>
+    <!-- Sensor focal core -->
+    <circle cx="260" cy="254" r="6" fill="#00E5FF"/>
+    <circle cx="260" cy="254" r="2.5" fill="#FFFFFF"/>
+  </g>
+</svg>

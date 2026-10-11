@@ -436,7 +436,7 @@ private fun FreezeAndExportContent(
                         windowSize = uiState.diagnostics.windowSize,
                         isNoiseSubtractionActive = cal.isNoiseSubtractionActive
                     )
-                    RtaExportManager.shareCsv(context, csv, "rta_live_spectrum")
+                    RtaExportManager.shareCsv(context, csv, "cabinrta_live_spectrum")
                 },
                 modifier = Modifier.weight(1f),
                 shape = RoundedCornerShape(6.dp),
