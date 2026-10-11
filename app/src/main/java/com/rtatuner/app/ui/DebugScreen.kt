@@ -72,6 +72,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import com.rtatuner.app.R
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -591,7 +593,7 @@ private fun HeaderSection(status: CaptureStatus) {
             Spacer(modifier = Modifier.width(10.dp))
             Column {
                 Text(
-                    text = "RTA TUNER",
+                    text = stringResource(R.string.app_name),
                     color = Color.White,
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Black,
@@ -1281,7 +1283,7 @@ private fun PermissionRequestCard(onRequestPermission: () -> Unit) {
                 )
             }
             Text(
-                text = "RTA Tuner requires RECORD_AUDIO to capture raw acoustic measurements directly from the device's microphone hardware.",
+                text = stringResource(R.string.microphone_permission_description, stringResource(R.string.app_name)),
                 color = Color(0xFFB0BEC5),
                 fontSize = 12.sp
             )

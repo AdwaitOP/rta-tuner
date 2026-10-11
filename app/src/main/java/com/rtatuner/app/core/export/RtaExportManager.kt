@@ -11,6 +11,7 @@ import android.util.Log
 import android.view.PixelCopy
 import android.view.SurfaceView
 import androidx.core.content.FileProvider
+import com.rtatuner.app.R
 import com.rtatuner.app.core.audio.AudioMath
 import com.rtatuner.app.core.database.SessionWithSnapshots
 import com.rtatuner.app.core.dsp.Iso31Bands
@@ -28,6 +29,8 @@ object RtaExportManager {
 
     private const val TAG = "RtaExportManager"
     private const val EXPORTS_DIR = "exports"
+    // CSV formatters remain usable without an Android Context (including JVM tests).
+    private const val EXPORT_BRAND = "CabinRTA"
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
     private val fileTimestampFormat = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
@@ -45,7 +48,7 @@ object RtaExportManager {
             "Relative dBFS"
         }
 
-        sb.append("# RTA Tuner Spectrum Export\n")
+        sb.append("# $EXPORT_BRAND Spectrum Export\n")
         sb.append("# Timestamp: $nowStr\n")
         if (!sessionName.isNullOrBlank()) {
             sb.append("# Session: $sessionName\n")
@@ -105,7 +108,7 @@ object RtaExportManager {
             "Relative dBFS"
         }
 
-        sb.append("# RTA Tuner Session Multi-Snapshot Export\n")
+        sb.append("# $EXPORT_BRAND Session Multi-Snapshot Export\n")
         sb.append("# Session: ${session.name}\n")
         if (session.notes.isNotBlank()) {
             sb.append("# Notes: ${session.notes.replace("\n", " ")}\n")
@@ -172,7 +175,7 @@ object RtaExportManager {
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
                 type = "text/csv"
                 putExtra(Intent.EXTRA_STREAM, uri)
-                putExtra(Intent.EXTRA_SUBJECT, "RTA Tuner Spectrum Export: $baseFileName")
+                putExtra(Intent.EXTRA_SUBJECT, context.getString(R.string.spectrum_export_subject, context.getString(R.string.app_name), baseFileName))
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
 
@@ -210,7 +213,7 @@ object RtaExportManager {
                         val exportDir = File(context.cacheDir, EXPORTS_DIR).apply { mkdirs() }
                         val timeTag = fileTimestampFormat.format(Date())
                         val safeName = title.replace(Regex("[^a-zA-Z0-9_-]"), "_")
-                        val file = File(exportDir, "rta_${safeName}_$timeTag.png")
+                        val file = File(exportDir, "cabinrta_${safeName}_$timeTag.png")
 
                         FileOutputStream(file).use { out ->
                             bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
@@ -222,7 +225,7 @@ object RtaExportManager {
                         val shareIntent = Intent(Intent.ACTION_SEND).apply {
                             type = "image/png"
                             putExtra(Intent.EXTRA_STREAM, uri)
-                            putExtra(Intent.EXTRA_SUBJECT, "RTA Tuner Spectrum: $title")
+                            putExtra(Intent.EXTRA_SUBJECT, context.getString(R.string.spectrum_image_subject, context.getString(R.string.app_name), title))
                             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         }
 

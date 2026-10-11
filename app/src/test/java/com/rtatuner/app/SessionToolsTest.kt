@@ -130,7 +130,7 @@ class SessionToolsTest {
         val csv = RtaExportManager.formatSnapshotCsv(snapshot, sessionName = "Aura Front Stage")
 
         // Verify header metadata comments
-        assertTrue("CSV must have RTA Tuner header", csv.contains("# RTA Tuner Spectrum Export"))
+        assertTrue("CSV must have CabinRTA header", csv.contains("# CabinRTA Spectrum Export"))
         assertTrue("CSV must contain session name", csv.contains("# Session: Aura Front Stage"))
         assertTrue("CSV must contain snapshot name", csv.contains("# Snapshot: Baseline Measurement"))
         assertTrue("CSV must contain calibration name", csv.contains("# Calibration Curve: Dayton iMM-6"))
@@ -201,6 +201,7 @@ class SessionToolsTest {
         val sessionWithSnapshots = SessionWithSnapshots(sessionEntity, listOf(snap1, snap2))
         val csv = RtaExportManager.formatSessionWithSnapshotsCsv(sessionWithSnapshots)
 
+        assertTrue(csv.contains("# CabinRTA Session Multi-Snapshot Export"))
         assertTrue(csv.contains("# Session: Civic Audio Tune"))
         assertTrue(csv.contains("# Notes: Replaced tweeters, smoothed 4kHz spike"))
         assertTrue(csv.contains("# Snapshot Count: 2"))

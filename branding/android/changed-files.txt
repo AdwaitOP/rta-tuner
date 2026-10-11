@@ -1,0 +1,46 @@
+M	app/src/main/java/com/rtatuner/app/core/export/RtaExportManager.kt
+M	app/src/main/java/com/rtatuner/app/ui/DebugScreen.kt
+M	app/src/main/java/com/rtatuner/app/ui/components/SessionToolsCard.kt
+M	app/src/main/res/drawable/ic_launcher_background.xml
+M	app/src/main/res/drawable/ic_launcher_foreground.xml
+A	app/src/main/res/drawable/ic_launcher_monochrome.xml
+R055	app/src/main/res/mipmap-anydpi/ic_launcher.xml	app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+R055	app/src/main/res/mipmap-anydpi/ic_launcher_round.xml	app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+R074	app/src/main/res/ic_launcher.xml	app/src/main/res/mipmap-anydpi-v33/ic_launcher.xml
+R074	app/src/main/res/ic_launcher_round.xml	app/src/main/res/mipmap-anydpi-v33/ic_launcher_round.xml
+M	app/src/main/res/mipmap-hdpi/ic_launcher.webp
+M	app/src/main/res/mipmap-hdpi/ic_launcher_round.webp
+M	app/src/main/res/mipmap-mdpi/ic_launcher.webp
+M	app/src/main/res/mipmap-mdpi/ic_launcher_round.webp
+M	app/src/main/res/mipmap-xhdpi/ic_launcher.webp
+M	app/src/main/res/mipmap-xhdpi/ic_launcher_round.webp
+M	app/src/main/res/mipmap-xxhdpi/ic_launcher.webp
+M	app/src/main/res/mipmap-xxhdpi/ic_launcher_round.webp
+M	app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp
+M	app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.webp
+M	app/src/main/res/values/strings.xml
+M	app/src/test/java/com/rtatuner/app/SessionToolsTest.kt
+A	branding/android/INTEGRATION.md
+A	branding/android/generate_vectors.py
+A	branding/android/mask-review.png
+A	branding/android/prepare_previews.py
+A	branding/android/render_icons.cjs
+A	branding/final/README.md
+A	branding/final/adaptive-icon-preview.svg
+A	branding/final/build_assets.py
+A	branding/final/cabinrta-master.svg
+A	branding/final/density-test-matrix.svg
+A	branding/final/ic_launcher-playstore-512.png
+A	branding/final/ic_launcher-preview-192.png
+A	branding/final/ic_launcher-preview-24.png
+A	branding/final/ic_launcher-preview-32.png
+A	branding/final/ic_launcher-preview-48.png
+A	branding/final/ic_launcher-preview-64.png
+A	branding/final/ic_launcher-preview-96.png
+A	branding/final/ic_launcher_background.svg
+A	branding/final/ic_launcher_foreground.svg
+A	branding/final/ic_launcher_monochrome.svg
+A	branding/final/index.html
+A	branding/final/render_pngs.py
+A	branding/play-store-listing.json
+A	branding/android/changed-files.txt

@@ -1,0 +1,262 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 780" width="100%" height="100%">
+  <defs>
+    <!-- Background Gradient for Icon -->
+    <radialGradient id="ad-bg" cx="50%" cy="36%" r="68%">
+      <stop offset="0%" stop-color="#141D2D"/>
+      <stop offset="55%" stop-color="#0B1019"/>
+      <stop offset="100%" stop-color="#05070C"/>
+    </radialGradient>
+
+    <linearGradient id="ad-cabin" x1="20%" y1="10%" x2="80%" y2="90%">
+      <stop offset="0%" stop-color="#2D3C54"/>
+      <stop offset="50%" stop-color="#1B2536"/>
+      <stop offset="100%" stop-color="#101722"/>
+    </linearGradient>
+
+    <linearGradient id="ad-curve" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00B0FF"/>
+      <stop offset="45%" stop-color="#00E5FF"/>
+      <stop offset="80%" stop-color="#00E676"/>
+      <stop offset="100%" stop-color="#69F0AE"/>
+    </linearGradient>
+
+    <!-- Clip Paths for 160x160 Presentation Stage -->
+    <!-- 1. Circular Mask (72dp -> 160px: r = 80px) -->
+    <clipPath id="mask-circle">
+      <circle cx="80" cy="80" r="80"/>
+    </clipPath>
+
+    <!-- 2. Squircle Mask (Pixel launcher: rx = 44px) -->
+    <clipPath id="mask-squircle">
+      <rect width="160" height="160" rx="44"/>
+    </clipPath>
+
+    <!-- 3. Rounded Square Mask (Samsung OneUI: rx = 28px) -->
+    <clipPath id="mask-roundrect">
+      <rect width="160" height="160" rx="28"/>
+    </clipPath>
+
+    <!-- Genuine CabinRTA Refined Artwork (Scaled to 160x160 presentation block) -->
+    <!-- Scale factor: 160 / 512 = 0.3125 -->
+    <g id="genuine-refined-icon">
+      <!-- Background Plate -->
+      <rect width="160" height="160" fill="url(#ad-bg)"/>
+
+      <!-- Optical Centered Refined Emblem (Shifted +1.8px for mass balance) -->
+      <g transform="translate(1.8, 0)">
+        <!-- Cabin C Shell -->
+        <path d="
+          M 113.1,53.75
+          C 100.0,41.88 83.75,38.13 68.13,40.63
+          C 49.38,43.75 36.88,59.38 36.88,80.00
+          C 36.88,100.63 49.38,116.25 68.13,119.38
+          C 83.75,121.88 100.0,118.13 113.1,106.25
+          C 115.6,103.75 113.1,100.00 108.75,100.00
+          C 98.75,100.00 88.75,106.88 73.13,108.75
+          C 58.13,106.88 49.38,96.25 49.38,80.00
+          C 49.38,63.75 58.13,53.13 73.13,51.25
+          C 88.75,53.13 98.75,60.00 108.75,60.00
+          C 113.1,60.00 115.6,56.25 113.1,53.75 Z"
+          fill="url(#ad-cabin)"
+          stroke="#38BDF8"
+          stroke-width="0.94"
+          stroke-linejoin="round"
+        />
+
+        <!-- Roofline Aero Reflection -->
+        <path d="
+          M 108.1,56.88
+          C 96.88,48.13 82.50,45.63 69.38,47.50
+          C 55.63,50.00 46.25,60.00 43.75,73.13
+          C 44.38,63.13 52.50,53.75 65.63,50.00
+          C 79.38,46.25 94.38,48.13 106.25,55.63
+          C 108.75,56.88 109.38,55.63 108.1,56.88 Z"
+          fill="#38BDF8"
+          opacity="0.55"
+        />
+
+        <!-- Frequency Target Curve (6.88px stroke on 160 canvas = robust, high-contrast) -->
+        <path d="
+          M 43.75,80.63
+          C 53.75,67.50 63.75,65.00 73.13,68.75
+          C 80.00,71.88 83.75,83.13 92.50,85.00
+          C 102.5,86.88 113.75,79.38 123.75,73.13"
+          fill="none"
+          stroke="url(#ad-curve)"
+          stroke-width="6.88"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+
+        <!-- High-DPI White Core -->
+        <path d="
+          M 43.75,80.63
+          C 53.75,67.50 63.75,65.00 73.13,68.75
+          C 80.00,71.88 83.75,83.13 92.50,85.00
+          C 102.5,86.88 113.75,79.38 123.75,73.13"
+          fill="none"
+          stroke="#FFFFFF"
+          stroke-width="1.56"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          opacity="0.95"
+        />
+
+        <!-- Simplified Calibration Focal Sensor (Zero Visual Clutter) -->
+        <circle cx="81.25" cy="79.38" r="4.68" fill="none" stroke="#00E5FF" stroke-width="0.94"/>
+        <circle cx="81.25" cy="79.38" r="1.88" fill="#00E5FF"/>
+        <circle cx="81.25" cy="79.38" r="0.78" fill="#FFFFFF"/>
+      </g>
+    </g>
+
+    <!-- Genuine Android 13+ Themed / Monochrome Graphic -->
+    <g id="genuine-monochrome-icon">
+      <!-- System Dynamic Tonal Background (Material You Surface Container) -->
+      <rect width="160" height="160" fill="#202A37"/>
+
+      <g transform="translate(1.8, 0)">
+        <!-- Solid Cabin Shell in Themed Neutral -->
+        <path d="
+          M 113.1,53.75
+          C 100.0,41.88 83.75,38.13 68.13,40.63
+          C 49.38,43.75 36.88,59.38 36.88,80.00
+          C 36.88,100.63 49.38,116.25 68.13,119.38
+          C 83.75,121.88 100.0,118.13 113.1,106.25
+          C 115.6,103.75 113.1,100.00 108.75,100.00
+          C 98.75,100.00 88.75,106.88 73.13,108.75
+          C 58.13,106.88 49.38,96.25 49.38,80.00
+          C 49.38,63.75 58.13,53.13 73.13,51.25
+          C 88.75,53.13 98.75,60.00 108.75,60.00
+          C 113.1,60.00 115.6,56.25 113.1,53.75 Z"
+          fill="#DCE3F0"
+        />
+
+        <!-- Frequency Curve Silhouette in Themed Neutral with guaranteed negative spacing -->
+        <path d="
+          M 43.75,80.63
+          C 53.75,67.50 63.75,65.00 73.13,68.75
+          C 80.00,71.88 83.75,83.13 92.50,85.00
+          C 102.5,86.88 113.75,79.38 123.75,73.13"
+          fill="none"
+          stroke="#DCE3F0"
+          stroke-width="6.88"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+
+        <!-- Focal Sensor -->
+        <circle cx="81.25" cy="79.38" r="4.68" fill="none" stroke="#DCE3F0" stroke-width="1.2"/>
+        <circle cx="81.25" cy="79.38" r="2.1" fill="#DCE3F0"/>
+      </g>
+    </g>
+
+    <filter id="shadow-card" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <!-- Canvas Background -->
+  <rect width="1100" height="780" fill="#070A0F"/>
+
+  <!-- Top Title Bar -->
+  <text x="60" y="55" fill="#FFFFFF" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="24" font-weight="800" letter-spacing="0.5">CabinRTA — Refined Android Adaptive Icon Verification</text>
+  <text x="60" y="85" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="14">Demonstrating optical centering, 66dp safe zone compliance, and OEM mask cutouts.</text>
+
+  <!-- Left: Android Adaptive Specifications Architecture Diagram -->
+  <g transform="translate(60, 130)">
+    <rect width="400" height="580" rx="16" fill="#0C111C" stroke="#1E293B" stroke-width="1.5"/>
+    <text x="24" y="36" fill="#38BDF8" font-family="sans-serif" font-size="14" font-weight="700">SPECIFICATIONS &amp; SAFE ZONE</text>
+    <text x="24" y="58" fill="#64748B" font-family="sans-serif" font-size="12">108dp canvas with 18dp bleed &amp; 66dp safe circle</text>
+
+    <!-- Scaled 280x280 Canvas Simulation -->
+    <g transform="translate(60, 90)">
+      <!-- 108dp Canvas (280x280 px) -->
+      <rect width="280" height="280" fill="#131B29" stroke="#334155" stroke-width="1"/>
+
+      <!-- 18dp Parallax Bleed Area (outer 46.6px margin) -->
+      <rect x="0" y="0" width="280" height="46.6" fill="#0F172A" opacity="0.6"/>
+      <rect x="0" y="233.4" width="280" height="46.6" fill="#0F172A" opacity="0.6"/>
+      <rect x="0" y="46.6" width="46.6" height="186.8" fill="#0F172A" opacity="0.6"/>
+      <rect x="233.4" y="46.6" width="46.6" height="186.8" fill="#0F172A" opacity="0.6"/>
+
+      <!-- 72dp Viewport Boundary (186.8 x 186.8 px) -->
+      <rect x="46.6" y="46.6" width="186.8" height="186.8" fill="none" stroke="#64748B" stroke-width="1.5" stroke-dasharray="4 4"/>
+
+      <!-- 66dp Safe Circle (diameter: 171 px, r=85.5) -->
+      <circle cx="140" cy="140" r="85.5" fill="none" stroke="#00E5FF" stroke-width="2"/>
+      <circle cx="140" cy="140" r="85.5" fill="#00E5FF" fill-opacity="0.04"/>
+
+      <!-- Scaled Refined Icon Inside (Scale: 280 / 160 = 1.75) -->
+      <!-- Center is at 140, 140 -->
+      <g transform="translate(140, 140) scale(1.05) translate(-80, -80)">
+        <use href="#genuine-refined-icon"/>
+      </g>
+
+      <!-- Center Crosshair Reference -->
+      <line x1="140" y1="35" x2="140" y2="245" stroke="#38BDF8" stroke-width="1" stroke-dasharray="2 4" opacity="0.5"/>
+      <line x1="35" y1="140" x2="245" y2="140" stroke="#38BDF8" stroke-width="1" stroke-dasharray="2 4" opacity="0.5"/>
+    </g>
+
+    <!-- Legend -->
+    <g transform="translate(24, 400)" font-family="sans-serif" font-size="11">
+      <circle cx="10" cy="10" r="5" fill="none" stroke="#00E5FF" stroke-width="2"/>
+      <text x="24" y="14" fill="#CBD5E1"><tspan font-weight="700" fill="#00E5FF">66dp Safe Zone Circle</tspan> — 100% of emblem inside</text>
+
+      <rect x="5" y="32" width="10" height="10" fill="none" stroke="#64748B" stroke-width="1.5" stroke-dasharray="2 2"/>
+      <text x="24" y="41" fill="#CBD5E1"><tspan font-weight="700">72dp OEM Viewport</tspan> — typical visible boundary</text>
+
+      <rect x="5" y="60" width="10" height="10" fill="#0F172A" stroke="#334155"/>
+      <text x="24" y="69" fill="#CBD5E1"><tspan font-weight="700">18dp Bleed / Parallax</tspan> — launcher animation buffer</text>
+
+      <circle cx="10" cy="95" r="3" fill="#00E676"/>
+      <text x="24" y="99" fill="#00E676" font-weight="600">Zero Clipping under Any OEM Mask</text>
+
+      <circle cx="10" cy="120" r="3" fill="#38BDF8"/>
+      <text x="24" y="124" fill="#38BDF8" font-weight="600">Optimal +6px Horizontal Balance Offset</text>
+    </g>
+  </g>
+
+  <!-- Right: OEM Mask Cutouts Preview (Circle, Squircle, Rounded Square, Themed) -->
+  <g transform="translate(490, 130)">
+    <rect width="550" height="580" rx="16" fill="#0C111C" stroke="#1E293B" stroke-width="1.5"/>
+    <text x="30" y="36" fill="#F8FAFC" font-family="sans-serif" font-size="14" font-weight="700">OEM LAUNCHER MASK VALIDATION</text>
+    <text x="30" y="58" fill="#64748B" font-family="sans-serif" font-size="12">Testing refined icon geometry across real Android device environments</text>
+
+    <!-- 2x2 Grid of OEM Masks -->
+    <!-- 1. Circular Mask (AOSP / Pixel / Motorola) -->
+    <g transform="translate(60, 95)" filter="url(#shadow-card)">
+      <g clip-path="url(#mask-circle)">
+        <use href="#genuine-refined-icon"/>
+      </g>
+      <text x="80" y="195" fill="#E2E8F0" font-family="sans-serif" font-size="13" font-weight="600" text-anchor="middle">Circular</text>
+      <text x="80" y="215" fill="#64748B" font-family="sans-serif" font-size="11" text-anchor="middle">AOSP / Stock Android</text>
+    </g>
+
+    <!-- 2. Squircle Mask (Google Pixel / Nova) -->
+    <g transform="translate(310, 95)" filter="url(#shadow-card)">
+      <g clip-path="url(#mask-squircle)">
+        <use href="#genuine-refined-icon"/>
+      </g>
+      <text x="80" y="195" fill="#E2E8F0" font-family="sans-serif" font-size="13" font-weight="600" text-anchor="middle">Squircle</text>
+      <text x="80" y="215" fill="#64748B" font-family="sans-serif" font-size="11" text-anchor="middle">Pixel Launcher</text>
+    </g>
+
+    <!-- 3. Rounded Rectangle Mask (Samsung OneUI) -->
+    <g transform="translate(60, 345)" filter="url(#shadow-card)">
+      <g clip-path="url(#mask-roundrect)">
+        <use href="#genuine-refined-icon"/>
+      </g>
+      <text x="80" y="195" fill="#E2E8F0" font-family="sans-serif" font-size="13" font-weight="600" text-anchor="middle">Rounded Rectangle</text>
+      <text x="80" y="215" fill="#64748B" font-family="sans-serif" font-size="11" text-anchor="middle">Samsung OneUI / Xiaomi</text>
+    </g>
+
+    <!-- 4. Material You Dynamic Monochrome / Themed Icon -->
+    <g transform="translate(310, 345)" filter="url(#shadow-card)">
+      <g clip-path="url(#mask-circle)">
+        <use href="#genuine-monochrome-icon"/>
+      </g>
+      <text x="80" y="195" fill="#38BDF8" font-family="sans-serif" font-size="13" font-weight="600" text-anchor="middle">Themed Icon</text>
+      <text x="80" y="215" fill="#64748B" font-family="sans-serif" font-size="11" text-anchor="middle">Android 13+ Material You</text>
+    </g>
+  </g>
+</svg>
