@@ -4,6 +4,22 @@ This directory contains the production-ready visual branding, adaptive icons, an
 
 All assets are located in [`branding/final/`](.).
 
+Play Store export uses a full-square background; Google Play supplies the mask.
+Regenerate only the store asset with:
+
+```powershell
+python branding/final/build_assets.py --play-store-only
+python branding/final/render_pngs.py
+python branding/final/render_pngs.py --check
+```
+
+The exporter requires Pillow and Edge (or a Chromium executable specified by
+`CABINRTA_BROWSER`). It forces sRGB rendering, saves 8-bit RGBA with an explicit
+sRGB chunk, and validates dimensions, PNG color type 6, fully opaque alpha,
+non-black corner pixels, and the 1 MiB size limit. `--check` verifies byte-for-byte
+regeneration against the stored PNG using the installed renderer. These commands
+do not change Android resources or the adaptive SVG layers.
+
 ---
 
 ## 1. Final Asset Inventory
@@ -14,7 +30,7 @@ All assets are located in [`branding/final/`](.).
 | [`ic_launcher_background.svg`](ic_launcher_background.svg) | Vector SVG | 108 × 108 dp | Adaptive icon background plate (API 26+) |
 | [`ic_launcher_foreground.svg`](ic_launcher_foreground.svg) | Vector SVG | 108 × 108 dp | Adaptive icon foreground emblem layer (API 26+) |
 | [`ic_launcher_monochrome.svg`](ic_launcher_monochrome.svg) | Vector SVG | 108 × 108 dp | Material You dynamic themed icon stencil (API 33+) |
-| [`ic_launcher-playstore-512.png`](ic_launcher-playstore-512.png) | 32-bit PNG | 512 × 512 px | Google Play Store listing icon (112 KB) |
+| [`ic_launcher-playstore-512.png`](ic_launcher-playstore-512.png) | 32-bit RGBA sRGB PNG | 512 × 512 px | Full-square, fully opaque Google Play icon (124,412 bytes) |
 | [`adaptive-icon-preview.svg`](adaptive-icon-preview.svg) | Vector SVG | 1100 × 780 px | Safe zone overlay & OEM mask testing matrix |
 | [`density-test-matrix.svg`](density-test-matrix.svg) | Vector SVG | 1000 × 680 px | Genuine design tested at 64dp, 48dp, 32dp, and 24dp |
 | [`ic_launcher-preview-192.png`](ic_launcher-preview-192.png) | 32-bit PNG | 192 × 192 px | xxxhdpi density raster reference |

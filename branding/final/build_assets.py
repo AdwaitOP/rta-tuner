@@ -1,9 +1,8 @@
+import argparse
 import os
-import subprocess
 import xml.etree.ElementTree as ET
-from PIL import Image
 
-FINAL_DIR = os.path.abspath(r"branding/final")
+FINAL_DIR = os.path.dirname(os.path.abspath(__file__))
 os.makedirs(FINAL_DIR, exist_ok=True)
 
 # ==============================================================================
@@ -53,8 +52,8 @@ MASTER_512_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512
     </filter>
   </defs>
 
-  <!-- App Background Plate -->
-  <rect width="512" height="512" rx="112" fill="url(#master-bg)"/>
+  <!-- Full-square Play Store background; Google Play applies its own mask. -->
+  <rect width="512" height="512" fill="url(#master-bg)"/>
 
   <!-- Optical Centered Emblem Group (Shifted +6px horizontally for ideal mass balance) -->
   <g transform="translate(6, 0)" filter="url(#emblem-shadow)">
@@ -334,7 +333,13 @@ files_to_write = {
     "ic_launcher_monochrome.svg": ADAPTIVE_MONO_SVG,
 }
 
+parser = argparse.ArgumentParser(description="Regenerate the editable CabinRTA SVG sources.")
+parser.add_argument('--play-store-only', action='store_true', help='Regenerate only the Play Store master SVG.')
+args = parser.parse_args()
+
 for fname, content in files_to_write.items():
+    if args.play_store_only and fname != 'cabinrta-master.svg':
+        continue
     fpath = os.path.join(FINAL_DIR, fname)
     with open(fpath, "w", encoding="utf-8") as f:
         f.write(content.strip())

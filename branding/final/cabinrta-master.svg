@@ -42,8 +42,8 @@
     </filter>
   </defs>
 
-  <!-- App Background Plate -->
-  <rect width="512" height="512" rx="112" fill="url(#master-bg)"/>
+  <!-- Full-square Play Store background; Google Play applies its own mask. -->
+  <rect width="512" height="512" fill="url(#master-bg)"/>
 
   <!-- Optical Centered Emblem Group (Shifted +6px horizontally for ideal mass balance) -->
   <g transform="translate(6, 0)" filter="url(#emblem-shadow)">
