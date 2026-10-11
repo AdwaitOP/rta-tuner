@@ -56,4 +56,32 @@ class FeatureAccessPolicyTest {
         }
         assertFalse(provider.state.value.isPro)
     }
+
+    @Test fun `1024 and 2048 FFT windows are always Free while 4096 requires explicit Pro access`() {
+        val repository = FakeEntitlementRepository()
+        val policy = FeatureAccessPolicy(repository)
+        listOf(EntitlementTier.FREE, EntitlementTier.PRO_LIFETIME, EntitlementTier.FREE).forEach { tier ->
+            repository.setTier(tier)
+            assertEquals(FeatureAccessResult.Allowed, policy.checkFftWindow(1024))
+            assertEquals(FeatureAccessResult.Allowed, policy.checkFftWindow(2048))
+            val result = policy.checkFftWindow(4096)
+            if (tier == EntitlementTier.PRO_LIFETIME) {
+                assertEquals(FeatureAccessResult.Allowed, result)
+            } else {
+                assertTrue(result is FeatureAccessResult.Denied)
+                assertEquals(ProFeature.FFT_4096, (result as FeatureAccessResult.Denied).feature)
+                assertTrue(result.message.contains("CabinRTA Pro"))
+            }
+        }
+        listOf(0, 512, 8192).forEach { size ->
+            assertThrows(IllegalArgumentException::class.java) { policy.checkFftWindow(size) }
+        }
+    }
+
+    @Test fun `production factory keeps 4096 restricted and basic windows available in release`() {
+        val policy = FeatureAccessPolicy(AppEntitlements.create())
+        assertEquals(FeatureAccessResult.Allowed, policy.checkFftWindow(1024))
+        assertEquals(FeatureAccessResult.Allowed, policy.checkFftWindow(2048))
+        assertEquals(ProFeature.FFT_4096, (policy.checkFftWindow(4096) as FeatureAccessResult.Denied).feature)
+    }
 }

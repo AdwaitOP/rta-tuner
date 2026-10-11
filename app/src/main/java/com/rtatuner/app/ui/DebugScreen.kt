@@ -10,6 +10,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -133,6 +135,7 @@ fun DebugScreen(
     val canCorrectNoise = remember(entitlement) { policy.check(ProFeature.NOISE_FLOOR) is FeatureAccessResult.Allowed }
     val canUseAdvancedTargets = remember(entitlement) { policy.check(ProFeature.ADVANCED_TARGETS) is FeatureAccessResult.Allowed }
     val canUseSweep = remember(entitlement) { policy.check(ProFeature.SINE_SWEEP) is FeatureAccessResult.Allowed }
+    val canUse4096 = remember(entitlement) { policy.checkFftWindow(4096) is FeatureAccessResult.Allowed }
     var surfaceViewRef by remember { mutableStateOf<RtaSurfaceView?>(null) }
 
     accessDenial?.let { denial ->
@@ -329,6 +332,7 @@ fun DebugScreen(
                 uiState = uiState,
                 frozenSnapshots = frozenSnapshots,
                 canFreeze = canFreeze,
+                canUse4096 = canUse4096,
                 onFreeze = { viewModel.freezeCurrentSnapshot() },
                 onClearAllFrozen = { viewModel.clearAllFrozenSnapshots() },
                 onToggleSnapshotVisibility = { viewModel.toggleSnapshotVisibility(it) },
@@ -711,10 +715,12 @@ private fun StatusBadge(status: CaptureStatus) {
 }
 
 @Composable
+@OptIn(ExperimentalLayoutApi::class)
 private fun SurfaceSpectrumCard(
     uiState: AudioCaptureUiState,
     frozenSnapshots: List<RtaSnapshot> = emptyList(),
     canFreeze: Boolean = true,
+    canUse4096: Boolean,
     onFreeze: () -> Unit = {},
     onClearAllFrozen: () -> Unit = {},
     onToggleSnapshotVisibility: (String) -> Unit = {},
@@ -749,10 +755,10 @@ private fun SurfaceSpectrumCard(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             // Row 1: Mode Toggle, Window Size Chips & Fullscreen Button
-            Row(
+            FlowRow(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 // Mode Toggle
                 Row(
@@ -778,22 +784,11 @@ private fun SurfaceSpectrumCard(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    // Window Size Selector (1024, 2048, 4096)
-                    Row(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(Color(0xFF0C0E12))
-                            .border(1.dp, Color(0xFF242C38), RoundedCornerShape(6.dp))
-                            .padding(2.dp)
-                    ) {
-                        listOf(1024, 2048, 4096).forEach { size ->
-                            WindowSizeChip(
-                                size = size,
-                                isSelected = diag.windowSize == size,
-                                onClick = { onSelectWindowSize(size) }
-                            )
-                        }
-                    }
+                    FftWindowSelector(
+                        windowSize = diag.windowSize,
+                        canUse4096 = canUse4096,
+                        onSelectWindowSize = onSelectWindowSize
+                    )
 
                     // Fullscreen Expand Button
                     Box(
@@ -1215,9 +1210,34 @@ private fun ModeTab(
 }
 
 @Composable
+internal fun FftWindowSelector(
+    windowSize: Int,
+    canUse4096: Boolean,
+    onSelectWindowSize: (Int) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(Color(0xFF0C0E12))
+            .border(1.dp, Color(0xFF242C38), RoundedCornerShape(6.dp))
+            .padding(2.dp)
+    ) {
+        listOf(1024, 2048, 4096).forEach { size ->
+            WindowSizeChip(
+                size = size,
+                isSelected = windowSize == size,
+                requiresPro = size == 4096 && !canUse4096,
+                onClick = { onSelectWindowSize(size) }
+            )
+        }
+    }
+}
+
+@Composable
 private fun WindowSizeChip(
     size: Int,
     isSelected: Boolean,
+    requiresPro: Boolean,
     onClick: () -> Unit
 ) {
     Box(
@@ -1228,11 +1248,13 @@ private fun WindowSizeChip(
             .padding(horizontal = 6.dp, vertical = 4.dp)
     ) {
         Text(
-            text = "$size",
-            color = if (isSelected) Color(0xFF00E676) else Color(0xFF78909C),
+            text = if (requiresPro) "$size · PRO" else "$size",
+            color = if (requiresPro) Color(0xFFFFD54F) else if (isSelected) Color(0xFF00E676) else Color(0xFF78909C),
             fontSize = 10.sp,
             fontWeight = FontWeight.Bold,
-            fontFamily = FontFamily.Monospace
+            fontFamily = FontFamily.Monospace,
+            maxLines = 1,
+            softWrap = false
         )
     }
 }

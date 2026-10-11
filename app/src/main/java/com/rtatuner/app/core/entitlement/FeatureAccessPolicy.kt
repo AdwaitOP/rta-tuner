@@ -1,12 +1,13 @@
 package com.rtatuner.app.core.entitlement
 
 enum class FreeFeature {
-    LIVE_RTA, RAW_FFT, FFT_WINDOWS, SMOOTHING_AND_GRAPH_CONTROLS, FULLSCREEN,
+    LIVE_RTA, RAW_FFT, BASIC_FFT_WINDOWS, SMOOTHING_AND_GRAPH_CONTROLS, FULLSCREEN,
     PEAK_RMS_METERS, MICROPHONE_ROUTING, PINK_NOISE, HARMAN_TARGET,
     SESSION_VIEWING, SESSION_NOTES, SESSION_DELETION, PNG_SHARING
 }
 
 enum class ProFeature(val title: String, val benefit: String) {
+    FFT_4096("4096-point FFT window", "Use a 4096-point FFT for finer frequency resolution. 1024 and 2048 remain available in Free."),
     MIC_CALIBRATION("Microphone calibration", "Import a microphone calibration file and correct its frequency response."),
     SPL_CALIBRATION("SPL calibration", "Set a reference level and measure in calibrated SPL mode."),
     NOISE_FLOOR("Noise floor subtraction", "Capture ambient noise and subtract it from your measurements."),
@@ -44,6 +45,12 @@ class FeatureAccessPolicy(val entitlements: EntitlementRepository = FreeEntitlem
             FeatureAccessResult.Denied(feature, "${feature.title} requires CabinRTA Pro. ${feature.benefit}")
 
     fun requireAccess(feature: ProFeature) = check(feature).getOrThrow()
+
+    fun checkFftWindow(windowSize: Int): FeatureAccessResult = when (windowSize) {
+        1024, 2048 -> FeatureAccessResult.Allowed
+        4096 -> check(ProFeature.FFT_4096)
+        else -> throw IllegalArgumentException("Unsupported window size: $windowSize")
+    }
 
     fun checkOverlayCapacity(existingCount: Int, additionalCount: Int = 1): FeatureAccessResult {
         require(existingCount >= 0 && additionalCount >= 0)

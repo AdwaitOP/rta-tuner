@@ -14,7 +14,7 @@ This phase centralizes access enforcement and adds the contextual upgrade interf
 
 `EntitlementRepository` exposes `StateFlow<EntitlementState>` with `FREE` and `PRO_LIFETIME` tiers. `FeatureAccessPolicy` owns all capability checks and numerical limits. Authorization checks return `FeatureAccessResult` or throw its structured `FeatureAccessDeniedException` before mutation; `AudioCaptureViewModel` publishes contextual denials for Compose. CSV application actions separately return `CsvExportResult` for denial, chooser initiation, or operational failure.
 
-One repository and policy are shared by the ViewModel's calibration manager, generator, overlay store, session repository, and export operations. Constructors support injected providers for tests and future verified ownership. The release source set's `AppEntitlements.create()` always returns `FreeEntitlementRepository`; its simulation operation returns `false`. `DebugEntitlementRepository` exists only in the debug source set, starts Free, and stores simulation in memory. Creating a new provider resets it to Free. Tests use a separate test-only fake.
+One repository and policy are shared by the ViewModel's live FFT window selection, calibration manager, generator, overlay store, session repository, and export operations. Constructors support injected providers for tests and future verified ownership. The release source set's `AppEntitlements.create()` always returns `FreeEntitlementRepository`; its simulation operation returns `false`. `DebugEntitlementRepository` exists only in the debug source set, starts Free, and stores simulation in memory. Creating a new provider resets it to Free. Tests use a separate test-only fake.
 
 `DebugScreen` and `SessionToolsCard` observe entitlement state and retain visible contextual premium controls. `ProUpgradeSheet` explains the requested feature, compares tiers, and describes a future one-time lifetime unlock as coming soon. Debug simulation is explicitly identified as local simulation; release has no mutable simulator provider.
 
@@ -24,7 +24,8 @@ One repository and policy are shared by the ViewModel's calibration manager, gen
 | --- | --- | --- |
 | Complete live 31-band RTA | Included | Included |
 | Raw FFT | Included | Included |
-| All existing FFT window sizes | Included | Included |
+| 1024-point and 2048-point FFT windows | Included | Included |
+| 4096-point FFT window (`FFT_4096`) | Requires Pro | Included |
 | All existing smoothing and graph controls | Included | Included |
 | Fullscreen analyzer | Included | Included |
 | Peak/RMS meters | Included | Included |
@@ -50,7 +51,8 @@ All paths below are application or processing boundaries; visible locks suppleme
 
 | Location | Enforcement |
 | --- | --- |
-| `core/entitlement/FeatureAccessPolicy.kt` | `check`, `requireAccess`, `checkOverlayCapacity`, and `checkSessionCapacity` provide the shared capability and capacity rules. Both Free limits are one; Pro limits have no ceiling. |
+| `core/entitlement/FeatureAccessPolicy.kt` | `check`, `requireAccess`, `checkFftWindow`, `checkOverlayCapacity`, and `checkSessionCapacity` provide the shared capability and capacity rules. The 1024/2048 windows are always Free; 4096 checks `FFT_4096`. Both Free capacity limits are one; Pro limits have no ceiling. |
+| `AudioCaptureViewModel.setWindowSize` and FFT entitlement reconciliation | Check `FFT_4096` before changing or releasing capture resources. Denied requests retain the current window, microphone routing and measurements and publish the existing contextual upgrade sheet. Active 4096 processing returns to the default 2048 after revocation; unchanged permitted windows avoid capture recreation. No checks run inside the FFT loop. |
 | `CalibrationManager.loadMicCurve` | Requires `MIC_CALIBRATION` before parsing or persisting an import. |
 | `CalibrationManager.mutateWithAccess` | Guards `setMicCurveActive` and `clearMicCurve`; `calibrateSplReference`, `setSplMode`, and `setSplOffset`; and `startNoiseFloorCapture`, `setNoiseSubtractionActive`, and `clearNoiseFloor` before modifying state/preferences. |
 | `CalibrationManager.setTargetCurve` and `setTargetCurveActive` | Require `ADVANCED_TARGETS` for presets other than Harman; selecting Harman or no target remains Free. |
@@ -76,6 +78,8 @@ Overlay revocation keeps all existing measurements. Additional freezes/imports a
 Calibration preferences remain separate from effective processing. Historical curves, offsets, floor measurements, target choices, and requested flags are retained while Free; their premium effects are disabled. Free-to-Pro publication restores authorized requested settings. Pro-to-Free publication disables premium processing and cancels an in-flight noise capture while retaining the previous completed floor. Regranting Pro does not restart a cancelled noise capture or a stopped sweep. Generation validation also prevents a revoked sweep still initializing on another thread from resurrecting playback.
 
 Entitlement state and contextual locks react through `StateFlow`. No ownership is inferred from persisted calibration settings, saved-session metadata, or debug simulation preferences.
+
+The default FFT window remains 2048. Pro-to-Free revocation changes an active 4096 window to 2048 while preserving microphone selection and saved measurements. Historical 4096 snapshots and sessions retain their original metadata and remain viewable under Free; loading them does not activate 4096 live processing. Entitlement grants do not automatically restore a previously active 4096 window.
 
 ## Files changed
 
@@ -152,3 +156,15 @@ app/src/test/java/com/rtatuner/app/SessionSaveButtonTest.kt
 app/src/test/java/com/rtatuner/app/SessionSaveStaleCapacityTest.kt
 docs/phase-2-entitlements.md
 ```
+
+## FFT window entitlement correction
+
+This correction builds on `e40d822da1d690d70905246962b1196981df6686` on `codex/cabinrta-pro-entitlements`. The original all-windows-Free specification is replaced by the intended split: 1024 and 2048 are Free, and 4096 requires the explicit `FFT_4096` Pro capability. The default remains 2048.
+
+- The ViewModel authorizes a window request before releasing or recreating capture resources. A denied Free request opens the existing contextual Pro sheet without changing capture, routing or measurement state. Entitlement reconciliation safely returns active 4096 processing to 2048 on revocation and avoids unnecessary recreation for unchanged permitted windows.
+- The FFT selector displays a visible, clickable `4096 · PRO` label under Free and the normal `4096` label under Pro. The spectrum header can wrap its control groups on narrow displays. The upgrade comparison and feature matrix now show the correct split.
+- Historical 4096 sessions and frozen snapshots keep their data and metadata under Free. They can still be viewed; metadata does not grant access to live 4096 processing. Existing session-capacity UX and CSV failure reporting corrections remain intact.
+- **Correction PASS:** `AudioCaptureFftEntitlementTest` adds 11 real ViewModel/policy cases with a deterministic capture-manager shadow, including rejection before mutation, running revocation, startup/retry/routing before the pending collector, revocation during release, restored Free state and historical Room data. `FftWindowSelectorTest` adds four production Compose label/click/reactivity cases; `FeatureAccessPolicyTest` adds two FFT split/release-factory cases. These 17 additional regressions passed in both variants.
+- **Verification:** Executed `:app:assembleDebug :app:assembleRelease :app:testDebugUnitTest :app:testReleaseUnitTest :app:lint --console=plain` with Gradle 8.13/JDK 21.0.7 on 12 October 2026: `BUILD SUCCESSFUL` in 2m 34s (120 tasks: 27 executed, 93 up-to-date). Debug and R8-minified release APKs built. Both complete unit-test variants passed **139 tests across 22 suites**, with zero failures/errors/skips. Lint passed with **0 errors, 70 warnings and 4 hints**. `git diff --check` passed.
+- **Limitations:** Capture lifecycle tests use a hardware shadow; physical-device continuity and microphone routing have not been exercised. Release unit tests validate the release source variant; the minified APK was built but not executed on a device. Existing Phase 2 limitations remain.
+- Scope remains limited to this correction: no DSP/FFT algorithms, microphone routing behavior, Room schema, calibration behavior, Billing integration, `main` merge or `branding/concepts/` changes.

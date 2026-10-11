@@ -100,7 +100,7 @@ fun ProUpgradeSheet(
                 }
                 listOf(
                     "Complete live 31-band RTA",
-                    "Raw FFT & all FFT window sizes",
+                    "Raw FFT · 1024 / 2048-point windows",
                     "All smoothing & graph controls",
                     "Fullscreen analyzer",
                     "Peak / RMS meters",
@@ -110,6 +110,7 @@ fun ProUpgradeSheet(
                     "Session notes, viewing & deletion",
                     "PNG screenshot sharing"
                 ).forEach { ComparisonRow(it, "Included", "Included") }
+                ComparisonRow("4096-point FFT window", "—", "Included")
                 ComparisonRow("Frozen spectrum overlays", "1", "Unlimited")
                 ComparisonRow("Saved tuning sessions", "1", "Unlimited")
                 ComparisonRow("Mic calibration import, activation & correction", "—", "Included")

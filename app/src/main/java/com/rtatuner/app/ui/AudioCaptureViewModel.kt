@@ -39,6 +39,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -87,7 +88,10 @@ class AudioCaptureViewModel(
         private const val BALLISTICS_TICK_MS = 33L // ~30 fps meter update
     }
 
-    private var currentWindowSize = 2048
+    private val captureControlLock = Any()
+    private val _fftWindowSize = MutableStateFlow(2048)
+    val fftWindowSize: StateFlow<Int> = _fftWindowSize.asStateFlow()
+    private val currentWindowSize: Int get() = _fftWindowSize.value
     private var preferredDeviceId: Int? = null
     private var captureManager: AudioCaptureManager = createCaptureManager(currentWindowSize)
     val signalGenerator: SignalGenerator = SignalGenerator(
@@ -115,12 +119,21 @@ class AudioCaptureViewModel(
     private var generatorCollectorJob: Job? = null
     private var calibrationCollectorJob: Job? = null
     private var sessionsCollectorJob: Job? = null
+    private var entitlementCollectorJob: Job? = null
     private var ballisticsJob: Job? = null
     private var peakHoldDb = AudioMath.MIN_DB_FS
     private var peakHoldTimestamp = 0L
 
     init {
         startCollectingCaptureState()
+        entitlementCollectorJob = viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            entitlementState.collect {
+                synchronized(captureControlLock) {
+                    // Read current policy, since a queued tier emission may already be stale.
+                    ensureAllowedWindowLocked()
+                }
+            }
+        }
         startCollectingGeneratorState()
         startCollectingCalibrationState()
         startCollectingSavedSessions()
@@ -171,57 +184,63 @@ class AudioCaptureViewModel(
 
     private fun startCollectingCaptureState() {
         captureCollectorJob?.cancel()
+        val source = captureManager
         captureCollectorJob = viewModelScope.launch {
-            captureManager.uiState.collect { mgrState ->
-                val now = System.currentTimeMillis()
+            source.uiState.collect { mgrState ->
+                synchronized(captureControlLock) {
+                    if (source !== captureManager) return@synchronized
+                    val now = System.currentTimeMillis()
 
-                // Pass raw audio spectral data through calibration engine (mic curve, noise subtraction, SPL, target deltas)
-                val diag = mgrState.diagnostics
-                val binRes = if (diag.windowSize > 0 && diag.actualSampleRate > 0) {
-                    diag.actualSampleRate.toFloat() / diag.windowSize
-                } else {
-                    23.4375f
+                    // Pass raw audio spectral data through calibration engine (mic curve, noise subtraction, SPL, target deltas)
+                    val diag = mgrState.diagnostics
+                    val binRes = if (diag.windowSize > 0 && diag.actualSampleRate > 0) {
+                        diag.actualSampleRate.toFloat() / diag.windowSize
+                    } else {
+                        23.4375f
+                    }
+
+                    val calFrame = calibrationManager.processFrame(
+                        raw31Bands = mgrState.octave31Db,
+                        rawFftDb = mgrState.rawFftDb,
+                        binResolutionHz = binRes
+                    )
+
+                    val rawSpl = if (calFrame.isSplMode) calFrame.splOffsetDb else 0.0f
+                    val splOffset = if (rawSpl.isNaN() || rawSpl.isInfinite()) 0.0f else rawSpl
+
+                    val rawPeak = if (mgrState.peakDb.isNaN() || mgrState.peakDb.isInfinite()) AudioMath.MIN_DB_FS else mgrState.peakDb
+                    val rawRms = if (mgrState.rmsDb.isNaN() || mgrState.rmsDb.isInfinite()) AudioMath.MIN_DB_FS else mgrState.rmsDb
+
+                    val effectivePeak = rawPeak + splOffset
+                    val effectiveRms = rawRms + splOffset
+
+                    // Broadband Peak hold ballistic update (clamped safely)
+                    if (peakHoldDb.isNaN() || peakHoldDb.isInfinite() || effectivePeak >= peakHoldDb) {
+                        peakHoldDb = effectivePeak
+                        peakHoldTimestamp = now
+                    }
+
+                    _uiState.value = mgrState.copy(
+                        rmsDb = effectiveRms,
+                        peakDb = effectivePeak,
+                        peakHoldDb = peakHoldDb,
+                        displayMode = _uiState.value.displayMode,
+                        displayConfig = _uiState.value.displayConfig,
+                        octave31Db = calFrame.calibrated31Db,
+                        rawFftDb = calFrame.calibratedRawFftDb,
+                        unreliableBands = calFrame.unreliableBands,
+                        targetDeltas31Db = calFrame.targetDeltas31Db,
+                        shouldResetSmoothing = calFrame.shouldResetSmoothing,
+                        diagnostics = mgrState.diagnostics.copy(
+                            windowSize = currentWindowSize,
+                            hopSize = currentWindowSize / 2,
+                            renderFps = _uiState.value.diagnostics.renderFps,
+                            renderDrawTimeUs = _uiState.value.diagnostics.renderDrawTimeUs
+                        ),
+                        generator = _uiState.value.generator,
+                        calibration = calibrationManager.uiState.value
+                    )
                 }
-
-                val calFrame = calibrationManager.processFrame(
-                    raw31Bands = mgrState.octave31Db,
-                    rawFftDb = mgrState.rawFftDb,
-                    binResolutionHz = binRes
-                )
-
-                val rawSpl = if (calFrame.isSplMode) calFrame.splOffsetDb else 0.0f
-                val splOffset = if (rawSpl.isNaN() || rawSpl.isInfinite()) 0.0f else rawSpl
-
-                val rawPeak = if (mgrState.peakDb.isNaN() || mgrState.peakDb.isInfinite()) AudioMath.MIN_DB_FS else mgrState.peakDb
-                val rawRms = if (mgrState.rmsDb.isNaN() || mgrState.rmsDb.isInfinite()) AudioMath.MIN_DB_FS else mgrState.rmsDb
-
-                val effectivePeak = rawPeak + splOffset
-                val effectiveRms = rawRms + splOffset
-
-                // Broadband Peak hold ballistic update (clamped safely)
-                if (peakHoldDb.isNaN() || peakHoldDb.isInfinite() || effectivePeak >= peakHoldDb) {
-                    peakHoldDb = effectivePeak
-                    peakHoldTimestamp = now
-                }
-
-                _uiState.value = mgrState.copy(
-                    rmsDb = effectiveRms,
-                    peakDb = effectivePeak,
-                    peakHoldDb = peakHoldDb,
-                    displayMode = _uiState.value.displayMode,
-                    displayConfig = _uiState.value.displayConfig,
-                    octave31Db = calFrame.calibrated31Db,
-                    rawFftDb = calFrame.calibratedRawFftDb,
-                    unreliableBands = calFrame.unreliableBands,
-                    targetDeltas31Db = calFrame.targetDeltas31Db,
-                    shouldResetSmoothing = calFrame.shouldResetSmoothing,
-                    diagnostics = mgrState.diagnostics.copy(
-                        renderFps = _uiState.value.diagnostics.renderFps,
-                        renderDrawTimeUs = _uiState.value.diagnostics.renderDrawTimeUs
-                    ),
-                    generator = _uiState.value.generator,
-                    calibration = calibrationManager.uiState.value
-                )
             }
         }
     }
@@ -266,17 +285,22 @@ class AudioCaptureViewModel(
     }
 
     fun startCapture() {
-        resetPeakHold()
-        captureManager.startCapture()
+        synchronized(captureControlLock) {
+            ensureAllowedWindowLocked(resumeCapture = false)
+            resetPeakHold()
+            captureManager.startCapture()
+        }
     }
 
     fun stopCapture() {
-        captureManager.stopCapture()
+        synchronized(captureControlLock) { captureManager.stopCapture() }
     }
 
     fun retryCapture() {
-        captureManager.stopCapture()
-        startCapture()
+        synchronized(captureControlLock) {
+            captureManager.stopCapture()
+            startCapture()
+        }
     }
 
     fun resetPeakHold() {
@@ -290,12 +314,14 @@ class AudioCaptureViewModel(
     }
 
     fun setFftDisplayMode(mode: FftDisplayMode) {
-        val updatedConfig = _uiState.value.displayConfig.copy(displayMode = mode)
-        captureManager.setDisplayMode(mode)
-        _uiState.value = _uiState.value.copy(
-            displayMode = mode,
-            displayConfig = updatedConfig
-        )
+        synchronized(captureControlLock) {
+            val updatedConfig = _uiState.value.displayConfig.copy(displayMode = mode)
+            captureManager.setDisplayMode(mode)
+            _uiState.value = _uiState.value.copy(
+                displayMode = mode,
+                displayConfig = updatedConfig
+            )
+        }
     }
 
     fun setEmaPreset(preset: EmaPreset) {
@@ -327,22 +353,42 @@ class AudioCaptureViewModel(
         }
     }
 
-    fun setWindowSize(newSize: Int) {
-        if (newSize == currentWindowSize) return
-        require(newSize == 1024 || newSize == 2048 || newSize == 4096) {
-            "Unsupported window size: $newSize"
+    fun setWindowSize(newSize: Int): FeatureAccessResult = synchronized(captureControlLock) {
+        val access = featureAccessPolicy.checkFftWindow(newSize)
+        if (access is FeatureAccessResult.Denied) {
+            return@synchronized reportAccess(access)
         }
+        reportAccess(reconfigureWindowLocked(newSize))
+    }
 
-        val wasRunning = _uiState.value.status == CaptureStatus.RUNNING
+    /** Only the live configuration changes; stored sessions and overlays keep their metadata. */
+    private fun ensureAllowedWindowLocked(resumeCapture: Boolean = true): Boolean {
+        if (featureAccessPolicy.checkFftWindow(currentWindowSize) is FeatureAccessResult.Allowed) return false
+        reconfigureWindowLocked(2048, resumeCapture)
+        return true
+    }
+
+    private fun reconfigureWindowLocked(newSize: Int, resumeCapture: Boolean = true): FeatureAccessResult {
+        if (newSize == currentWindowSize) return FeatureAccessResult.Allowed
+        val wasRunning = captureManager.uiState.value.status == CaptureStatus.RUNNING
+        captureCollectorJob?.cancel()
         captureManager.release()
 
-        currentWindowSize = newSize
-        captureManager = createCaptureManager(newSize)
+        // Release may take time: a downgrade during it must not create a restricted manager.
+        val access = featureAccessPolicy.checkFftWindow(newSize)
+        val effectiveSize = if (access is FeatureAccessResult.Allowed) newSize else 2048
+        captureManager = createCaptureManager(effectiveSize)
+        captureManager.setDisplayMode(_uiState.value.displayMode)
+        _fftWindowSize.value = effectiveSize
+        _uiState.value = _uiState.value.copy(
+            diagnostics = _uiState.value.diagnostics.copy(windowSize = effectiveSize, hopSize = effectiveSize / 2)
+        )
         startCollectingCaptureState()
 
-        if (wasRunning) {
+        if (wasRunning && resumeCapture) {
             captureManager.startCapture()
         }
+        return access
     }
 
     // --- Stage 4 Test Signal Generator Controls ---
@@ -646,8 +692,11 @@ class AudioCaptureViewModel(
     // ==========================================
 
     fun setPreferredInputDevice(deviceId: Int?) {
-        preferredDeviceId = deviceId
-        captureManager.setPreferredInputDevice(deviceId)
+        synchronized(captureControlLock) {
+            preferredDeviceId = deviceId
+            // A replacement already receives this preference; avoid restarting it a second time.
+            if (!ensureAllowedWindowLocked()) captureManager.setPreferredInputDevice(deviceId)
+        }
     }
 
     fun dismissDevicePrompt() {
@@ -681,7 +730,8 @@ class AudioCaptureViewModel(
         generatorCollectorJob?.cancel()
         calibrationCollectorJob?.cancel()
         sessionsCollectorJob?.cancel()
-        captureManager.release()
+        entitlementCollectorJob?.cancel()
+        synchronized(captureControlLock) { captureManager.release() }
         calibrationManager.close()
         signalGenerator.close()
     }
