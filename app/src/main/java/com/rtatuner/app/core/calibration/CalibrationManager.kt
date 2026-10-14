@@ -344,15 +344,17 @@ class CalibrationManager internal constructor(
                             canAccumulate = false
                         }
                         if (frameContext.fingerprint != activeNoiseCaptureFingerprint) {
-                            activeNoiseCaptureFingerprint = frameContext.fingerprint
-                            noiseAccumFrames = 0
-                            noiseAccumPower.fill(0.0)
-                            noiseCaptureStartMs = nowMs()
+                            cancelNoiseCaptureLocked()
+                            canAccumulate = false
                         }
                     }
                     if (!frameContext.fingerprint.isMicrophoneKnown) {
                         canAccumulate = false
                     }
+                }
+
+                if (!isCapturingNoise) {
+                    return@synchronized
                 }
 
                 if (canAccumulate) {

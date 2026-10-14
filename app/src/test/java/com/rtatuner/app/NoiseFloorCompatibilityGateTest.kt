@@ -16,6 +16,7 @@ import com.rtatuner.app.core.entitlement.EntitlementTier
 import com.rtatuner.app.core.entitlement.FakeEntitlementRepository
 import com.rtatuner.app.core.entitlement.FeatureAccessPolicy
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -265,40 +266,56 @@ class NoiseFloorCompatibilityGateTest {
     }
 
     @Test
-    fun requirementC_midCaptureRouteChangeResetsAccumulation() = runTest {
+    fun requirementC_midCaptureRouteChangeCancelsAcquisitionAndPreservesExistingFloor() = runTest {
         var now = 1000L
         val prefs = testPreferences()
+        val originalFp = sampleFingerprint(sampleRate = 48000, micId = "micOriginal")
+        val originalBands = FloatArray(31) { -55f }
+        val originalTimestamp = 1234L
+
+        // Set up pre-existing captured noise floor
+        prefs.edit()
+            .putString("noise_floor_bands", originalBands.joinToString(","))
+            .putLong("noise_floor_timestamp", originalTimestamp)
+            .putString("noise_floor_fingerprint", originalFp.toJsonString())
+            .putBoolean("noise_floor_captured", true)
+            .putBoolean("noise_subtraction_active", true)
+            .commit()
+
         val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
         val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope, nowMs = { now })
 
         try {
+            assertTrue("Pre-existing floor is loaded", manager.uiState.value.noiseFloor.isCaptured)
+            assertEquals("Pre-existing timestamp preserved", originalTimestamp, manager.uiState.value.noiseFloor.captureTimestampMs)
+
+            // Start new noise floor capture
             manager.startNoiseFloorCapture(durationMs = 200L)
             assertTrue(manager.uiState.value.isCapturingNoiseFloor)
 
             val micA = sampleFingerprint(sampleRate = 48000, micId = "micA")
             val micB = sampleFingerprint(sampleRate = 48000, micId = "micB")
 
-            // Frame 1 with micA: loud -10 dB frame
+            // Frame 1 with micA
             now += 50L
             val ctx1 = sampleFrameContext(sequence = 1L, fingerprint = micA)
             manager.processFrame(FloatArray(31) { -10f }, FloatArray(8) { -10f }, 100f, frameContext = ctx1)
+            assertTrue(manager.uiState.value.isCapturingNoiseFloor)
 
             // Routing switched to micB mid-capture!
-            // Frame 2 with micB: quiet -60 dB frame
             now += 50L
             val ctx2 = sampleFrameContext(sequence = 2L, fingerprint = micB)
             manager.processFrame(FloatArray(31) { -60f }, FloatArray(8) { -60f }, 100f, frameContext = ctx2)
 
-            // Frame 3 with micB: quiet -60 dB frame, elapsed time reaches 200ms from reset
-            now += 200L
-            val ctx3 = sampleFrameContext(sequence = 3L, fingerprint = micB)
-            manager.processFrame(FloatArray(31) { -60f }, FloatArray(8) { -60f }, 100f, frameContext = ctx3)
+            // Acquisition must be CANCELED rather than silently restarting accumulation
+            assertFalse("Acquisition must be canceled on route change", manager.uiState.value.isCapturingNoiseFloor)
+            assertEquals("Progress must be reset to 0", 0.0f, manager.uiState.value.noiseCaptureProgress, 0.0f)
 
-            // Finalized noise floor must have micB fingerprint, and power average must be -60 dB,
-            // proving the prior micA sample was completely purged.
-            assertFalse(manager.uiState.value.isCapturingNoiseFloor)
-            assertEquals(micB, manager.uiState.value.noiseFloor.fingerprint)
-            assertArrayEquals(FloatArray(31) { -60f }, manager.uiState.value.noiseFloor.bands31Db, 0.001f)
+            // Pre-existing floor must be fully preserved
+            assertTrue("Pre-existing floor remains captured", manager.uiState.value.noiseFloor.isCaptured)
+            assertEquals("Pre-existing timestamp preserved", originalTimestamp, manager.uiState.value.noiseFloor.captureTimestampMs)
+            assertEquals("Pre-existing fingerprint preserved", originalFp, manager.uiState.value.noiseFloor.fingerprint)
+            assertArrayEquals("Pre-existing bands preserved", originalBands, manager.uiState.value.noiseFloor.bands31Db, 0.001f)
         } finally {
             manager.close()
         }
@@ -470,6 +487,261 @@ class NoiseFloorCompatibilityGateTest {
             assertFalse(state.isNoiseSubtractionActive)
             assertFalse(prefs.contains("noise_floor_fingerprint"))
             assertFalse(prefs.getBoolean("noise_floor_captured", false))
+        } finally {
+            manager.close()
+        }
+    }
+
+    @Test
+    fun requirementB_requestedMicDifferingFromActualRoutedMic() {
+        // Fingerprint binds observed routed microphone identity, NOT requested mic identity
+        val fp = sampleFingerprint(
+            selectedSource = 6, // requested VOICE_RECOGNITION
+            actualSource = 1,   // actual fallback to MIC
+            micId = "observed_usb_mic_01",
+            devType = "TYPE_USB_DEVICE"
+        )
+        assertEquals("observed_usb_mic_01", fp.routedMicrophoneId)
+        assertEquals("TYPE_USB_DEVICE", fp.routedDeviceType)
+        assertTrue(fp.isSourceFallback)
+        assertEquals(6, fp.selectedAudioSource)
+        assertEquals(1, fp.actualAudioSource)
+    }
+
+    @Test
+    fun requirementC_staleGenerationOrReplacedManagerCannotAdvanceAcquisition() = runTest {
+        var now = 1000L
+        val prefs = testPreferences()
+        val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
+        val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope, nowMs = { now })
+
+        try {
+            manager.startNoiseFloorCapture(durationMs = 200L)
+            val baseFp = sampleFingerprint()
+
+            // Frame 1: generation = 2L, sequence = 1L
+            now += 50L
+            val ctxValid = sampleFrameContext(managerId = "mgr_A", generation = 2L, sequence = 1L, fingerprint = baseFp)
+            manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f, frameContext = ctxValid)
+            assertEquals(0.25f, manager.uiState.value.noiseCaptureProgress, 0.01f)
+
+            // Stale generation frame: generation = 1L
+            now += 50L
+            val ctxStaleGen = sampleFrameContext(managerId = "mgr_A", generation = 1L, sequence = 2L, fingerprint = baseFp)
+            manager.processFrame(FloatArray(31) { -10f }, FloatArray(8) { -10f }, 100f, frameContext = ctxStaleGen)
+
+            // Replaced manager frame: managerId = "mgr_B"
+            val ctxOtherMgr = sampleFrameContext(managerId = "mgr_B", generation = 2L, sequence = 3L, fingerprint = baseFp)
+            manager.processFrame(FloatArray(31) { -10f }, FloatArray(8) { -10f }, 100f, frameContext = ctxOtherMgr)
+
+            // Frame 2: valid hop (sequence = 2L on mgr_A, gen 2)
+            now += 150L
+            val ctxValid2 = sampleFrameContext(managerId = "mgr_A", generation = 2L, sequence = 2L, fingerprint = baseFp)
+            manager.processFrame(FloatArray(31) { -50f }, FloatArray(8) { -50f }, 100f, frameContext = ctxValid2)
+
+            // Finalized: only -40 dB and -50 dB frames are averaged
+            assertTrue(manager.uiState.value.noiseFloor.isCaptured)
+            val expectedAvg = (10.0 * kotlin.math.log10((0.0001 + 0.00001) / 2.0)).toFloat()
+            assertArrayEquals(FloatArray(31) { expectedAvg }, manager.uiState.value.noiseFloor.bands31Db, 0.001f)
+        } finally {
+            manager.close()
+        }
+    }
+
+    @Test
+    fun requirementD_malformedPersistedFingerprintHandledSafely() = runTest {
+        val prefs = testPreferences()
+        val legacyBands = FloatArray(31) { -52.0f }
+        val legacyTimestamp = 8888L
+
+        // Test non-JSON string
+        prefs.edit()
+            .putString("noise_floor_bands", legacyBands.joinToString(","))
+            .putLong("noise_floor_timestamp", legacyTimestamp)
+            .putString("noise_floor_fingerprint", "<<<CORRUPTED_NON_JSON>>>")
+            .putBoolean("noise_floor_captured", true)
+            .putBoolean("noise_subtraction_active", true)
+            .commit()
+
+        val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
+        val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope)
+
+        try {
+            val state = manager.uiState.value
+            assertTrue("Snapshot reflects captured status", state.noiseFloor.isCaptured)
+            assertEquals("Historical timestamp preserved", legacyTimestamp, state.noiseFloor.captureTimestampMs)
+            assertArrayEquals("Historical bands preserved", legacyBands, state.noiseFloor.bands31Db, 0.001f)
+
+            // Non-JSON string causes fromJsonString to return null -> requiresRecapture = true, fingerprint = null
+            assertTrue("Requires recapture for malformed fingerprint", state.noiseFloor.requiresRecapture)
+            assertNull("Fingerprint is null when malformed", state.noiseFloor.fingerprint)
+            assertFalse("Effective subtraction disabled", state.isNoiseSubtractionEffective)
+        } finally {
+            manager.close()
+        }
+    }
+
+    @Test
+    fun requirementD_proToFreeRevocationAndProRestoration() = runTest {
+        val prefs = testPreferences()
+        val fp = sampleFingerprint(sampleRate = 48000, micId = "mic1")
+        prefs.edit()
+            .putString("noise_floor_bands", FloatArray(31) { -50f }.joinToString(","))
+            .putLong("noise_floor_timestamp", 1234L)
+            .putString("noise_floor_fingerprint", fp.toJsonString())
+            .putBoolean("noise_floor_captured", true)
+            .putBoolean("noise_subtraction_active", true)
+            .commit()
+
+        val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
+        val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope)
+
+        try {
+            val liveCtx = sampleFrameContext(fingerprint = fp)
+            val expectedSubtracted = AudioMath.subtractNoiseFloor(-40f, -50f, AudioMath.MIN_DB_FS).correctedDb
+
+            // 1. Pro mode: subtraction is effective
+            val framePro1 = manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f, frameContext = liveCtx)
+            assertTrue(manager.uiState.value.isNoiseSubtractionEffective)
+            assertArrayEquals(FloatArray(31) { expectedSubtracted }, framePro1.calibrated31Db, 0.001f)
+
+            // 2. Revoke to Free
+            entitlements.setTier(EntitlementTier.FREE)
+            runCurrent()
+            val frameFree = manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f, frameContext = liveCtx)
+            assertFalse(manager.uiState.value.isNoiseSubtractionEffective)
+            assertArrayEquals(FloatArray(31) { -40f }, frameFree.calibrated31Db, 0.001f)
+            assertTrue("Snapshot remains preserved on Free tier", manager.uiState.value.noiseFloor.isCaptured)
+
+            // 3. Restore to Pro
+            entitlements.setTier(EntitlementTier.PRO_LIFETIME)
+            runCurrent()
+            val framePro2 = manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f, frameContext = liveCtx)
+            assertTrue(manager.uiState.value.isNoiseSubtractionEffective)
+            assertArrayEquals(FloatArray(31) { expectedSubtracted }, framePro2.calibrated31Db, 0.001f)
+        } finally {
+            manager.close()
+        }
+    }
+
+    @Test
+    fun requirementD_fftWindowSizeChangeDoesNotInvalidateRawDomainNoiseFloor() = runTest {
+        val prefs = testPreferences()
+        val fp = sampleFingerprint(sampleRate = 48000, micId = "mic1")
+        prefs.edit()
+            .putString("noise_floor_bands", FloatArray(31) { -50f }.joinToString(","))
+            .putLong("noise_floor_timestamp", 1234L)
+            .putString("noise_floor_fingerprint", fp.toJsonString())
+            .putBoolean("noise_floor_captured", true)
+            .putBoolean("noise_subtraction_active", true)
+            .commit()
+
+        val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
+        val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope)
+
+        try {
+            val liveCtx = sampleFrameContext(fingerprint = fp)
+            val expectedSubtracted = AudioMath.subtractNoiseFloor(-40f, -50f, AudioMath.MIN_DB_FS).correctedDb
+
+            // 4096-point FFT: 2049 bins, binResolution = 48000 / 4096 = 11.71875 Hz
+            val frame4096 = manager.processFrame(
+                FloatArray(31) { -40f },
+                FloatArray(2049) { -40f },
+                11.71875f,
+                frameContext = liveCtx
+            )
+            assertArrayEquals(FloatArray(31) { expectedSubtracted }, frame4096.calibrated31Db, 0.001f)
+
+            // Reconfigured / restarted to 2048-point FFT: 1025 bins, binResolution = 48000 / 2048 = 23.4375 Hz
+            val frame2048 = manager.processFrame(
+                FloatArray(31) { -40f },
+                FloatArray(1025) { -40f },
+                23.4375f,
+                frameContext = liveCtx
+            )
+            // 31-band raw-domain noise subtraction remains compatible and fully effective
+            assertArrayEquals(FloatArray(31) { expectedSubtracted }, frame2048.calibrated31Db, 0.001f)
+            assertTrue(manager.uiState.value.isNoiseSubtractionEffective)
+        } finally {
+            manager.close()
+        }
+    }
+
+    @Test
+    fun requirementD_micCalibrationAndTargetChangesDoNotInvalidateCompatibleNoiseFloor() = runTest {
+        val prefs = testPreferences()
+        val fp = sampleFingerprint(sampleRate = 48000, micId = "mic1")
+        prefs.edit()
+            .putString("noise_floor_bands", FloatArray(31) { -50f }.joinToString(","))
+            .putLong("noise_floor_timestamp", 1234L)
+            .putString("noise_floor_fingerprint", fp.toJsonString())
+            .putBoolean("noise_floor_captured", true)
+            .putBoolean("noise_subtraction_active", true)
+            .commit()
+
+        val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
+        val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope)
+
+        try {
+            val liveCtx = sampleFrameContext(fingerprint = fp)
+            assertTrue(manager.uiState.value.isNoiseSubtractionEffective)
+
+            // Load mic curve
+            manager.loadMicCurve("Test Mic", "20 2.0\n20000 2.0")
+            assertTrue("Noise floor remains captured after mic curve load", manager.uiState.value.noiseFloor.isCaptured)
+            assertTrue("Noise subtraction remains effective", manager.uiState.value.isNoiseSubtractionEffective)
+
+            // Set target curve
+            manager.setTargetCurve(com.rtatuner.app.core.calibration.TargetCurve.HARMAN_CAR)
+            manager.setTargetCurveActive(true)
+            assertTrue("Noise subtraction remains effective after target curve change", manager.uiState.value.isNoiseSubtractionEffective)
+            assertEquals(fp, manager.uiState.value.noiseFloor.fingerprint)
+        } finally {
+            manager.close()
+        }
+    }
+
+    @Test
+    fun requirementD_endToEndRawBandSubtractionOccursBeforeMicAndSplCorrection() = runTest {
+        val prefs = testPreferences()
+        val fp = sampleFingerprint(sampleRate = 48000, micId = "mic1")
+        prefs.edit()
+            .putString("noise_floor_bands", FloatArray(31) { -50f }.joinToString(","))
+            .putLong("noise_floor_timestamp", 1234L)
+            .putString("noise_floor_fingerprint", fp.toJsonString())
+            .putBoolean("noise_floor_captured", true)
+            .putBoolean("noise_subtraction_active", true)
+            .commit()
+
+        val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
+        val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope)
+
+        try {
+            // Apply mic curve with +3 dB offset
+            manager.loadMicCurve("Flat+3dB", "20 3.0\n20000 3.0", com.rtatuner.app.core.calibration.CalibrationFileConvention.ADDITIVE_CORRECTION)
+            manager.setMicCurveActive(true)
+
+            // Apply SPL offset (+100 dB)
+            manager.setSplOffset(100f)
+            manager.setSplMode(true)
+
+            val liveCtx = sampleFrameContext(fingerprint = fp)
+            val frame = manager.processFrame(
+                FloatArray(31) { -40f },
+                FloatArray(8) { -40f },
+                100f,
+                frameContext = liveCtx
+            )
+
+            // Order must be:
+            // 1. Raw noise subtraction: AudioMath.subtractNoiseFloor(-40, -50)
+            // 2. Mic correction: + 3 dB
+            // 3. SPL calibration: + 100 dB
+            val expectedRawSub = AudioMath.subtractNoiseFloor(-40f, -50f, AudioMath.MIN_DB_FS).correctedDb
+            val expectedEndToEnd = expectedRawSub + 3.0f + 100.0f
+
+            assertArrayEquals(FloatArray(31) { expectedEndToEnd }, frame.calibrated31Db, 0.001f)
+            assertTrue(frame.isSplMode)
         } finally {
             manager.close()
         }
