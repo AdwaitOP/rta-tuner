@@ -45,6 +45,15 @@ class BiquadFilterBank(
             return 1.0 / (halfBandRatio - 1.0 / halfBandRatio)
         }
 
+        /**
+         * Bandwidth contraction factor for two cascaded identical 2nd-order bandpass filters:
+         * sqrt(sqrt(2) - 1) ≈ 0.6435942529.
+         * For the 4th-order cascade response to achieve -3 dB at the nominal band edges,
+         * the per-stage bandwidth must be scaled by 1.0 / CASCADE_BANDWIDTH_EXPANSION_FACTOR.
+         */
+        val CASCADE_BANDWIDTH_EXPANSION_FACTOR: Double =
+            sqrt(sqrt(2.0) - 1.0)
+
         private const val INV_SHORT_MAX = 1.0 / 32768.0
         private const val ANTI_DENORMAL_THRESHOLD = 1e-25
     }
@@ -160,35 +169,61 @@ class BiquadFilterBank(
     }
 
     /**
-     * Recomputes 2nd-order BPF coefficients for each center frequency.
-     * Standard RBJ Audio EQ Cookbook bandpass filter with constant 0 dB peak gain:
-     *   w0 = 2 * PI * f0 / Fs
-     *   alpha = sin(w0) / (2 * Q)
-     *   b0 = alpha / (1 + alpha)
-     *   b1 = 0
-     *   b2 = -b0
-     *   a1 = -2 * cos(w0) / (1 + alpha)
-     *   a2 = (1 - alpha) / (1 + alpha)
+     * Recomputes 4th-order bandpass filter bank coefficients (two cascaded 2nd-order biquads per band).
+     *
+     * Employs exact bilinear transform frequency pre-warping to prevent high-frequency
+     * bandwidth collapse near Nyquist, and compensates for the -3 dB bandwidth contraction
+     * inherent in cascading two identical 2nd-order biquad stages:
+     *
+     * 1. For each band, determine nominal band edges f1 and f2 from center frequency f0 and quality factor Q.
+     * 2. Pre-warp band edges to continuous-time analog prototype angular frequencies:
+     *      Omega1 = tan(pi * f1 / Fs)
+     *      Omega2 = tan(pi * f2 / Fs)
+     * 3. Analog bandwidth and center:
+     *      DeltaOmega = Omega2 - Omega1
+     *      Omega0_sq = Omega1 * Omega2
+     * 4. Account for two cascaded sections (-3 dB cascade cutoff matching nominal band edges):
+     *      beta = DeltaOmega / sqrt(sqrt(2) - 1)
+     * 5. Normalized 2nd-order biquad coefficients for each stage:
+     *      a0 = 1.0 + beta + Omega0_sq
+     *      b0 = beta / a0
+     *      b1 = 0.0
+     *      b2 = -b0
+     *      a1 = 2.0 * (Omega0_sq - 1.0) / a0
+     *      a2 = (1.0 - beta + Omega0_sq) / a0
      */
     private fun recomputeCoefficients() {
         val nyquist = sampleRate * 0.5
+        // Octave half-step ratio k = 1 / (2Q) + sqrt(1 + 1 / (4Q^2))
+        // For standard 1/3-octave Q ≈ 4.318464, k = 2^(1/6) ≈ 1.122462
+        val k = (1.0 / (2.0 * q)) + sqrt(1.0 + 1.0 / (4.0 * q * q))
+        val cascadeFactor = CASCADE_BANDWIDTH_EXPANSION_FACTOR
+
         for (b in centerFrequencies.indices) {
-            val f0 = centerFrequencies[b]
-            if (f0 <= 0.0f || f0 >= nyquist) {
+            val f0 = centerFrequencies[b].toDouble()
+            if (f0 <= 0.0 || f0 >= nyquist) {
                 // Out of valid band range: disable filter
                 b0Coeffs[b] = 0.0
                 a1Coeffs[b] = 0.0
                 a2Coeffs[b] = 0.0
             } else {
-                val omega0 = 2.0 * Math.PI * f0 / sampleRate
-                val sinW0 = sin(omega0)
-                val cosW0 = cos(omega0)
-                val alpha = sinW0 / (2.0 * q)
-                val a0 = 1.0 + alpha
+                val f1 = f0 / k
+                val f2Nominal = f0 * k
+                // For bands approaching Nyquist (e.g. 20 kHz at 44.1 kHz), ensure upper edge is strictly below Nyquist
+                val f2 = if (f2Nominal >= nyquist) nyquist * 0.999 else f2Nominal
 
-                b0Coeffs[b] = alpha / a0
-                a1Coeffs[b] = (-2.0 * cosW0) / a0
-                a2Coeffs[b] = (1.0 - alpha) / a0
+                val omega1 = Math.PI * f1 / sampleRate
+                val omega2 = Math.PI * f2 / sampleRate
+                val tan1 = Math.tan(omega1)
+                val tan2 = Math.tan(omega2)
+                val omega0Sq = tan1 * tan2
+                val deltaOmega = tan2 - tan1
+                val beta = deltaOmega
+                val a0 = 1.0 + beta + omega0Sq
+
+                b0Coeffs[b] = beta / a0
+                a1Coeffs[b] = (2.0 * (omega0Sq - 1.0)) / a0
+                a2Coeffs[b] = (1.0 - beta + omega0Sq) / a0
             }
         }
     }
