@@ -619,4 +619,225 @@ class AudioCaptureOwnershipAndPartialReadTest {
         currentManager.stopCapture()
         assertTrue("New 2048 recorder must be released on stop", record2048.isReleased)
     }
+
+    // --- F04: Atomic Publication and Lifecycle Synchronization Tests ---
+
+    @Test
+    fun workerPausedBetweenComputationAndPublishDoesNotOverwriteStoppedState() {
+        val prePublishReached = CountDownLatch(1)
+        val resumeWorker = CountDownLatch(1)
+
+        val record = FakeAudioRecordSource(
+            onRead = { buf, offset, size ->
+                for (i in 0 until size) {
+                    buf[offset + i] = 1000.toShort()
+                }
+                size
+            }
+        )
+
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = { _, _, _, _, _ -> record },
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        manager.onPrePublishFrame = { _ ->
+            prePublishReached.countDown()
+            resumeWorker.await(5, TimeUnit.SECONDS)
+        }
+
+        assertTrue(manager.startCapture())
+        assertTrue("Capture thread should reach pre-publish hook", prePublishReached.await(5, TimeUnit.SECONDS))
+
+        // While worker thread is paused right before publishFrame, main thread stops capture
+        manager.stopCapture()
+        assertEquals(CaptureStatus.STOPPED, manager.uiState.value.status)
+        assertEquals(0L, manager.uiState.value.diagnostics.totalFramesCaptured)
+
+        // Resume worker thread to attempt publishing into stopped state
+        resumeWorker.countDown()
+        Thread.sleep(100)
+
+        // Status must remain strictly STOPPED, and stale frame must NOT have been published
+        assertEquals(CaptureStatus.STOPPED, manager.uiState.value.status)
+        assertEquals(0L, manager.uiState.value.diagnostics.totalFramesCaptured)
+        assertTrue(record.isReleased)
+    }
+
+    @Test
+    fun workerAPausedBeforePublishDoesNotInjectStaleSpectrumIntoSessionB() {
+        val workerAPrePublish = CountDownLatch(1)
+        val resumeWorkerA = CountDownLatch(1)
+
+        // Worker A emits high amplitude 5000 tone
+        val recordA = FakeAudioRecordSource(
+            onRead = { buf, offset, size ->
+                for (i in 0 until size) {
+                    buf[offset + i] = 5000.toShort()
+                }
+                size
+            }
+        )
+        // Worker B emits small amplitude 50 tone
+        val recordB = FakeAudioRecordSource(
+            onRead = { buf, offset, size ->
+                for (i in 0 until size) {
+                    buf[offset + i] = 50.toShort()
+                }
+                size
+            }
+        )
+
+        val sources = ConcurrentLinkedQueue(listOf(recordA, recordB))
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = { _, _, _, _, _ -> sources.poll() },
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        var pausedGen: Long = -1L
+        manager.onPrePublishFrame = { gen ->
+            if (pausedGen == -1L) {
+                pausedGen = gen
+                workerAPrePublish.countDown()
+                resumeWorkerA.await(5, TimeUnit.SECONDS)
+            }
+        }
+
+        assertTrue(manager.startCapture())
+        assertTrue("Worker A must reach pre-publish hook", workerAPrePublish.await(5, TimeUnit.SECONDS))
+
+        // Stop session A and start session B
+        manager.stopCapture()
+        assertTrue(manager.startCapture())
+        assertEquals(CaptureStatus.RUNNING, manager.uiState.value.status)
+
+        // Now resume Worker A while Session B is active
+        resumeWorkerA.countDown()
+        Thread.sleep(100)
+
+        // Wait for Session B to produce at least 1 frame
+        runBlocking {
+            withTimeout(5000) {
+                manager.uiState.first { it.diagnostics.totalFramesCaptured >= 1L }
+            }
+        }
+
+        val stateB = manager.uiState.value
+        assertEquals(CaptureStatus.RUNNING, stateB.status)
+        assertTrue("Record A must be cleaned up and released", recordA.isReleased)
+        assertFalse("Record B must remain active", recordB.isReleased)
+
+        // Verification: Worker A's high RMS (amplitude 5000 is ~-16 dBFS) must NOT be in Session B (amplitude 50 is ~-56 dBFS)
+        assertTrue("Session B peak dB (${stateB.peakDb}) should reflect low amplitude signal, not Worker A's high signal", stateB.peakDb < -40f)
+
+        manager.stopCapture()
+        assertTrue(recordB.isReleased)
+    }
+
+    @Test
+    @Suppress("DEPRECATION")
+    fun inFlightRoutingListenerPausedBeforeExecutionDoesNotContaminateStoppedOrNewSession() {
+        val preRoutingReached = CountDownLatch(1)
+        val resumeRouting = CountDownLatch(1)
+
+        val recordA = FakeAudioRecordSource()
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = { _, _, _, _, _ -> recordA },
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        var hookArmed = true
+        manager.onPreRoutingUpdate = {
+            if (hookArmed) {
+                hookArmed = false
+                preRoutingReached.countDown()
+                resumeRouting.await(5, TimeUnit.SECONDS)
+            }
+        }
+
+        assertTrue(manager.startCapture())
+        val listener = recordA.routingListeners.firstOrNull()
+        assertNotNull("Routing listener must be registered", listener)
+
+        // Fire routing callback from a separate thread
+        val callbackThread = Thread {
+            listener?.onRoutingChanged(null)
+        }
+        callbackThread.start()
+
+        assertTrue("Routing callback should reach pre-update hook", preRoutingReached.await(5, TimeUnit.SECONDS))
+
+        // While routing callback is paused, stop capture
+        manager.stopCapture()
+        assertEquals(CaptureStatus.STOPPED, manager.uiState.value.status)
+
+        // Resume routing callback
+        resumeRouting.countDown()
+        callbackThread.join(3000)
+
+        // UI status must remain STOPPED, not corrupted back to RUNNING or mismatched
+        assertEquals(CaptureStatus.STOPPED, manager.uiState.value.status)
+        assertFalse(manager.uiState.value.isRoutingMismatch)
+        assertTrue(recordA.isReleased)
+    }
+
+    @Test
+    fun viewModelRetryConsumesFreshFrameAfterError() {
+        val recordA = FakeAudioRecordSource(
+            onRead = { _, _, _ -> AudioRecord.ERROR_DEAD_OBJECT }
+        )
+        val recordB = FakeAudioRecordSource(
+            onRead = { buf, offset, size ->
+                for (i in 0 until size) {
+                    buf[offset + i] = 500.toShort()
+                }
+                size
+            }
+        )
+
+        val sources = ConcurrentLinkedQueue(listOf(recordA, recordB))
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = { _, _, _, _, _ -> sources.poll() },
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        assertTrue(manager.startCapture())
+
+        // Wait for session A to enter ERROR state
+        runBlocking {
+            withTimeout(3000) {
+                manager.uiState.first { it.status == CaptureStatus.ERROR }
+            }
+        }
+        assertEquals(CaptureStatus.ERROR, manager.uiState.value.status)
+        assertTrue(recordA.isReleased)
+
+        // ViewModel initiates retry
+        assertTrue(manager.startCapture())
+
+        // Wait for session B to publish fresh frames
+        runBlocking {
+            withTimeout(4000) {
+                manager.uiState.first { it.status == CaptureStatus.RUNNING && it.diagnostics.totalFramesCaptured >= 2L }
+            }
+        }
+
+        val stateB = manager.uiState.value
+        assertEquals(CaptureStatus.RUNNING, stateB.status)
+        assertNull(stateB.errorMessage)
+        assertTrue(stateB.diagnostics.totalFramesCaptured >= 2L)
+        assertFalse(recordB.isReleased)
+
+        manager.stopCapture()
+        assertTrue(recordB.isReleased)
+    }
 }
+

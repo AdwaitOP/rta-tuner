@@ -151,7 +151,8 @@ internal class CaptureSession(
  * - Safe source negotiation: UNPROCESSED (raw PCM, no AGC/AEC/NS) with fallback to MIC
  * - Defensive buffer size validation (preventing negative AudioRecord error returns)
  * - Explicit capture generation / session ownership preventing stale worker interference
- * - Accumulation of partial AudioRecord reads into complete, contiguous processing hops
+ * - Contiguous partial-read accumulation and mathematical equivalence (F05)
+ * - Atomic lifecycle synchronization preventing publication races and status corruption (F04)
  * - Dedicated capture thread running at Process.THREAD_PRIORITY_URGENT_AUDIO
  * - 50% overlap sliding window buffer
  * - Zero-allocation RMS/Peak math and clipping detection
@@ -196,6 +197,13 @@ class AudioCaptureManager(
     private var activeSession: CaptureSession? = null
     private var captureThread: Thread? = null
 
+    // Lock coordinating all lifecycle transitions and UI state mutations
+    private val lifecycleLock = Any()
+
+    // Deterministic test hooks for intercepting thread execution prior to publication
+    internal var onPrePublishFrame: ((sessionGeneration: Long) -> Unit)? = null
+    internal var onPreRoutingUpdate: (() -> Unit)? = null
+
     private var activeConfig: AudioCaptureConfig = config
 
     private val deviceCallback = object : AudioDeviceCallback() {
@@ -213,25 +221,34 @@ class AudioCaptureManager(
             }
             if (externalInput != null && externalInput.id != activeConfig.preferredDeviceId) {
                 val inputInfo = AudioInputDeviceInfo.fromAudioDeviceInfo(externalInput)
-                _uiState.value = _uiState.value.copy(deviceAttachedPrompt = inputInfo)
+                synchronized(lifecycleLock) {
+                    _uiState.value = _uiState.value.copy(deviceAttachedPrompt = inputInfo)
+                }
             }
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
             Log.i(TAG, "Audio devices removed: ${removedDevices?.size ?: 0}")
             refreshInputDevices()
-            if (isRunning.get()) {
-                val currentRoutedDeviceId = _uiState.value.routedDeviceId
-                val targetDeviceId = activeConfig.preferredDeviceId
-                val removedActive = removedDevices?.firstOrNull { dev ->
-                    dev.id == targetDeviceId || dev.id == currentRoutedDeviceId
+            var sessionToNotify: CaptureSession? = null
+            var deviceName = "Active microphone"
+            synchronized(lifecycleLock) {
+                if (isRunning.get() && activeSession != null) {
+                    val currentRoutedDeviceId = _uiState.value.routedDeviceId
+                    val targetDeviceId = activeConfig.preferredDeviceId
+                    val removedActive = removedDevices?.firstOrNull { dev ->
+                        dev.id == targetDeviceId || dev.id == currentRoutedDeviceId
+                    }
+                    if (removedActive != null) {
+                        deviceName = removedActive.productName?.toString()?.takeIf { it.isNotBlank() } ?: "Active microphone"
+                        sessionToNotify = activeSession
+                    }
                 }
-                if (removedActive != null) {
-                    val name = removedActive.productName?.toString()?.takeIf { it.isNotBlank() } ?: "Active microphone"
-                    val msg = "$name was disconnected during active capture."
-                    Log.w(TAG, msg)
-                    activeSession?.let { notifyCaptureError(it, msg) }
-                }
+            }
+            if (sessionToNotify != null) {
+                val msg = "$deviceName was disconnected during active capture."
+                Log.w(TAG, msg)
+                notifyCaptureError(sessionToNotify!!, msg)
             }
         }
     }
@@ -249,20 +266,23 @@ class AudioCaptureManager(
         try {
             val devices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
             val selectedId = activeConfig.preferredDeviceId
-            val currentRoutedDeviceId = _uiState.value.routedDeviceId
+            synchronized(lifecycleLock) {
+                val current = _uiState.value
+                val currentRoutedDeviceId = current.routedDeviceId
 
-            val deviceList = devices.map { device ->
-                AudioInputDeviceInfo.fromAudioDeviceInfo(
-                    device = device,
-                    isSelected = (selectedId != null && device.id == selectedId) || (selectedId == null && device.type == AudioDeviceInfo.TYPE_BUILTIN_MIC),
-                    isCurrentlyRouted = currentRoutedDeviceId != null && device.id == currentRoutedDeviceId
+                val deviceList = devices.map { device ->
+                    AudioInputDeviceInfo.fromAudioDeviceInfo(
+                        device = device,
+                        isSelected = (selectedId != null && device.id == selectedId) || (selectedId == null && device.type == AudioDeviceInfo.TYPE_BUILTIN_MIC),
+                        isCurrentlyRouted = currentRoutedDeviceId != null && device.id == currentRoutedDeviceId
+                    )
+                }
+
+                _uiState.value = current.copy(
+                    availableInputDevices = deviceList,
+                    selectedDeviceId = selectedId
                 )
             }
-
-            _uiState.value = _uiState.value.copy(
-                availableInputDevices = deviceList,
-                selectedDeviceId = selectedId
-            )
         } catch (e: Exception) {
             Log.w(TAG, "Failed to query audio input devices", e)
         }
@@ -353,25 +373,38 @@ class AudioCaptureManager(
     }
 
     /**
-     * Initiates audio capture. Safe to call from any thread.
+     * Initiates audio capture. Safe to call concurrently from any thread.
      */
     @SuppressLint("MissingPermission")
-    @Synchronized
     fun startCapture(): Boolean {
-        if (isRunning.get() && activeSession?.let { !it.isCleanedUp() } == true) {
-            Log.d(TAG, "Capture already in progress")
-            return true
+        var sessionToClean: CaptureSession? = null
+        var threadToInterrupt: Thread? = null
+
+        synchronized(lifecycleLock) {
+            if (isRunning.get() && activeSession?.let { !it.isCleanedUp() } == true) {
+                Log.d(TAG, "Capture already in progress")
+                return true
+            }
+
+            // Clean up any stale or lingering session before starting anew
+            sessionToClean = activeSession
+            activeSession = null
+            isRunning.set(false)
+            threadToInterrupt = captureThread
+            captureThread = null
+
+            _uiState.value = _uiState.value.copy(
+                status = CaptureStatus.INITIALIZING,
+                errorMessage = null
+            )
         }
 
-        // Clean up any stale or lingering session before starting anew
-        activeSession?.cleanup()
-        activeSession = null
-        isRunning.set(false)
-
-        _uiState.value = _uiState.value.copy(
-            status = CaptureStatus.INITIALIZING,
-            errorMessage = null
-        )
+        sessionToClean?.cleanup()
+        try {
+            threadToInterrupt?.interrupt()
+        } catch (e: Exception) {
+            Log.w(TAG, "Exception interrupting capture thread", e)
+        }
 
         val rateResolution = resolveSampleRate()
         val requestedRate = rateResolution.resolvedRate
@@ -399,10 +432,14 @@ class AudioCaptureManager(
         if (minBufferSize <= 0 || minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) {
             val errorMsg = "Audio hardware rejected buffer parameters (AudioRecord.getMinBufferSize error: $minBufferSize)"
             Log.e(TAG, errorMsg)
-            _uiState.value = _uiState.value.copy(
-                status = CaptureStatus.ERROR,
-                errorMessage = errorMsg
-            )
+            synchronized(lifecycleLock) {
+                if (_uiState.value.status == CaptureStatus.INITIALIZING && activeSession == null) {
+                    _uiState.value = _uiState.value.copy(
+                        status = CaptureStatus.ERROR,
+                        errorMessage = errorMsg
+                    )
+                }
+            }
             return false
         }
 
@@ -422,10 +459,14 @@ class AudioCaptureManager(
         if (sourceNegotiation == null) {
             val errorMsg = "Failed to initialize AudioRecord with UNPROCESSED or MIC source"
             Log.e(TAG, errorMsg)
-            _uiState.value = _uiState.value.copy(
-                status = CaptureStatus.ERROR,
-                errorMessage = errorMsg
-            )
+            synchronized(lifecycleLock) {
+                if (_uiState.value.status == CaptureStatus.INITIALIZING && activeSession == null) {
+                    _uiState.value = _uiState.value.copy(
+                        status = CaptureStatus.ERROR,
+                        errorMessage = errorMsg
+                    )
+                }
+            }
             return false
         }
 
@@ -460,8 +501,9 @@ class AudioCaptureManager(
 
             // Attach routing listener bound to this generation session
             val listener = AudioRecord.OnRoutingChangedListener { audRecord ->
-                if (isCurrentSession(session)) {
-                    updateActualRoutedDevice(audRecord.routedDevice, targetDevice)
+                onPreRoutingUpdate?.invoke()
+                synchronized(lifecycleLock) {
+                    updateActualRoutedDeviceLocked(session, audRecord?.routedDevice ?: session.record.routedDevice, targetDevice)
                 }
             }
             session.routingListener = listener
@@ -477,47 +519,63 @@ class AudioCaptureManager(
 
             val inputDeviceName = targetDevice?.productName?.toString() ?: getPrimaryInputDeviceName()
 
-            activeSession = session
-            isRunning.set(true)
+            var threadToStart: Thread? = null
+            synchronized(lifecycleLock) {
+                // Check if stopCapture was called while we were initializing hardware
+                if (_uiState.value.status != CaptureStatus.INITIALIZING || activeSession != null) {
+                    Log.w(TAG, "Capture initialization aborted; state is no longer INITIALIZING for generation $generation")
+                    session.cleanup()
+                    return false
+                }
 
-            _uiState.value = _uiState.value.copy(
-                status = CaptureStatus.RUNNING,
-                errorMessage = null,
-                diagnostics = AudioCaptureDiagnostics(
-                    activeAudioSource = activeSourceName,
-                    requestedSampleRate = requestedRate,
-                    actualSampleRate = sampleRate,
-                    detectedInputRate = rateResolution.detectedInputRate,
-                    detectedOutputRate = rateResolution.detectedOutputRate,
-                    inputDeviceName = inputDeviceName,
-                    requestedDeviceName = targetDevice?.productName?.toString() ?: "Auto (System Default)",
-                    actualRoutedDeviceName = inputDeviceName,
-                    windowSize = windowSize,
-                    hopSize = hopSize,
-                    bufferSizeInBytes = hardwareBufferSize,
-                    minBufferSizeInBytes = minBufferSize
+                activeSession = session
+                isRunning.set(true)
+
+                _uiState.value = _uiState.value.copy(
+                    status = CaptureStatus.RUNNING,
+                    errorMessage = null,
+                    diagnostics = AudioCaptureDiagnostics(
+                        activeAudioSource = activeSourceName,
+                        requestedSampleRate = requestedRate,
+                        actualSampleRate = sampleRate,
+                        detectedInputRate = rateResolution.detectedInputRate,
+                        detectedOutputRate = rateResolution.detectedOutputRate,
+                        inputDeviceName = inputDeviceName,
+                        requestedDeviceName = targetDevice?.productName?.toString() ?: "Auto (System Default)",
+                        actualRoutedDeviceName = inputDeviceName,
+                        windowSize = windowSize,
+                        hopSize = hopSize,
+                        bufferSizeInBytes = hardwareBufferSize,
+                        minBufferSizeInBytes = minBufferSize
+                    )
                 )
-            )
 
-            // 4. Launch dedicated real-time audio thread
-            val thread = Thread({
-                runAudioCaptureLoop(session)
-            }, "AudioCaptureThread-$generation")
+                // 4. Launch dedicated real-time audio thread
+                val thread = Thread({
+                    runAudioCaptureLoop(session)
+                }, "AudioCaptureThread-$generation")
 
-            captureThread = thread
-            thread.start()
+                captureThread = thread
+                threadToStart = thread
+            }
+
+            threadToStart?.start()
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Exception starting capture session $generation", e)
             session.cleanup()
-            if (activeSession === session) {
-                activeSession = null
-                isRunning.set(false)
+            synchronized(lifecycleLock) {
+                if (activeSession === session) {
+                    activeSession = null
+                    isRunning.set(false)
+                }
+                if (_uiState.value.status == CaptureStatus.INITIALIZING || activeSession === session) {
+                    _uiState.value = _uiState.value.copy(
+                        status = CaptureStatus.ERROR,
+                        errorMessage = "Failed to launch capture thread: ${e.message}"
+                    )
+                }
             }
-            _uiState.value = _uiState.value.copy(
-                status = CaptureStatus.ERROR,
-                errorMessage = "Failed to launch capture thread: ${e.message}"
-            )
             return false
         }
     }
@@ -547,8 +605,8 @@ class AudioCaptureManager(
                 )
                 return
             }
-            if (isCurrentSession(session)) {
-                updateActualRoutedDevice(record.routedDevice, session.targetDevice)
+            synchronized(lifecycleLock) {
+                updateActualRoutedDeviceLocked(session, record.routedDevice, session.targetDevice)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Exception starting AudioRecord for session ${session.generation}", e)
@@ -612,33 +670,34 @@ class AudioCaptureManager(
                             lastFpsTimeNs = nowNs
                         }
 
-                        // Update UI state diagnostics if this worker still owns the active session
-                        if (isCurrentSession(session)) {
-                            _uiState.value = _uiState.value.let { current ->
-                                current.copy(
-                                    rmsDb = rmsDb,
-                                    peakDb = peakDb,
-                                    isClipping = isClipping,
-                                    octave31Db = octave31FilterDb,
-                                    rawFftDb = fftResult.rawFftDb,
-                                    diagnostics = current.diagnostics.copy(
-                                        totalFramesCaptured = totalFrames,
-                                        fps = currentFps,
-                                        consecutiveZeroReads = 0,
-                                        fftExecutionTimeUs = fftResult.executionTimeUs,
-                                        filterBankExecutionTimeUs = biquadFilterBank.lastExecutionTimeUs
-                                    )
-                                )
-                            }
+                        // Test hook to intercept execution right before publication
+                        onPrePublishFrame?.invoke(session.generation)
+
+                        val published = publishFrame(
+                            session = session,
+                            rmsDb = rmsDb,
+                            peakDb = peakDb,
+                            isClipping = isClipping,
+                            octave31Db = octave31FilterDb,
+                            rawFftDb = fftResult.rawFftDb,
+                            totalFrames = totalFrames,
+                            fps = currentFps,
+                            fftExecutionTimeUs = fftResult.executionTimeUs,
+                            filterBankExecutionTimeUs = biquadFilterBank.lastExecutionTimeUs
+                        )
+
+                        if (!published && (!isRunning.get() || !isCurrentSession(session))) {
+                            break
                         }
 
                         hopSamplesAccumulated = 0
                     }
                 } else if (readResult == 0) {
                     consecutiveZeroReads++
-                    if (isCurrentSession(session)) {
-                        _uiState.value = _uiState.value.let { current ->
-                            current.copy(
+                    synchronized(lifecycleLock) {
+                        if (activeSession === session && isRunning.get() && !session.isCleanedUp() && _uiState.value.status == CaptureStatus.RUNNING) {
+                            val current = _uiState.value
+                            _uiState.value = current.copy(
                                 diagnostics = current.diagnostics.copy(
                                     consecutiveZeroReads = consecutiveZeroReads
                                 )
@@ -665,7 +724,7 @@ class AudioCaptureManager(
             notifyCaptureError(session, "Capture loop error: ${e.message}")
         } finally {
             session.cleanup()
-            synchronized(this) {
+            synchronized(lifecycleLock) {
                 if (activeSession === session) {
                     activeSession = null
                     isRunning.set(false)
@@ -675,8 +734,48 @@ class AudioCaptureManager(
         }
     }
 
+    /**
+     * Atomically publishes computed audio frame measurements to UI state.
+     * Rejects updates from obsolete, interrupted, or stopped capture sessions.
+     */
+    private fun publishFrame(
+        session: CaptureSession,
+        rmsDb: Float,
+        peakDb: Float,
+        isClipping: Boolean,
+        octave31Db: FloatArray,
+        rawFftDb: FloatArray,
+        totalFrames: Long,
+        fps: Float,
+        fftExecutionTimeUs: Long,
+        filterBankExecutionTimeUs: Long
+    ): Boolean {
+        synchronized(lifecycleLock) {
+            if (activeSession !== session || !isRunning.get() || session.isCleanedUp() || _uiState.value.status != CaptureStatus.RUNNING) {
+                return false
+            }
+            val current = _uiState.value
+            _uiState.value = current.copy(
+                rmsDb = rmsDb,
+                peakDb = peakDb,
+                isClipping = isClipping,
+                octave31Db = octave31Db,
+                rawFftDb = rawFftDb,
+                diagnostics = current.diagnostics.copy(
+                    totalFramesCaptured = totalFrames,
+                    fps = fps,
+                    consecutiveZeroReads = 0,
+                    fftExecutionTimeUs = fftExecutionTimeUs,
+                    filterBankExecutionTimeUs = filterBankExecutionTimeUs
+                )
+            )
+            return true
+        }
+    }
+
     private fun notifyCaptureError(session: CaptureSession, message: String) {
-        synchronized(this) {
+        var shouldClean = false
+        synchronized(lifecycleLock) {
             if (activeSession === session) {
                 isRunning.set(false)
                 activeSession = null
@@ -684,43 +783,61 @@ class AudioCaptureManager(
                     status = CaptureStatus.ERROR,
                     errorMessage = message
                 )
+                shouldClean = true
             } else {
                 Log.w(TAG, "Suppressed stale capture error from session ${session.generation}: $message")
             }
         }
-        session.cleanup()
+        if (shouldClean) {
+            session.cleanup()
+        }
     }
 
     /**
      * Gracefully terminates audio capture and frees hardware resources.
      */
-    @Synchronized
     fun stopCapture() {
-        val session = activeSession
-        activeSession = null
-        isRunning.set(false)
+        val sessionToClean: CaptureSession?
+        val threadToInterrupt: Thread?
 
-        session?.cleanup()
+        synchronized(lifecycleLock) {
+            sessionToClean = activeSession
+            activeSession = null
+            isRunning.set(false)
+            threadToInterrupt = captureThread
+            captureThread = null
+
+            _uiState.value = _uiState.value.copy(
+                status = CaptureStatus.STOPPED,
+                errorMessage = null,
+                isClipping = false
+            )
+        }
+
+        sessionToClean?.cleanup()
 
         try {
-            captureThread?.interrupt()
-            captureThread = null
+            threadToInterrupt?.interrupt()
         } catch (e: Exception) {
             Log.w(TAG, "Exception interrupting capture thread", e)
         }
-
-        _uiState.value = _uiState.value.copy(
-            status = CaptureStatus.STOPPED,
-            errorMessage = null,
-            isClipping = false
-        )
     }
 
     fun setDisplayMode(mode: FftDisplayMode) {
-        _uiState.value = _uiState.value.copy(displayMode = mode)
+        synchronized(lifecycleLock) {
+            _uiState.value = _uiState.value.copy(displayMode = mode)
+        }
     }
 
-    private fun updateActualRoutedDevice(routedDevice: AudioDeviceInfo?, targetDevice: AudioDeviceInfo?) {
+    private fun updateActualRoutedDeviceLocked(
+        session: CaptureSession,
+        routedDevice: AudioDeviceInfo?,
+        targetDevice: AudioDeviceInfo?
+    ) {
+        if (activeSession !== session || !isRunning.get() || session.isCleanedUp() || _uiState.value.status != CaptureStatus.RUNNING) {
+            return
+        }
+
         val actualName = routedDevice?.productName?.toString()?.takeIf { it.isNotBlank() }
             ?: if (routedDevice != null) {
                 AudioInputDeviceInfo.classifyDevice(routedDevice.type).second
@@ -753,38 +870,40 @@ class AudioCaptureManager(
         val routedId = routedDevice?.id
         val selectedId = activeConfig.preferredDeviceId
 
-        _uiState.value = _uiState.value.let { current ->
-            current.copy(
-                routedDeviceId = routedId,
-                selectedDeviceId = selectedId,
-                isRoutingMismatch = isMismatch,
-                routingMismatchMessage = mismatchMessage,
-                isBluetoothBandwidthLimited = isBtLimited,
-                bluetoothWarningText = btWarning,
-                availableInputDevices = current.availableInputDevices.map { dev ->
-                    dev.copy(
-                        isSelected = (selectedId != null && dev.id == selectedId) || (selectedId == null && dev.isBuiltIn),
-                        isCurrentlyRouted = routedId != null && dev.id == routedId
-                    )
-                },
-                diagnostics = current.diagnostics.copy(
-                    inputDeviceName = actualName,
-                    requestedDeviceName = targetDevice?.productName?.toString() ?: "Auto (System Default)",
-                    actualRoutedDeviceName = actualName,
-                    actualRoutedDeviceType = actualType,
-                    isUsbDevice = isUsb,
-                    isRoutingMismatch = isMismatch,
-                    isBluetoothBandwidthLimited = isBtLimited,
-                    bluetoothWarningText = btWarning
+        val current = _uiState.value
+        _uiState.value = current.copy(
+            routedDeviceId = routedId,
+            selectedDeviceId = selectedId,
+            isRoutingMismatch = isMismatch,
+            routingMismatchMessage = mismatchMessage,
+            isBluetoothBandwidthLimited = isBtLimited,
+            bluetoothWarningText = btWarning,
+            availableInputDevices = current.availableInputDevices.map { dev ->
+                dev.copy(
+                    isSelected = (selectedId != null && dev.id == selectedId) || (selectedId == null && dev.isBuiltIn),
+                    isCurrentlyRouted = routedId != null && dev.id == routedId
                 )
+            },
+            diagnostics = current.diagnostics.copy(
+                inputDeviceName = actualName,
+                requestedDeviceName = targetDevice?.productName?.toString() ?: "Auto (System Default)",
+                actualRoutedDeviceName = actualName,
+                actualRoutedDeviceType = actualType,
+                isUsbDevice = isUsb,
+                isRoutingMismatch = isMismatch,
+                isBluetoothBandwidthLimited = isBtLimited,
+                bluetoothWarningText = btWarning
             )
-        }
+        )
         Log.i(TAG, "Active routed input device: $actualName (type: $actualType, id: $routedId), mismatch: $isMismatch, BT limited: $isBtLimited")
     }
 
     fun setPreferredInputDevice(deviceId: Int?) {
         activeConfig = activeConfig.copy(preferredDeviceId = deviceId)
-        val wasRunning = isRunning.get()
+        val wasRunning: Boolean
+        synchronized(lifecycleLock) {
+            wasRunning = isRunning.get()
+        }
         if (wasRunning) {
             stopCapture()
         }
@@ -795,7 +914,9 @@ class AudioCaptureManager(
     }
 
     fun dismissDevicePrompt() {
-        _uiState.value = _uiState.value.copy(deviceAttachedPrompt = null)
+        synchronized(lifecycleLock) {
+            _uiState.value = _uiState.value.copy(deviceAttachedPrompt = null)
+        }
     }
 
     fun release() {
