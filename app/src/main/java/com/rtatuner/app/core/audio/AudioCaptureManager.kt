@@ -137,14 +137,29 @@ internal class CaptureSession(
      * Attempts to start recording under sessionLock.
      * Prevents race condition B03: if cleanup() has already started or completed,
      * startRecording() returns false immediately without invoking record.startRecording().
+     * Handles synthetic reentrancy where cleanup is invoked synchronously during startRecording.
      */
     fun startRecording(): Boolean {
         synchronized(sessionLock) {
             if (isCleanedUp) {
                 return false
             }
-            record.startRecording()
-            if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+            try {
+                record.startRecording()
+            } catch (e: Exception) {
+                Log.e("AudioCaptureManager", "Exception in record.startRecording for session $generation", e)
+                throw e
+            }
+            if (isCleanedUp) {
+                return false
+            }
+            val recState = try {
+                record.recordingState
+            } catch (e: Exception) {
+                Log.w("AudioCaptureManager", "Exception querying recordingState after start in session $generation", e)
+                AudioRecord.RECORDSTATE_STOPPED
+            }
+            if (recState == AudioRecord.RECORDSTATE_RECORDING) {
                 isRecordingStarted = true
                 return true
             }
@@ -156,7 +171,8 @@ internal class CaptureSession(
      * Cleans up the session and releases the hardware recorder.
      * Synchronized on sessionLock to prevent race condition B03 (overlapping with startRecording).
      * Guaranteed idempotent (runs at most once).
-     * Hardware stop and release operations execute outside any manager-wide lock (B02).
+     * Hardware stop, release, and listener removal operations execute outside any manager-wide lock (B02).
+     * Fully exception-resilient (B06): failures querying state or releasing never prevent release attempt.
      */
     fun cleanup() {
         var listenerToRemove: AudioRecord.OnRoutingChangedListener? = null
@@ -169,7 +185,15 @@ internal class CaptureSession(
             isCleanedUp = true
             listenerToRemove = routingListener
             routingListener = null
-            shouldStop = isRecordingStarted || (record.recordingState == AudioRecord.RECORDSTATE_RECORDING)
+            shouldStop = isRecordingStarted
+        }
+
+        if (!shouldStop) {
+            try {
+                shouldStop = (record.recordingState == AudioRecord.RECORDSTATE_RECORDING)
+            } catch (e: Exception) {
+                Log.w("AudioCaptureManager", "Exception querying recordingState during cleanup in session $generation", e)
+            }
         }
 
         if (listenerToRemove != null) {
@@ -248,6 +272,8 @@ class AudioCaptureManager(
     private val sessionGeneration = AtomicLong(0L)
     private var nextAttemptToken = 1L
     private var activeAttemptToken = 0L
+    private var nextReconfigurationToken = 1L
+    private var activeRestartToken = 0L
     @Volatile
     private var activeSession: CaptureSession? = null
     private var captureThread: Thread? = null
@@ -261,8 +287,14 @@ class AudioCaptureManager(
     internal var onPreStartRecording: ((session: CaptureSession) -> Unit)? = null
     internal var onPrePublishFrame: ((sessionGeneration: Long) -> Unit)? = null
     internal var onPreRoutingUpdate: (() -> Unit)? = null
+    internal var onPreReconfigurationRestart: ((token: Long) -> Unit)? = null
+    internal var threadLauncher: (thread: Thread) -> Unit = { it.start() }
 
     private var activeConfig: AudioCaptureConfig = config
+
+    private fun isFatalError(t: Throwable): Boolean {
+        return t is VirtualMachineError || t is ThreadDeath || t is LinkageError
+    }
 
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
@@ -277,10 +309,12 @@ class AudioCaptureManager(
                     device.type == AudioDeviceInfo.TYPE_LINE_ANALOG
                 )
             }
-            if (externalInput != null && externalInput.id != activeConfig.preferredDeviceId) {
-                val inputInfo = AudioInputDeviceInfo.fromAudioDeviceInfo(externalInput)
+            if (externalInput != null) {
                 synchronized(lifecycleLock) {
-                    _uiState.value = _uiState.value.copy(deviceAttachedPrompt = inputInfo)
+                    if (externalInput.id != activeConfig.preferredDeviceId) {
+                        val inputInfo = AudioInputDeviceInfo.fromAudioDeviceInfo(externalInput)
+                        _uiState.value = _uiState.value.copy(deviceAttachedPrompt = inputInfo)
+                    }
                 }
             }
         }
@@ -323,8 +357,8 @@ class AudioCaptureManager(
     fun refreshInputDevices() {
         try {
             val devices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-            val selectedId = activeConfig.preferredDeviceId
             synchronized(lifecycleLock) {
+                val selectedId = activeConfig.preferredDeviceId
                 val current = _uiState.value
                 val currentRoutedDeviceId = current.routedDeviceId
 
@@ -352,8 +386,9 @@ class AudioCaptureManager(
      * and logs warnings on discrepancy.
      */
     fun resolveSampleRate(): SampleRateResolution {
-        return resolveSampleRateForConfig(
-            CaptureAttemptConfig(
+        val configSnapshot: CaptureAttemptConfig
+        synchronized(lifecycleLock) {
+            configSnapshot = CaptureAttemptConfig(
                 token = 0L,
                 windowSize = activeConfig.windowSize,
                 hopSize = activeConfig.hopSize,
@@ -361,7 +396,8 @@ class AudioCaptureManager(
                 preferredDeviceId = activeConfig.preferredDeviceId,
                 targetSampleRate = activeConfig.targetSampleRate
             )
-        )
+        }
+        return resolveSampleRateForConfig(configSnapshot)
     }
 
     internal fun resolveSampleRateForConfig(attemptConfig: CaptureAttemptConfig): SampleRateResolution {
@@ -450,22 +486,39 @@ class AudioCaptureManager(
      */
     @SuppressLint("MissingPermission")
     fun startCapture(): Boolean {
+        return startCaptureInternal(authorizedRestartToken = null)
+    }
+
+    @SuppressLint("MissingPermission")
+    internal fun startCaptureInternal(authorizedRestartToken: Long? = null): Boolean {
         var sessionToClean: CaptureSession? = null
         var threadToInterrupt: Thread? = null
         val attemptToken: Long
         val attemptConfig: CaptureAttemptConfig
 
         synchronized(lifecycleLock) {
-            if (isRunning.get() && activeSession?.let { !it.isCleanedUp() } == true) {
-                Log.d(TAG, "Capture already in progress")
-                return true
+            if (authorizedRestartToken != null) {
+                // Validate restart token immediately under lifecycleLock (B04)
+                if (activeRestartToken != authorizedRestartToken) {
+                    Log.w(TAG, "Reconfiguration restart aborted; token $authorizedRestartToken superseded or canceled (active=$activeRestartToken)")
+                    return false
+                }
+                activeRestartToken = 0L
+            } else {
+                // Public startCapture() supersedes any pending automatic restart
+                activeRestartToken = 0L
+
+                if (isRunning.get() && activeSession?.let { !it.isCleanedUp() } == true) {
+                    Log.d(TAG, "Capture already in progress")
+                    return true
+                }
             }
 
             // Allocate a unique, monotonically increasing attempt token under lifecycleLock (B01)
             attemptToken = nextAttemptToken++
             activeAttemptToken = attemptToken
 
-            // Capture an immutable configuration snapshot for this attempt (B01)
+            // Capture an immutable configuration snapshot for this attempt (B01, B07)
             attemptConfig = CaptureAttemptConfig(
                 token = attemptToken,
                 windowSize = activeConfig.windowSize,
@@ -484,7 +537,8 @@ class AudioCaptureManager(
 
             _uiState.value = _uiState.value.copy(
                 status = CaptureStatus.INITIALIZING,
-                errorMessage = null
+                errorMessage = null,
+                routedDeviceId = null
             )
         }
 
@@ -496,109 +550,115 @@ class AudioCaptureManager(
             Log.w(TAG, "Exception interrupting capture thread", e)
         }
 
-        onPreHardwareInit?.invoke(attemptToken)
+        var newlyCreatedRecord: AudioRecordSource? = null
+        var createdSession: CaptureSession? = null
 
-        val rateResolution = resolveSampleRateForConfig(attemptConfig)
-        val requestedRate = rateResolution.resolvedRate
+        try {
+            onPreHardwareInit?.invoke(attemptToken)
 
-        // 1. Validate AudioRecord buffer size defensively against negative error codes
-        var sampleRate = requestedRate
-        var minBufferSize = minBufferSizeProvider(
-            sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
+            val rateResolution = resolveSampleRateForConfig(attemptConfig)
+            val requestedRate = rateResolution.resolvedRate
 
-        // If primary rate fails, test fallback sample rate
-        if (minBufferSize <= 0 || minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) {
-            val altRate = if (sampleRate == DEFAULT_SAMPLE_RATE) FALLBACK_SAMPLE_RATE else DEFAULT_SAMPLE_RATE
-            Log.w(TAG, "Invalid minBufferSize ($minBufferSize) for $sampleRate Hz. Attempting fallback: $altRate Hz")
-            sampleRate = altRate
-            minBufferSize = minBufferSizeProvider(
+            // 1. Validate AudioRecord buffer size defensively against negative error codes
+            var sampleRate = requestedRate
+            var minBufferSize = minBufferSizeProvider(
                 sampleRate,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-        }
 
-        if (minBufferSize <= 0 || minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) {
-            val errorMsg = "Audio hardware rejected buffer parameters (AudioRecord.getMinBufferSize error: $minBufferSize)"
-            Log.e(TAG, errorMsg)
-            synchronized(lifecycleLock) {
-                // Scoped strictly to owning attempt (B01)
-                if (activeAttemptToken == attemptToken && activeSession == null) {
-                    activeAttemptToken = 0L
-                    _uiState.value = _uiState.value.copy(
-                        status = CaptureStatus.ERROR,
-                        errorMessage = errorMsg
-                    )
-                } else {
-                    Log.w(TAG, "Suppressed buffer-size error from obsolete attempt $attemptToken")
+            // If primary rate fails, test fallback sample rate
+            if (minBufferSize <= 0 || minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) {
+                val altRate = if (sampleRate == DEFAULT_SAMPLE_RATE) FALLBACK_SAMPLE_RATE else DEFAULT_SAMPLE_RATE
+                Log.w(TAG, "Invalid minBufferSize ($minBufferSize) for $sampleRate Hz. Attempting fallback: $altRate Hz")
+                sampleRate = altRate
+                minBufferSize = minBufferSizeProvider(
+                    sampleRate,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT
+                )
+            }
+
+            if (minBufferSize <= 0 || minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) {
+                val errorMsg = "Audio hardware rejected buffer parameters (AudioRecord.getMinBufferSize error: $minBufferSize)"
+                Log.e(TAG, errorMsg)
+                synchronized(lifecycleLock) {
+                    if (activeAttemptToken == attemptToken && activeSession == null) {
+                        activeAttemptToken = 0L
+                        _uiState.value = _uiState.value.copy(
+                            status = CaptureStatus.ERROR,
+                            errorMessage = errorMsg,
+                            routedDeviceId = null
+                        )
+                    } else {
+                        Log.w(TAG, "Suppressed buffer-size error from obsolete attempt $attemptToken")
+                    }
+                }
+                return false
+            }
+
+            // 2. Compute safe hardware buffer size (must be at least 2x our FFT window to prevent overrun)
+            val windowSize = attemptConfig.windowSize
+            val hopSize = attemptConfig.hopSize
+            val windowBytes = windowSize * 2 // 16-bit PCM = 2 bytes per sample
+            val hardwareBufferSize = max(minBufferSize, windowBytes * 2)
+
+            // 3. Negotiate AudioSource (Try UNPROCESSED -> Fallback to MIC)
+            val sourceNegotiation = createAudioRecordWithFallback(
+                preferredSource = attemptConfig.preferredAudioSource,
+                sampleRate = sampleRate,
+                bufferSizeInBytes = hardwareBufferSize
+            )
+
+            if (sourceNegotiation == null) {
+                val errorMsg = "Failed to initialize AudioRecord with UNPROCESSED or MIC source"
+                Log.e(TAG, errorMsg)
+                synchronized(lifecycleLock) {
+                    if (activeAttemptToken == attemptToken && activeSession == null) {
+                        activeAttemptToken = 0L
+                        _uiState.value = _uiState.value.copy(
+                            status = CaptureStatus.ERROR,
+                            errorMessage = errorMsg,
+                            routedDeviceId = null
+                        )
+                    } else {
+                        Log.w(TAG, "Suppressed source-negotiation error from obsolete attempt $attemptToken")
+                    }
+                }
+                return false
+            }
+
+            newlyCreatedRecord = sourceNegotiation.record
+            val activeSourceName = sourceNegotiation.sourceName
+
+            onPostHardwareInit?.invoke(attemptToken)
+
+            // Look up target device from snapshot
+            val targetDevice = attemptConfig.preferredDeviceId?.let { prefId ->
+                try {
+                    audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.id == prefId }
+                } catch (e: Exception) {
+                    null
                 }
             }
-            return false
-        }
 
-        // 2. Compute safe hardware buffer size (must be at least 2x our FFT window to prevent overrun)
-        val windowSize = attemptConfig.windowSize
-        val hopSize = attemptConfig.hopSize
-        val windowBytes = windowSize * 2 // 16-bit PCM = 2 bytes per sample
-        val hardwareBufferSize = max(minBufferSize, windowBytes * 2)
+            val generation = sessionGeneration.incrementAndGet()
+            val session = CaptureSession(
+                attemptToken = attemptToken,
+                generation = generation,
+                record = newlyCreatedRecord,
+                targetDevice = targetDevice,
+                requestedRate = requestedRate,
+                actualRate = sampleRate,
+                windowSize = windowSize,
+                hopSize = hopSize
+            )
+            // Transfer ownership to session
+            createdSession = session
+            newlyCreatedRecord = null
 
-        // 3. Negotiate AudioSource (Try UNPROCESSED -> Fallback to MIC)
-        val sourceNegotiation = createAudioRecordWithFallback(
-            preferredSource = attemptConfig.preferredAudioSource,
-            sampleRate = sampleRate,
-            bufferSizeInBytes = hardwareBufferSize
-        )
-
-        if (sourceNegotiation == null) {
-            val errorMsg = "Failed to initialize AudioRecord with UNPROCESSED or MIC source"
-            Log.e(TAG, errorMsg)
-            synchronized(lifecycleLock) {
-                // Scoped strictly to owning attempt (B01)
-                if (activeAttemptToken == attemptToken && activeSession == null) {
-                    activeAttemptToken = 0L
-                    _uiState.value = _uiState.value.copy(
-                        status = CaptureStatus.ERROR,
-                        errorMessage = errorMsg
-                    )
-                } else {
-                    Log.w(TAG, "Suppressed source-negotiation error from obsolete attempt $attemptToken")
-                }
-            }
-            return false
-        }
-
-        val record = sourceNegotiation.record
-        val activeSourceName = sourceNegotiation.sourceName
-
-        onPostHardwareInit?.invoke(attemptToken)
-
-        // Look up target device from snapshot
-        val targetDevice = attemptConfig.preferredDeviceId?.let { prefId ->
-            try {
-                audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.id == prefId }
-            } catch (e: Exception) {
-                null
-            }
-        }
-
-        val generation = sessionGeneration.incrementAndGet()
-        val session = CaptureSession(
-            attemptToken = attemptToken,
-            generation = generation,
-            record = record,
-            targetDevice = targetDevice,
-            requestedRate = requestedRate,
-            actualRate = sampleRate,
-            windowSize = windowSize,
-            hopSize = hopSize
-        )
-
-        try {
             if (targetDevice != null) {
-                val setSuccess = record.setPreferredDevice(targetDevice)
+                val setSuccess = session.record.setPreferredDevice(targetDevice)
                 Log.i(TAG, "setPreferredDevice(${targetDevice.productName}, id=${targetDevice.id}) returned $setSuccess")
             }
 
@@ -611,14 +671,10 @@ class AudioCaptureManager(
             }
             session.routingListener = listener
 
-            try {
-                record.addOnRoutingChangedListener(
-                    listener,
-                    Handler(Looper.getMainLooper())
-                )
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to register OnRoutingChangedListener for session $generation", e)
-            }
+            session.record.addOnRoutingChangedListener(
+                listener,
+                Handler(Looper.getMainLooper())
+            )
 
             val inputDeviceName = targetDevice?.productName?.toString() ?: getPrimaryInputDeviceName()
 
@@ -669,22 +725,51 @@ class AudioCaptureManager(
                 return false
             }
 
-            threadToStart?.start()
+            threadToStart?.let { thread ->
+                threadLauncher(thread)
+            }
             return true
-        } catch (e: Exception) {
-            Log.e(TAG, "Exception starting capture session $generation", e)
-            session.cleanup()
+        } catch (t: Throwable) {
+            // Clean up all resources created by this attempt (B05, B06)
+            try {
+                if (createdSession != null) {
+                    createdSession.cleanup()
+                } else {
+                    newlyCreatedRecord?.release()
+                }
+            } catch (cleanEx: Exception) {
+                Log.w(TAG, "Exception cleaning up resources after initialization failure in attempt $attemptToken", cleanEx)
+            }
+
+            // For fatal JVM errors, preserve error propagation while avoiding resource leaks (B05)
+            if (isFatalError(t)) {
+                synchronized(lifecycleLock) {
+                    if (activeAttemptToken == attemptToken) {
+                        activeAttemptToken = 0L
+                        if (activeSession === createdSession) {
+                            activeSession = null
+                            isRunning.set(false)
+                        }
+                    }
+                }
+                throw t
+            }
+
+            Log.e(TAG, "Exception during capture initialization for attempt $attemptToken", t)
             synchronized(lifecycleLock) {
                 if (activeAttemptToken == attemptToken) {
                     activeAttemptToken = 0L
-                    if (activeSession === session) {
+                    if (activeSession === createdSession) {
                         activeSession = null
                         isRunning.set(false)
                     }
                     _uiState.value = _uiState.value.copy(
                         status = CaptureStatus.ERROR,
-                        errorMessage = "Failed to launch capture thread: ${e.message}"
+                        errorMessage = "Capture initialization failed: ${t.message ?: t.javaClass.simpleName}",
+                        routedDeviceId = null
                     )
+                } else {
+                    Log.w(TAG, "Suppressed initialization error from obsolete attempt $attemptToken: ${t.message}")
                 }
             }
             return false
@@ -898,7 +983,8 @@ class AudioCaptureManager(
                 activeAttemptToken = 0L
                 _uiState.value = _uiState.value.copy(
                     status = CaptureStatus.ERROR,
-                    errorMessage = message
+                    errorMessage = message,
+                    routedDeviceId = null
                 )
                 shouldClean = true
             } else {
@@ -918,7 +1004,8 @@ class AudioCaptureManager(
         val threadToInterrupt: Thread?
 
         synchronized(lifecycleLock) {
-            // Invalidate any active or in-flight initialization attempt (B01)
+            // Explicit stop invalidates any pending restart intentions and active attempts (B01, B04)
+            activeRestartToken = 0L
             activeAttemptToken = 0L
 
             sessionToClean = activeSession
@@ -930,7 +1017,8 @@ class AudioCaptureManager(
             _uiState.value = _uiState.value.copy(
                 status = CaptureStatus.STOPPED,
                 errorMessage = null,
-                isClipping = false
+                isClipping = false,
+                routedDeviceId = null
             )
         }
 
@@ -988,7 +1076,7 @@ class AudioCaptureManager(
         } else null
 
         val routedId = routedDevice?.id
-        val selectedId = activeConfig.preferredDeviceId
+        val selectedId = _uiState.value.selectedDeviceId
 
         val current = _uiState.value
         _uiState.value = current.copy(
@@ -1019,17 +1107,59 @@ class AudioCaptureManager(
     }
 
     fun setPreferredInputDevice(deviceId: Int?) {
-        activeConfig = activeConfig.copy(preferredDeviceId = deviceId)
-        val wasActive: Boolean
+        var sessionToClean: CaptureSession? = null
+        var threadToInterrupt: Thread? = null
+        val restartToken: Long?
+
         synchronized(lifecycleLock) {
-            wasActive = isRunning.get() || activeAttemptToken != 0L
+            // Mutate configuration strictly under lifecycleLock (B07)
+            activeConfig = activeConfig.copy(preferredDeviceId = deviceId)
+            val wasActive = isRunning.get() || activeAttemptToken != 0L
+
+            if (wasActive) {
+                // Reserve restart ownership under lifecycleLock (B04)
+                val token = nextReconfigurationToken++
+                activeRestartToken = token
+                restartToken = token
+
+                activeAttemptToken = 0L
+                sessionToClean = activeSession
+                activeSession = null
+                isRunning.set(false)
+                threadToInterrupt = captureThread
+                captureThread = null
+
+                _uiState.value = _uiState.value.copy(
+                    status = CaptureStatus.INITIALIZING,
+                    errorMessage = null,
+                    selectedDeviceId = deviceId,
+                    routedDeviceId = null
+                )
+            } else {
+                activeRestartToken = 0L
+                restartToken = null
+                _uiState.value = _uiState.value.copy(
+                    selectedDeviceId = deviceId,
+                    routedDeviceId = null
+                )
+            }
         }
-        if (wasActive) {
-            stopCapture()
+
+        // Blocking hardware release executed strictly outside lifecycleLock (B02, B04)
+        sessionToClean?.cleanup()
+        try {
+            threadToInterrupt?.interrupt()
+        } catch (e: Exception) {
+            Log.w(TAG, "Exception interrupting capture thread during device switch", e)
         }
+
         refreshInputDevices()
-        if (wasActive) {
-            startCapture()
+
+        onPreReconfigurationRestart?.invoke(restartToken ?: 0L)
+
+        // If restart was authorized, start capture only if restart token is still authoritative (B04)
+        if (restartToken != null) {
+            startCaptureInternal(authorizedRestartToken = restartToken)
         }
     }
 
@@ -1058,50 +1188,106 @@ class AudioCaptureManager(
         val audioEncoding = AudioFormat.ENCODING_PCM_16BIT
 
         // 1. Try preferred source (UNPROCESSED)
+        var primaryRecord: AudioRecordSource? = null
         try {
-            val record = audioRecordFactory.create(
+            primaryRecord = audioRecordFactory.create(
                 preferredSource,
                 sampleRate,
                 channelConfig,
                 audioEncoding,
                 bufferSizeInBytes
             )
-            if (record != null && record.state == AudioRecord.STATE_INITIALIZED) {
-                val name = if (preferredSource == MediaRecorder.AudioSource.UNPROCESSED) {
-                    "UNPROCESSED (Raw Direct HAL)"
-                } else {
-                    "AudioSource ($preferredSource)"
+            if (primaryRecord != null) {
+                val state = try {
+                    primaryRecord.state
+                } catch (e: Exception) {
+                    Log.w(TAG, "Exception probing state on preferred source $preferredSource", e)
+                    AudioRecord.STATE_UNINITIALIZED
                 }
-                Log.i(TAG, "Successfully initialized AudioRecord with source: $name")
-                return RecordNegotiationResult(record, name)
-            } else {
-                Log.w(TAG, "AudioRecord state not initialized with preferred source $preferredSource")
-                record?.release()
+                if (state == AudioRecord.STATE_INITIALIZED) {
+                    val name = if (preferredSource == MediaRecorder.AudioSource.UNPROCESSED) {
+                        "UNPROCESSED (Raw Direct HAL)"
+                    } else {
+                        "AudioSource ($preferredSource)"
+                    }
+                    Log.i(TAG, "Successfully initialized AudioRecord with source: $name")
+                    val result = RecordNegotiationResult(primaryRecord, name)
+                    primaryRecord = null // ownership successfully transferred
+                    return result
+                } else {
+                    Log.w(TAG, "AudioRecord state not initialized with preferred source $preferredSource")
+                    try {
+                        primaryRecord.release()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Exception releasing uninitialized primary record", e)
+                    }
+                    primaryRecord = null
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed creating AudioRecord with source $preferredSource: ${e.message}")
+            try {
+                primaryRecord?.release()
+            } catch (relEx: Exception) {
+                Log.w(TAG, "Exception releasing primary record after failure", relEx)
+            }
+            primaryRecord = null
+        } finally {
+            try {
+                primaryRecord?.release()
+            } catch (e: Exception) {
+                Log.w(TAG, "Exception releasing unowned primary record in finally", e)
+            }
         }
 
         // 2. Fallback to standard MIC
         if (preferredSource != MediaRecorder.AudioSource.MIC) {
+            var fallbackRecord: AudioRecordSource? = null
             try {
                 Log.i(TAG, "Attempting fallback to MediaRecorder.AudioSource.MIC")
-                val fallbackRecord = audioRecordFactory.create(
+                fallbackRecord = audioRecordFactory.create(
                     MediaRecorder.AudioSource.MIC,
                     sampleRate,
                     channelConfig,
                     audioEncoding,
                     bufferSizeInBytes
                 )
-                if (fallbackRecord != null && fallbackRecord.state == AudioRecord.STATE_INITIALIZED) {
-                    Log.i(TAG, "Successfully initialized fallback AudioRecord with source: MIC")
-                    return RecordNegotiationResult(fallbackRecord, "MIC (Fallback Source)")
-                } else {
-                    Log.e(TAG, "Fallback AudioRecord with MIC failed to initialize")
-                    fallbackRecord?.release()
+                if (fallbackRecord != null) {
+                    val fallbackState = try {
+                        fallbackRecord.state
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Exception probing state on fallback MIC source", e)
+                        AudioRecord.STATE_UNINITIALIZED
+                    }
+                    if (fallbackState == AudioRecord.STATE_INITIALIZED) {
+                        Log.i(TAG, "Successfully initialized fallback AudioRecord with source: MIC")
+                        val result = RecordNegotiationResult(fallbackRecord, "MIC (Fallback Source)")
+                        fallbackRecord = null // ownership successfully transferred
+                        return result
+                    } else {
+                        Log.e(TAG, "Fallback AudioRecord with MIC failed to initialize")
+                        try {
+                            fallbackRecord.release()
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Exception releasing uninitialized fallback record", e)
+                        }
+                        fallbackRecord = null
+                    }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Exception initializing fallback MIC AudioRecord", e)
+                try {
+                    fallbackRecord?.release()
+                } catch (relEx: Exception) {
+                    Log.w(TAG, "Exception releasing fallback record after failure", relEx)
+                }
+                fallbackRecord = null
+            } finally {
+                try {
+                    fallbackRecord?.release()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Exception releasing unowned fallback record in finally", e)
+                }
             }
         }
 
