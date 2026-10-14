@@ -598,4 +598,137 @@ class CalibrationTest {
         assertEquals(resetState, identicalResetState)
         assertEquals(resetState.hashCode(), identicalResetState.hashCode())
     }
+
+    // --- File-Picker Convention Selection & Import Path Verification ---
+
+    @Test
+    fun filePickerImportWithPositive3DbMeasuredResponseProducesMinus3DbOffsetAndAttenuation() {
+        val fileContent = """
+            # UMIK-1 / REW Format Calibration File
+            1000.0  3.0
+            2000.0  3.0
+        """.trimIndent()
+
+        val prefs = testPreferences()
+        val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
+        val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements))
+
+        // Simulate file picker import with MEASURED_RESPONSE chosen
+        val result = manager.loadMicCurve(
+            name = "umik1_picked.txt",
+            textContent = fileContent,
+            convention = CalibrationFileConvention.MEASURED_RESPONSE
+        )
+        assertTrue("Import must succeed with MEASURED_RESPONSE", result.isSuccess)
+        val curve = result.getOrThrow()
+        assertEquals(CalibrationFileConvention.MEASURED_RESPONSE, curve.convention)
+        assertEquals("Offset at 1 kHz must be -3.0 dB (inverted)", -3.0f, curve.getOffsetAt(1000.0f), 0.001f)
+
+        // Process audio frame: -40.0 dBFS raw input + (-3.0 dB compensation) = -43.0 dBFS
+        val frame = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, 100.0f)
+        assertEquals("Calibrated 1 kHz output must be attenuated by 3 dB to -43.0 dBFS", -43.0f, frame.calibrated31Db[0], 0.01f)
+        manager.close()
+    }
+
+    @Test
+    fun filePickerImportWithPositive3DbAdditiveCorrectionProducesPlus3DbOffsetAndBoost() {
+        val fileContent = """
+            # Additive Correction Calibration File
+            1000.0  3.0
+            2000.0  3.0
+        """.trimIndent()
+
+        val prefs = testPreferences()
+        val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
+        val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements))
+
+        // Simulate file picker import with ADDITIVE_CORRECTION chosen
+        val result = manager.loadMicCurve(
+            name = "additive_picked.cal",
+            textContent = fileContent,
+            convention = CalibrationFileConvention.ADDITIVE_CORRECTION
+        )
+        assertTrue("Import must succeed with ADDITIVE_CORRECTION", result.isSuccess)
+        val curve = result.getOrThrow()
+        assertEquals(CalibrationFileConvention.ADDITIVE_CORRECTION, curve.convention)
+        assertEquals("Offset at 1 kHz must be +3.0 dB (direct)", 3.0f, curve.getOffsetAt(1000.0f), 0.001f)
+
+        // Process audio frame: -40.0 dBFS raw input + (+3.0 dB compensation) = -37.0 dBFS
+        val frame = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, 100.0f)
+        assertEquals("Calibrated 1 kHz output must be boosted by 3 dB to -37.0 dBFS", -37.0f, frame.calibrated31Db[0], 0.01f)
+        manager.close()
+    }
+
+    @Test
+    fun filePickerImportCancellationLeavesActiveCurveUntouched() {
+        val prefs = testPreferences()
+        val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
+        val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements))
+
+        // Initially load baseline curve (+2 dB additive)
+        manager.loadMicCurve("InitialMic", "1000.0 2.0\n2000.0 2.0", CalibrationFileConvention.ADDITIVE_CORRECTION)
+        val initialCurve = manager.uiState.value.micCurve
+        assertNotNull(initialCurve)
+        assertEquals(2.0f, initialCurve!!.getOffsetAt(1000.0f), 0.001f)
+
+        // Simulate user picking file, but dismissing/cancelling dialog -> onLoadMicCurve not called
+        // UI pendingFileImport is set to null without calling manager.loadMicCurve
+        val currentCurve = manager.uiState.value.micCurve
+        assertNotNull(currentCurve)
+        assertEquals("InitialMic", currentCurve!!.name)
+        assertEquals(2.0f, currentCurve.getOffsetAt(1000.0f), 0.001f)
+
+        // Frame processing remains consistent with InitialMic
+        val frame = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, -40.0f)
+        assertEquals(-38.0f, frame.calibrated31Db[0], 0.01f)
+        manager.close()
+    }
+
+    @Test
+    fun repeatedImportsWithConventionSwitchingAndInvalidHandling() {
+        val prefs = testPreferences()
+        val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
+        val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements))
+
+        // Step 1: Import with MEASURED_RESPONSE (+3 dB) -> produces -3 dB offset (-43.0 dBFS)
+        val res1 = manager.loadMicCurve("File1.txt", "1000.0 3.0\n2000.0 3.0", CalibrationFileConvention.MEASURED_RESPONSE)
+        assertTrue(res1.isSuccess)
+        var frame = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, -40.0f)
+        assertEquals(-43.0f, frame.calibrated31Db[0], 0.01f)
+
+        // Step 2: Repeat import with same file, but switch convention to ADDITIVE_CORRECTION (+3 dB) -> produces +3 dB offset (-37.0 dBFS)
+        val res2 = manager.loadMicCurve("File1.txt", "1000.0 3.0\n2000.0 3.0", CalibrationFileConvention.ADDITIVE_CORRECTION)
+        assertTrue(res2.isSuccess)
+        frame = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, -40.0f)
+        assertEquals(-37.0f, frame.calibrated31Db[0], 0.01f)
+
+        // Step 3: Attempt import with invalid corrupt file data -> fails and preserves previous valid curve
+        val res3 = manager.loadMicCurve("Corrupt.txt", "not a valid calibration format", CalibrationFileConvention.MEASURED_RESPONSE)
+        assertTrue("Corrupt file import must return failure Result", res3.isFailure)
+        frame = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, -40.0f)
+        assertEquals("Active curve must remain untouched after failed import", -37.0f, frame.calibrated31Db[0], 0.01f)
+
+        // Step 4: Import with MEASURED_RESPONSE (-2 dB) -> produces +2 dB offset (-38.0 dBFS)
+        val res4 = manager.loadMicCurve("File2.txt", "1000.0 -2.0\n2000.0 -2.0", CalibrationFileConvention.MEASURED_RESPONSE)
+        assertTrue(res4.isSuccess)
+        frame = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, -40.0f)
+        assertEquals(-38.0f, frame.calibrated31Db[0], 0.01f)
+
+        manager.close()
+    }
+
+    @Test
+    fun testPendingFileImportModel() {
+        val pending = com.rtatuner.app.ui.PendingFileImport(
+            displayName = "cal_mic.txt",
+            content = "1000.0 0.0\n2000.0 0.5"
+        )
+        assertEquals("cal_mic.txt", pending.displayName)
+        assertEquals("1000.0 0.0\n2000.0 0.5", pending.content)
+
+        val copy = pending.copy(displayName = "renamed.txt")
+        assertEquals("renamed.txt", copy.displayName)
+        assertEquals(pending.content, copy.content)
+    }
 }
+
