@@ -3,6 +3,41 @@ package com.rtatuner.app.core.calibration
 import kotlin.math.log10
 
 /**
+ * Conventions for interpreting numeric values in microphone calibration files.
+ */
+enum class CalibrationFileConvention(
+    val id: String,
+    val displayName: String,
+    val description: String
+) {
+    /**
+     * Standard microphone calibration file convention (e.g. miniDSP UMIK-1, Dayton Audio, REW calibration files).
+     * Values represent the microphone capsule's measured frequency response / sensitivity deviation.
+     * To compensate, values are inverted (e.g. +3 dB measured response -> -3 dB correction offset).
+     */
+    MEASURED_RESPONSE(
+        id = "MEASURED_RESPONSE",
+        displayName = "Measured Response (Standard)",
+        description = "Values represent measured microphone deviation; values are inverted to compensate (e.g. +3 dB measured -> -3 dB correction)."
+    ),
+
+    /**
+     * Additive correction offset convention.
+     * Values represent direct additive correction offsets applied as-is to measurements without inversion.
+     */
+    ADDITIVE_CORRECTION(
+        id = "ADDITIVE_CORRECTION",
+        displayName = "Direct Additive Correction",
+        description = "Values represent direct additive correction offsets applied as-is without inversion."
+    );
+
+    companion object {
+        fun fromId(id: String?): CalibrationFileConvention =
+            entries.find { it.id.equals(id, ignoreCase = true) } ?: MEASURED_RESPONSE
+    }
+}
+
+/**
  * A single frequency / dB-offset point on a microphone frequency response calibration curve.
  */
 data class MicCalibrationPoint(
@@ -15,7 +50,8 @@ data class MicCalibrationPoint(
  */
 data class MicCalibrationCurve(
     val name: String,
-    val points: List<MicCalibrationPoint>
+    val points: List<MicCalibrationPoint>,
+    val convention: CalibrationFileConvention = CalibrationFileConvention.MEASURED_RESPONSE
 ) {
     init {
         // Ensure points are sorted by frequency ascending
@@ -201,7 +237,11 @@ data class SplCalibration(
  */
 object CalibrationCurveParser {
 
-    fun parse(name: String, textContent: String): Result<MicCalibrationCurve> {
+    fun parse(
+        name: String,
+        textContent: String,
+        convention: CalibrationFileConvention = CalibrationFileConvention.MEASURED_RESPONSE
+    ): Result<MicCalibrationCurve> {
         val points = mutableListOf<MicCalibrationPoint>()
         val lines = textContent.lines()
 
@@ -215,9 +255,13 @@ object CalibrationCurveParser {
             val tokens = line.split(Regex("[,\\t\\s]+")).map { it.trim().trim('"', '\'') }.filter { it.isNotEmpty() }
             if (tokens.size >= 2) {
                 val freq = tokens[0].toFloatOrNull()
-                val offset = tokens[1].toFloatOrNull()
-                if (freq != null && offset != null && freq in 5.0f..100000.0f && offset in -100.0f..100.0f) {
-                    points.add(MicCalibrationPoint(freq, offset))
+                val rawValue = tokens[1].toFloatOrNull()
+                if (freq != null && rawValue != null && freq in 5.0f..100000.0f && rawValue in -100.0f..100.0f) {
+                    val dbOffset = when (convention) {
+                        CalibrationFileConvention.MEASURED_RESPONSE -> if (rawValue == 0.0f) 0.0f else -rawValue
+                        CalibrationFileConvention.ADDITIVE_CORRECTION -> rawValue
+                    }
+                    points.add(MicCalibrationPoint(freq, dbOffset))
                 }
             }
         }
@@ -228,6 +272,6 @@ object CalibrationCurveParser {
 
         // Sort by frequency
         val sortedPoints = points.sortedBy { it.freqHz }
-        return Result.success(MicCalibrationCurve(name = name, points = sortedPoints))
+        return Result.success(MicCalibrationCurve(name = name, points = sortedPoints, convention = convention))
     }
 }

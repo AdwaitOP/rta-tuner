@@ -106,6 +106,7 @@ class CalibrationManager internal constructor(
         private const val KEY_MIC_CURVE_NAME = "mic_curve_name"
         private const val KEY_MIC_CURVE_POINTS = "mic_curve_points"
         private const val KEY_MIC_CURVE_ACTIVE = "mic_curve_active"
+        private const val KEY_MIC_CURVE_CONVENTION = "mic_curve_convention"
 
         private const val KEY_SPL_MODE = "spl_mode"
         private const val KEY_SPL_OFFSET_DB = "spl_offset_db"
@@ -173,6 +174,7 @@ class CalibrationManager internal constructor(
             val micName = prefs.getString(KEY_MIC_CURVE_NAME, null)
             val micPointsJson = prefs.getString(KEY_MIC_CURVE_POINTS, null)
             val micActive = prefs.getBoolean(KEY_MIC_CURVE_ACTIVE, false)
+            val conventionStr = prefs.getString(KEY_MIC_CURVE_CONVENTION, null)
 
             var loadedMicCurve: MicCalibrationCurve? = null
             if (micName != null && micPointsJson != null) {
@@ -188,7 +190,18 @@ class CalibrationManager internal constructor(
                     )
                 }
                 if (points.isNotEmpty()) {
-                    loadedMicCurve = MicCalibrationCurve(micName, points.sortedBy { it.freqHz })
+                    // Legacy stored curves did not have KEY_MIC_CURVE_CONVENTION; their "o" values were already stored
+                    // directly as additive correction offsets. Preserving them as ADDITIVE_CORRECTION prevents double negation.
+                    val convention = if (conventionStr != null) {
+                        CalibrationFileConvention.fromId(conventionStr)
+                    } else {
+                        CalibrationFileConvention.ADDITIVE_CORRECTION
+                    }
+                    loadedMicCurve = MicCalibrationCurve(
+                        name = micName,
+                        points = points.sortedBy { it.freqHz },
+                        convention = convention
+                    )
                 }
             }
 
@@ -318,17 +331,20 @@ class CalibrationManager internal constructor(
             val rawVal = if (i < raw31Bands.size) raw31Bands[i] else AudioMath.MIN_DB_FS
             var valDb = if (rawVal.isNaN() || rawVal.isInfinite()) AudioMath.MIN_DB_FS else rawVal
 
-            // 1. Apply Mic Calibration offset
-            val micOffset = if (i < micOffsets31.size) micOffsets31[i] else 0.0f
-            valDb += if (micOffset.isNaN() || micOffset.isInfinite()) 0.0f else micOffset
-
-            // 2. Apply Power-Domain Noise Subtraction
+            // 1. Power-Domain Noise Subtraction (operating purely in raw power domain)
             if (isSubtractingNoise) {
                 val noiseDb = if (i < noiseSnapshot.bands31Db.size) noiseSnapshot.bands31Db[i] else AudioMath.MIN_DB_FS
                 val safeNoiseDb = if (noiseDb.isNaN() || noiseDb.isInfinite()) AudioMath.MIN_DB_FS else noiseDb
                 val subResult = AudioMath.subtractNoiseFloor(valDb, safeNoiseDb, AudioMath.MIN_DB_FS)
                 valDb = subResult.correctedDb
                 unreliable[i] = subResult.isUnreliable
+            }
+
+            // 2. Apply Mic Calibration offset to cleaned acoustic signal
+            if (!isSubtractingNoise || valDb > AudioMath.MIN_DB_FS) {
+                val micOffset = if (i < micOffsets31.size) micOffsets31[i] else 0.0f
+                val safeMicOffset = if (micOffset.isNaN() || micOffset.isInfinite()) 0.0f else micOffset
+                valDb += safeMicOffset
             }
 
             // 3. Apply SPL offset if in SPL mode
@@ -392,10 +408,14 @@ class CalibrationManager internal constructor(
 
     // --- Mic Calibration Curve Actions ---
 
-    fun loadMicCurve(name: String, textContent: String): Result<MicCalibrationCurve> = synchronized(stateLock) {
+    fun loadMicCurve(
+        name: String,
+        textContent: String,
+        convention: CalibrationFileConvention = CalibrationFileConvention.MEASURED_RESPONSE
+    ): Result<MicCalibrationCurve> = synchronized(stateLock) {
         val authorization = runCatching { featurePolicy.requireAccess(ProFeature.MIC_CALIBRATION) }
         if (authorization.isFailure) return@synchronized Result.failure(authorization.exceptionOrNull()!!)
-        val parseResult = CalibrationCurveParser.parse(name, textContent)
+        val parseResult = CalibrationCurveParser.parse(name, textContent, convention)
         if (parseResult.isSuccess) {
             val curve = parseResult.getOrThrow()
             val pointsArr = JSONArray()
@@ -409,6 +429,7 @@ class CalibrationManager internal constructor(
             prefs.edit()
                 .putString(KEY_MIC_CURVE_NAME, curve.name)
                 .putString(KEY_MIC_CURVE_POINTS, pointsArr.toString())
+                .putString(KEY_MIC_CURVE_CONVENTION, convention.id)
                 .putBoolean(KEY_MIC_CURVE_ACTIVE, true)
                 .apply()
 
@@ -440,6 +461,7 @@ class CalibrationManager internal constructor(
         prefs.edit()
             .remove(KEY_MIC_CURVE_NAME)
             .remove(KEY_MIC_CURVE_POINTS)
+            .remove(KEY_MIC_CURVE_CONVENTION)
             .putBoolean(KEY_MIC_CURVE_ACTIVE, false)
             .apply()
 

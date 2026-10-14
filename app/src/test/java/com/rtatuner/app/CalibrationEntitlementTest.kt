@@ -103,7 +103,7 @@ class CalibrationEntitlementTest {
             entitlements.setTier(EntitlementTier.PRO_LIFETIME)
             runCurrent()
             val pro = manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f)
-            val expectedBand = AudioMath.subtractNoiseFloor(-37f, -50f, AudioMath.MIN_DB_FS).correctedDb + 100f
+            val expectedBand = AudioMath.subtractNoiseFloor(-40f, -50f, AudioMath.MIN_DB_FS).correctedDb + 3f + 100f
             assertArrayEquals(FloatArray(31) { expectedBand }, pro.calibrated31Db, 0.0001f)
             assertArrayEquals(FloatArray(8) { 63f }, pro.calibratedRawFftDb, 0.0001f)
             assertTrue(pro.isSplMode)
