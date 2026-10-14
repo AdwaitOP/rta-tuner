@@ -14,6 +14,7 @@ import com.rtatuner.app.core.audio.CaptureStatus
 import com.rtatuner.app.core.audio.FftDisplayMode
 import com.rtatuner.app.core.audio.SignalGenerator
 import com.rtatuner.app.core.audio.SweepRangePreset
+import com.rtatuner.app.core.calibration.CalibrationFileConvention
 import com.rtatuner.app.core.calibration.CalibrationManager
 import com.rtatuner.app.core.calibration.MicCalibrationCurve
 import com.rtatuner.app.core.calibration.TargetCurve
@@ -429,8 +430,12 @@ class AudioCaptureViewModel(
 
     // --- Stage 5 Calibration & Target Curve Actions ---
 
-    fun loadMicCurve(name: String, textContent: String): Result<MicCalibrationCurve> {
-        return calibrationManager.loadMicCurve(name, textContent).also { result ->
+    fun loadMicCurve(
+        name: String,
+        textContent: String,
+        convention: CalibrationFileConvention = CalibrationFileConvention.MEASURED_RESPONSE
+    ): Result<MicCalibrationCurve> {
+        return calibrationManager.loadMicCurve(name, textContent, convention).also { result ->
             (result.exceptionOrNull() as? FeatureAccessDeniedException)?.let { reportAccess(it.denial) }
         }
     }

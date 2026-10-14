@@ -61,6 +61,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import com.rtatuner.app.core.audio.GeneratorMode
 import com.rtatuner.app.core.audio.SweepRangePreset
 import com.rtatuner.app.core.audio.SignalGeneratorState
+import com.rtatuner.app.core.calibration.CalibrationFileConvention
 import com.rtatuner.app.core.calibration.CalibrationUiState
 import com.rtatuner.app.core.calibration.MicCalibrationCurve
 import com.rtatuner.app.core.calibration.TargetCurve
@@ -359,7 +360,7 @@ fun DebugScreen(
                 canCorrectNoise = canCorrectNoise,
                 canUseAdvancedTargets = canUseAdvancedTargets,
                 onRequestPro = { viewModel.requestProUpgrade(it) },
-                onLoadMicCurve = { name, content -> viewModel.loadMicCurve(name, content) },
+                onLoadMicCurve = { name, content, convention -> viewModel.loadMicCurve(name, content, convention) },
                 onSetMicCurveActive = { viewModel.setMicCurveActive(it) },
                 onClearMicCurve = { viewModel.clearMicCurve() },
                 onCalibrateSpl = { viewModel.calibrateSplReference(it) },
@@ -2060,6 +2061,11 @@ private const val SAMPLE_UMIK1_CAL = """# miniDSP UMIK-1 Sample 90-degree Calibr
 20000.000 3.80
 """
 
+internal data class PendingFileImport(
+    val displayName: String,
+    val content: String
+)
+
 @Composable
 fun CalibrationControlsCard(
     uiState: AudioCaptureUiState,
@@ -2068,7 +2074,7 @@ fun CalibrationControlsCard(
     canCorrectNoise: Boolean,
     canUseAdvancedTargets: Boolean,
     onRequestPro: (ProFeature) -> Unit,
-    onLoadMicCurve: (name: String, content: String) -> Result<MicCalibrationCurve>,
+    onLoadMicCurve: (name: String, content: String, convention: CalibrationFileConvention) -> Result<MicCalibrationCurve>,
     onSetMicCurveActive: (Boolean) -> Unit,
     onClearMicCurve: () -> Unit,
     onCalibrateSpl: (Float) -> Unit,
@@ -2086,11 +2092,17 @@ fun CalibrationControlsCard(
     var showSplDialog by remember { mutableStateOf(false) }
     var pasteNameInput by remember { mutableStateOf("Custom Mic Cal") }
     var pasteContentInput by remember { mutableStateOf("") }
+    var selectedConvention by remember { mutableStateOf(CalibrationFileConvention.MEASURED_RESPONSE) }
     var parseErrorMsg by remember { mutableStateOf<String?>(null) }
     var splTargetInput by remember { mutableStateOf("85.0") }
+    var pendingFileImport by remember { mutableStateOf<PendingFileImport?>(null) }
+    var fileImportConvention by remember { mutableStateOf(CalibrationFileConvention.MEASURED_RESPONSE) }
 
     LaunchedEffect(canMicCalibrate, canSplCalibrate) {
-        if (!canMicCalibrate) showPasteDialog = false
+        if (!canMicCalibrate) {
+            showPasteDialog = false
+            pendingFileImport = null
+        }
         if (!canSplCalibrate) showSplDialog = false
     }
 
@@ -2106,12 +2118,9 @@ fun CalibrationControlsCard(
                 }
                 if (content != null) {
                     val displayName = uri.lastPathSegment?.substringAfterLast('/') ?: "Imported Mic Cal"
-                    val result = onLoadMicCurve(displayName, content)
-                    if (result.isFailure) {
-                        parseErrorMsg = result.exceptionOrNull()?.message ?: "Failed to parse calibration file"
-                    } else {
-                        parseErrorMsg = null
-                    }
+                    pendingFileImport = PendingFileImport(displayName, content)
+                    fileImportConvention = CalibrationFileConvention.MEASURED_RESPONSE
+                    parseErrorMsg = null
                 }
             } catch (e: Exception) {
                 parseErrorMsg = "Error opening file: ${e.localizedMessage}"
@@ -2260,7 +2269,7 @@ fun CalibrationControlsCard(
                         Button(
                             onClick = {
                                 if (canMicCalibrate) {
-                                    val res = onLoadMicCurve("miniDSP UMIK-1 (Demo)", SAMPLE_UMIK1_CAL)
+                                    val res = onLoadMicCurve("miniDSP UMIK-1 (Demo)", SAMPLE_UMIK1_CAL, CalibrationFileConvention.MEASURED_RESPONSE)
                                     if (res.isFailure) parseErrorMsg = res.exceptionOrNull()?.message
                                 } else onRequestPro(ProFeature.MIC_CALIBRATION)
                             },
@@ -2665,15 +2674,74 @@ fun CalibrationControlsCard(
                         onValueChange = { pasteContentInput = it },
                         label = { Text("Paste Data (e.g. 1000  0.0)", fontSize = 10.sp) },
                         placeholder = { Text("20.0  1.5\n100.0  0.2\n1000.0  0.0\n10000.0  -1.2") },
-                        modifier = Modifier.fillMaxWidth().height(140.dp),
+                        modifier = Modifier.fillMaxWidth().height(120.dp),
                         maxLines = 8
                     )
+                    Text(
+                        text = "File Convention:",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Surface(
+                            color = if (selectedConvention == CalibrationFileConvention.MEASURED_RESPONSE) Color(0xFF00E5FF).copy(alpha = 0.15f) else Color(0xFF1E222B),
+                            shape = RoundedCornerShape(4.dp),
+                            border = androidx.compose.foundation.BorderStroke(
+                                1.dp,
+                                if (selectedConvention == CalibrationFileConvention.MEASURED_RESPONSE) Color(0xFF00E5FF) else Color(0xFF37474F)
+                            ),
+                            modifier = Modifier.weight(1f).clickable { selectedConvention = CalibrationFileConvention.MEASURED_RESPONSE }
+                        ) {
+                            Column(modifier = Modifier.padding(6.dp)) {
+                                Text(
+                                    "Measured Response",
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (selectedConvention == CalibrationFileConvention.MEASURED_RESPONSE) Color(0xFF00E5FF) else Color.White
+                                )
+                                Text(
+                                    "Standard (UMIK-1 / REW). Inverted (+3dB -> -3dB).",
+                                    fontSize = 8.sp,
+                                    color = Color(0xFF90A4AE),
+                                    lineHeight = 10.sp
+                                )
+                            }
+                        }
+                        Surface(
+                            color = if (selectedConvention == CalibrationFileConvention.ADDITIVE_CORRECTION) Color(0xFF00E5FF).copy(alpha = 0.15f) else Color(0xFF1E222B),
+                            shape = RoundedCornerShape(4.dp),
+                            border = androidx.compose.foundation.BorderStroke(
+                                1.dp,
+                                if (selectedConvention == CalibrationFileConvention.ADDITIVE_CORRECTION) Color(0xFF00E5FF) else Color(0xFF37474F)
+                            ),
+                            modifier = Modifier.weight(1f).clickable { selectedConvention = CalibrationFileConvention.ADDITIVE_CORRECTION }
+                        ) {
+                            Column(modifier = Modifier.padding(6.dp)) {
+                                Text(
+                                    "Additive Offsets",
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (selectedConvention == CalibrationFileConvention.ADDITIVE_CORRECTION) Color(0xFF00E5FF) else Color.White
+                                )
+                                Text(
+                                    "Direct offsets applied as-is without inversion.",
+                                    fontSize = 8.sp,
+                                    color = Color(0xFF90A4AE),
+                                    lineHeight = 10.sp
+                                )
+                            }
+                        }
+                    }
                 }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        val res = onLoadMicCurve(pasteNameInput, pasteContentInput)
+                        val res = onLoadMicCurve(pasteNameInput, pasteContentInput, selectedConvention)
                         if (res.isSuccess) {
                             showPasteDialog = false
                             parseErrorMsg = null
@@ -2691,6 +2759,121 @@ fun CalibrationControlsCard(
             },
             dismissButton = {
                 TextButton(onClick = { showPasteDialog = false }) {
+                    Text("CANCEL", color = Color(0xFF90A4AE), fontFamily = FontFamily.Monospace)
+                }
+            }
+        )
+    }
+
+    // File Import Convention Selection Dialog
+    pendingFileImport?.let { pending ->
+        AlertDialog(
+            onDismissRequest = { pendingFileImport = null },
+            title = {
+                Text(
+                    text = "Import Calibration File",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "File: ${pending.displayName}",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF00E5FF),
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Text(
+                        text = "Select the format convention used by this calibration file:",
+                        fontSize = 11.sp,
+                        color = Color(0xFFB0BEC5)
+                    )
+                    Text(
+                        text = "File Convention:",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Surface(
+                            color = if (fileImportConvention == CalibrationFileConvention.MEASURED_RESPONSE) Color(0xFF00E5FF).copy(alpha = 0.15f) else Color(0xFF1E222B),
+                            shape = RoundedCornerShape(4.dp),
+                            border = androidx.compose.foundation.BorderStroke(
+                                1.dp,
+                                if (fileImportConvention == CalibrationFileConvention.MEASURED_RESPONSE) Color(0xFF00E5FF) else Color(0xFF37474F)
+                            ),
+                            modifier = Modifier.weight(1f).clickable { fileImportConvention = CalibrationFileConvention.MEASURED_RESPONSE }
+                        ) {
+                            Column(modifier = Modifier.padding(6.dp)) {
+                                Text(
+                                    "Measured Response",
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (fileImportConvention == CalibrationFileConvention.MEASURED_RESPONSE) Color(0xFF00E5FF) else Color.White
+                                )
+                                Text(
+                                    "Standard (UMIK-1 / REW). Inverted (+3dB -> -3dB).",
+                                    fontSize = 8.sp,
+                                    color = Color(0xFF90A4AE),
+                                    lineHeight = 10.sp
+                                )
+                            }
+                        }
+                        Surface(
+                            color = if (fileImportConvention == CalibrationFileConvention.ADDITIVE_CORRECTION) Color(0xFF00E5FF).copy(alpha = 0.15f) else Color(0xFF1E222B),
+                            shape = RoundedCornerShape(4.dp),
+                            border = androidx.compose.foundation.BorderStroke(
+                                1.dp,
+                                if (fileImportConvention == CalibrationFileConvention.ADDITIVE_CORRECTION) Color(0xFF00E5FF) else Color(0xFF37474F)
+                            ),
+                            modifier = Modifier.weight(1f).clickable { fileImportConvention = CalibrationFileConvention.ADDITIVE_CORRECTION }
+                        ) {
+                            Column(modifier = Modifier.padding(6.dp)) {
+                                Text(
+                                    "Additive Offsets",
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (fileImportConvention == CalibrationFileConvention.ADDITIVE_CORRECTION) Color(0xFF00E5FF) else Color.White
+                                )
+                                Text(
+                                    "Direct offsets applied as-is without inversion.",
+                                    fontSize = 8.sp,
+                                    color = Color(0xFF90A4AE),
+                                    lineHeight = 10.sp
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val res = onLoadMicCurve(pending.displayName, pending.content, fileImportConvention)
+                        if (res.isSuccess) {
+                            pendingFileImport = null
+                            parseErrorMsg = null
+                        } else {
+                            parseErrorMsg = res.exceptionOrNull()?.message ?: "Failed to parse calibration file"
+                            pendingFileImport = null
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF00E676),
+                        contentColor = Color.Black
+                    )
+                ) {
+                    Text("APPLY", color = Color.Black, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingFileImport = null }) {
                     Text("CANCEL", color = Color(0xFF90A4AE), fontFamily = FontFamily.Monospace)
                 }
             }
