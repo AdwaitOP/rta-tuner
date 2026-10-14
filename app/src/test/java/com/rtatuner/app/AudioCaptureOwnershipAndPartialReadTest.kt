@@ -54,11 +54,12 @@ class AudioCaptureOwnershipAndPartialReadTest {
      * Fake AudioRecordSource allowing deterministic injection of reads, errors, and lifecycle state.
      */
     @Suppress("DEPRECATION")
-    class FakeAudioRecordSource(
+    open class FakeAudioRecordSource(
         override var state: Int = AudioRecord.STATE_INITIALIZED,
         override var recordingState: Int = AudioRecord.RECORDSTATE_RECORDING,
         override var routedDevice: AudioDeviceInfo? = null,
-        val onRead: ((audioData: ShortArray, offset: Int, size: Int) -> Int)? = null
+        val onRead: ((audioData: ShortArray, offset: Int, size: Int) -> Int)? = null,
+        var onRelease: (() -> Unit)? = null
     ) : AudioRecordSource {
         var startRecordingCalls = 0
         var stopCalls = 0
@@ -81,12 +82,12 @@ class AudioCaptureOwnershipAndPartialReadTest {
             routingListeners.remove(listener)
         }
 
-        override fun startRecording() {
+        open override fun startRecording() {
             startRecordingCalls++
             startRecordingException?.let { throw it }
         }
 
-        override fun read(
+        open override fun read(
             audioData: ShortArray,
             offsetInShorts: Int,
             sizeInShorts: Int,
@@ -96,12 +97,13 @@ class AudioCaptureOwnershipAndPartialReadTest {
             return onRead?.invoke(audioData, offsetInShorts, sizeInShorts) ?: sizeInShorts
         }
 
-        override fun stop() {
+        open override fun stop() {
             stopCalls++
             recordingState = AudioRecord.RECORDSTATE_STOPPED
         }
 
-        override fun release() {
+        open override fun release() {
+            onRelease?.invoke()
             releaseCalls++
             isReleased = true
             stop()
@@ -838,6 +840,545 @@ class AudioCaptureOwnershipAndPartialReadTest {
 
         manager.stopCapture()
         assertTrue(recordB.isReleased)
+    }
+
+    // --- B01, B02, B03 & Mandatory Scenarios (1-9, 13, 17, 19, 20) ---
+
+    @Test
+    fun attemptACanceledDuringInitAllowsAttemptBToStartNormally() {
+        val attemptAPaused = CountDownLatch(1)
+        val resumeAttemptA = CountDownLatch(1)
+        val attemptAFinished = CountDownLatch(1)
+
+        val recordA = FakeAudioRecordSource()
+        val recordB = FakeAudioRecordSource(onRead = { _, _, size -> size })
+
+        val records = ConcurrentLinkedQueue(listOf(recordA, recordB))
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = { _, _, _, _, _ -> records.poll() ?: FakeAudioRecordSource() },
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        var attemptACall = true
+        manager.onPostHardwareInit = { _ ->
+            if (attemptACall) {
+                attemptACall = false
+                attemptAPaused.countDown()
+                resumeAttemptA.await(5, TimeUnit.SECONDS)
+            }
+        }
+
+        var startAResult = true
+        val threadA = Thread {
+            startAResult = manager.startCapture()
+            attemptAFinished.countDown()
+        }
+        threadA.start()
+
+        assertTrue(attemptAPaused.await(5, TimeUnit.SECONDS))
+        assertEquals(CaptureStatus.INITIALIZING, manager.uiState.value.status)
+
+        // Cancel A via stopCapture
+        manager.stopCapture()
+        assertEquals(CaptureStatus.STOPPED, manager.uiState.value.status)
+
+        // Start B
+        assertTrue(manager.startCapture())
+        assertEquals(CaptureStatus.RUNNING, manager.uiState.value.status)
+
+        // Resume A
+        resumeAttemptA.countDown()
+        assertTrue(attemptAFinished.await(5, TimeUnit.SECONDS))
+        threadA.join(3000)
+
+        assertFalse("Attempt A must return false since it was canceled (B01)", startAResult)
+        assertTrue("Record A must be released", recordA.isReleased)
+        assertFalse("Record B must remain active", recordB.isReleased)
+        assertEquals(CaptureStatus.RUNNING, manager.uiState.value.status)
+
+        manager.stopCapture()
+        assertTrue(recordB.isReleased)
+    }
+
+    @Test
+    fun attemptACanceledWhileBInitializingSucceedsLateWithoutHijackingB() {
+        val attemptAPaused = CountDownLatch(1)
+        val resumeAttemptA = CountDownLatch(1)
+        val attemptBPaused = CountDownLatch(1)
+        val resumeAttemptB = CountDownLatch(1)
+        val attemptAFinished = CountDownLatch(1)
+        val attemptBFinished = CountDownLatch(1)
+
+        val recordA = FakeAudioRecordSource()
+        val recordB = FakeAudioRecordSource(onRead = { _, _, size -> size })
+
+        val records = ConcurrentLinkedQueue(listOf(recordA, recordB))
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = { _, _, _, _, _ -> records.poll() ?: FakeAudioRecordSource() },
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        val initCall = AtomicInteger(0)
+        manager.onPostHardwareInit = { _ ->
+            val c = initCall.incrementAndGet()
+            if (c == 1) {
+                attemptAPaused.countDown()
+                resumeAttemptA.await(5, TimeUnit.SECONDS)
+            } else if (c == 2) {
+                attemptBPaused.countDown()
+                resumeAttemptB.await(5, TimeUnit.SECONDS)
+            }
+        }
+
+        var resultA = true
+        var resultB = false
+        val threadA = Thread {
+            resultA = manager.startCapture()
+            attemptAFinished.countDown()
+        }
+        threadA.start()
+
+        assertTrue(attemptAPaused.await(5, TimeUnit.SECONDS))
+        // Stop capture, canceling A
+        manager.stopCapture()
+        assertEquals(CaptureStatus.STOPPED, manager.uiState.value.status)
+
+        // Start capture B
+        val threadB = Thread {
+            resultB = manager.startCapture()
+            attemptBFinished.countDown()
+        }
+        threadB.start()
+
+        assertTrue(attemptBPaused.await(5, TimeUnit.SECONDS))
+        assertEquals(CaptureStatus.INITIALIZING, manager.uiState.value.status)
+
+        // Resume A, then resume B
+        resumeAttemptA.countDown()
+        assertTrue(attemptAFinished.await(5, TimeUnit.SECONDS))
+        threadA.join(3000)
+
+        // A must fail and NOT hijack B (B01)
+        assertFalse("Attempt A must return false", resultA)
+        assertTrue("Record A must be cleaned up", recordA.isReleased)
+        assertEquals(CaptureStatus.INITIALIZING, manager.uiState.value.status)
+
+        resumeAttemptB.countDown()
+        assertTrue(attemptBFinished.await(5, TimeUnit.SECONDS))
+        threadB.join(3000)
+
+        assertTrue("Attempt B must succeed", resultB)
+        assertEquals(CaptureStatus.RUNNING, manager.uiState.value.status)
+        assertFalse("Record B must remain active", recordB.isReleased)
+
+        manager.stopCapture()
+        assertTrue(recordB.isReleased)
+    }
+
+    @Test
+    fun attemptACanceledWhileBInitializingFailsLateWithoutPublishingError() {
+        val attemptAPaused = CountDownLatch(1)
+        val resumeAttemptA = CountDownLatch(1)
+        val attemptBPaused = CountDownLatch(1)
+        val resumeAttemptB = CountDownLatch(1)
+        val attemptAFinished = CountDownLatch(1)
+        val attemptBFinished = CountDownLatch(1)
+
+        val recordB = FakeAudioRecordSource(onRead = { _, _, size -> size })
+
+        var threadA: Thread? = null
+        val attemptAPausedOnce = AtomicBoolean(false)
+        val factory = AudioRecordSourceFactory { _, _, _, _, _ ->
+            if (Thread.currentThread() === threadA) {
+                if (attemptAPausedOnce.compareAndSet(false, true)) {
+                    attemptAPaused.countDown()
+                    resumeAttemptA.await(5, TimeUnit.SECONDS)
+                }
+                null // Always fail for attempt A (both UNPROCESSED and fallback MIC)
+            } else {
+                recordB
+            }
+        }
+
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = factory,
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        var resultA = true
+        var resultB = false
+
+        threadA = Thread {
+            resultA = manager.startCapture()
+            attemptAFinished.countDown()
+        }
+        threadA.start()
+
+        assertTrue(attemptAPaused.await(5, TimeUnit.SECONDS))
+
+        // Cancel A and set hook for B
+        manager.stopCapture()
+        manager.onPostHardwareInit = { _ ->
+            if (Thread.currentThread() !== threadA) {
+                attemptBPaused.countDown()
+                resumeAttemptB.await(5, TimeUnit.SECONDS)
+            }
+        }
+
+        val threadB = Thread {
+            resultB = manager.startCapture()
+            attemptBFinished.countDown()
+        }
+        threadB.start()
+
+        assertTrue(attemptBPaused.await(5, TimeUnit.SECONDS))
+        assertEquals(CaptureStatus.INITIALIZING, manager.uiState.value.status)
+
+        // Resume A so it returns null and triggers error path
+        resumeAttemptA.countDown()
+        assertTrue(attemptAFinished.await(5, TimeUnit.SECONDS))
+        threadA.join(3000)
+
+        assertFalse("Attempt A must return false", resultA)
+        // CRITICAL CHECK B01: State must NOT be ERROR! It must remain INITIALIZING for B!
+        assertEquals("Obsolete Attempt A must not publish ERROR during B initialization", CaptureStatus.INITIALIZING, manager.uiState.value.status)
+        assertNull(manager.uiState.value.errorMessage)
+
+        // Now resume B
+        resumeAttemptB.countDown()
+        assertTrue(attemptBFinished.await(5, TimeUnit.SECONDS))
+        threadB.join(3000)
+
+        assertTrue("Attempt B must succeed", resultB)
+        assertEquals(CaptureStatus.RUNNING, manager.uiState.value.status)
+        assertNull(manager.uiState.value.errorMessage)
+
+        manager.stopCapture()
+        assertTrue(recordB.isReleased)
+    }
+
+    @Test
+    fun simultaneousStartRequestsResolveConsistentlyWithoutLeaking() {
+        val barrier = java.util.concurrent.CyclicBarrier(2)
+        val record1 = FakeAudioRecordSource(onRead = { _, _, size -> size })
+        val record2 = FakeAudioRecordSource(onRead = { _, _, size -> size })
+
+        val records = ConcurrentLinkedQueue(listOf(record1, record2))
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = { _, _, _, _, _ -> records.poll() ?: FakeAudioRecordSource() },
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        val results = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+        val thread1 = Thread {
+            barrier.await(5, TimeUnit.SECONDS)
+            results["thread1"] = manager.startCapture()
+        }
+        val thread2 = Thread {
+            barrier.await(5, TimeUnit.SECONDS)
+            results["thread2"] = manager.startCapture()
+        }
+
+        thread1.start()
+        thread2.start()
+        thread1.join(5000)
+        thread2.join(5000)
+
+        assertEquals(CaptureStatus.RUNNING, manager.uiState.value.status)
+        val activeCount = (if (!record1.isReleased) 1 else 0) + (if (!record2.isReleased) 1 else 0)
+        assertEquals("Exactly one recorder must remain active", 1, activeCount)
+
+        manager.stopCapture()
+        assertTrue(record1.isReleased)
+        assertTrue(record2.isReleased)
+    }
+
+    @Test
+    fun startInterruptedByStopAndReleaseAbortsCleanly() {
+        val inInit = CountDownLatch(1)
+        val resumeInit = CountDownLatch(1)
+        val record = FakeAudioRecordSource()
+
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = { _, _, _, _, _ -> record },
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        manager.onPostHardwareInit = { _ ->
+            inInit.countDown()
+            resumeInit.await(5, TimeUnit.SECONDS)
+        }
+
+        var startResult = true
+        val startThread = Thread {
+            startResult = manager.startCapture()
+        }
+        startThread.start()
+
+        assertTrue(inInit.await(5, TimeUnit.SECONDS))
+        assertEquals(CaptureStatus.INITIALIZING, manager.uiState.value.status)
+
+        // Release the manager while start is blocked
+        manager.release()
+        assertEquals(CaptureStatus.STOPPED, manager.uiState.value.status)
+
+        resumeInit.countDown()
+        startThread.join(3000)
+
+        assertFalse("Interrupted start must return false", startResult)
+        assertEquals(CaptureStatus.STOPPED, manager.uiState.value.status)
+        assertTrue("Record must be released", record.isReleased)
+    }
+
+    @Test
+    fun workerPausedBeforeStartRecordingThenStoppedDoesNotUseReleasedRecorder() {
+        val workerPausedBeforeStart = CountDownLatch(1)
+        val resumeWorker = CountDownLatch(1)
+
+        val record = FakeAudioRecordSource(onRead = { _, _, size -> size })
+
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = { _, _, _, _, _ -> record },
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        manager.onPreStartRecording = { _ ->
+            workerPausedBeforeStart.countDown()
+            resumeWorker.await(5, TimeUnit.SECONDS)
+        }
+
+        assertTrue(manager.startCapture())
+        assertTrue("Worker must reach pre-start hook", workerPausedBeforeStart.await(5, TimeUnit.SECONDS))
+
+        // Main thread stops capture while worker has NOT called startRecording yet!
+        manager.stopCapture()
+        assertEquals(CaptureStatus.STOPPED, manager.uiState.value.status)
+        assertTrue("Record must be released on stop", record.isReleased)
+        assertEquals("startRecording must not have been called yet", 0, record.startRecordingCalls)
+
+        // Resume worker thread
+        resumeWorker.countDown()
+        Thread.sleep(150)
+
+        // VERIFICATION OF B03: Worker MUST NOT call startRecording on released record!
+        assertEquals("Worker must NOT call startRecording() on already-released recorder (B03)!", 0, record.startRecordingCalls)
+        assertEquals(CaptureStatus.STOPPED, manager.uiState.value.status)
+        assertNull(manager.uiState.value.errorMessage)
+    }
+
+    @Test
+    fun hardwareStartupExceptionHandledSafelyWithoutCorruptingSubsequentSessions() {
+        val record = FakeAudioRecordSource()
+        record.startRecordingException = RuntimeException("HAL bus error")
+
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = { _, _, _, _, _ -> record },
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        assertTrue(manager.startCapture())
+        runBlocking {
+            withTimeout(3000) {
+                manager.uiState.first { it.status == CaptureStatus.ERROR }
+            }
+        }
+
+        assertEquals(CaptureStatus.ERROR, manager.uiState.value.status)
+        assertTrue(manager.uiState.value.errorMessage!!.contains("HAL bus error"))
+        assertTrue("Recorder must be released on exception", record.isReleased)
+    }
+
+    @Test
+    fun hardwareReleaseBlockedDoesNotBlockOtherLifecycleOperations() {
+        val releaseEntered = CountDownLatch(1)
+        val unblockRelease = CountDownLatch(1)
+
+        val recordA = FakeAudioRecordSource(
+            onRelease = {
+                releaseEntered.countDown()
+                unblockRelease.await(5, TimeUnit.SECONDS)
+            }
+        )
+        val recordB = FakeAudioRecordSource(onRead = { _, _, size -> size })
+        val records = ConcurrentLinkedQueue(listOf(recordA, recordB))
+
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = { _, _, _, _, _ -> records.poll() ?: FakeAudioRecordSource() },
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        assertTrue(manager.startCapture())
+
+        // Stop capture on Thread 1: this will block in recordA.release() outside lifecycleLock
+        val thread1 = Thread {
+            manager.stopCapture()
+        }
+        thread1.start()
+
+        assertTrue(releaseEntered.await(5, TimeUnit.SECONDS))
+
+        // While Thread 1 is blocked in hardware release, Thread 2 calls stopCapture or checks state
+        val thread2Finished = CountDownLatch(1)
+        val thread2 = Thread {
+            // Must NOT block on Thread 1's hardware release! (B02)
+            manager.stopCapture()
+            assertEquals(CaptureStatus.STOPPED, manager.uiState.value.status)
+            thread2Finished.countDown()
+        }
+        thread2.start()
+
+        assertTrue("Thread 2 must complete without blocking on Thread 1's slow release (B02)", thread2Finished.await(2, TimeUnit.SECONDS))
+
+        // Unblock Thread 1
+        unblockRelease.countDown()
+        thread1.join(3000)
+        thread2.join(3000)
+
+        assertTrue(recordA.isReleased)
+    }
+
+    @Test
+    fun zeroReadDiagnosticsDoNotMutateStateAfterInvalidation() {
+        val inRead = CountDownLatch(1)
+        val resumeRead = CountDownLatch(1)
+
+        val record = FakeAudioRecordSource(
+            onRead = { _, _, _ ->
+                inRead.countDown()
+                resumeRead.await(5, TimeUnit.SECONDS)
+                0 // zero read
+            }
+        )
+
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = { _, _, _, _, _ -> record },
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        assertTrue(manager.startCapture())
+        assertTrue(inRead.await(5, TimeUnit.SECONDS))
+
+        // Stop session while paused in read
+        manager.stopCapture()
+        assertEquals(CaptureStatus.STOPPED, manager.uiState.value.status)
+
+        // Resume read returning 0 samples
+        resumeRead.countDown()
+        Thread.sleep(100)
+
+        // Must remain STOPPED, consecutiveZeroReads must not corrupt STOPPED state
+        assertEquals(CaptureStatus.STOPPED, manager.uiState.value.status)
+        assertTrue(record.isReleased)
+    }
+
+    @Test
+    fun usbMicrophoneSelectionAndReplacementTransitionsCleanly() {
+        val recordInternal = FakeAudioRecordSource(onRead = { _, _, size -> size })
+        val recordUsb = FakeAudioRecordSource(onRead = { _, _, size -> size })
+        val records = ConcurrentLinkedQueue(listOf(recordInternal, recordUsb))
+
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = { _, _, _, _, _ -> records.poll() ?: FakeAudioRecordSource() },
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        assertTrue(manager.startCapture())
+        assertEquals(CaptureStatus.RUNNING, manager.uiState.value.status)
+        assertFalse(recordInternal.isReleased)
+
+        // Select USB microphone (ID 101)
+        manager.setPreferredInputDevice(101)
+        assertEquals(CaptureStatus.RUNNING, manager.uiState.value.status)
+        assertTrue("Internal mic must be released upon USB selection", recordInternal.isReleased)
+        assertFalse("USB mic must be active", recordUsb.isReleased)
+
+        manager.stopCapture()
+        assertTrue(recordUsb.isReleased)
+    }
+
+    @Test
+    fun obsoleteAttemptsDoNotProduceFalseRunningOrErrorTransitions() {
+        val pausedAttempts = listOf(CountDownLatch(1), CountDownLatch(1), CountDownLatch(1))
+        val resumeAttempts = listOf(CountDownLatch(1), CountDownLatch(1), CountDownLatch(1))
+        val finishedAttempts = listOf(CountDownLatch(1), CountDownLatch(1), CountDownLatch(1))
+
+        val records = listOf(
+            FakeAudioRecordSource(),
+            FakeAudioRecordSource(),
+            FakeAudioRecordSource(onRead = { _, _, size -> size })
+        )
+        val recordQueue = ConcurrentLinkedQueue(records)
+
+        val manager = AudioCaptureManager(
+            context = application,
+            config = AudioCaptureConfig(windowSize = 1024, hopSize = 512),
+            audioRecordFactory = { _, _, _, _, _ -> recordQueue.poll() ?: FakeAudioRecordSource() },
+            minBufferSizeProvider = { _, _, _ -> 4096 }
+        )
+
+        val callCount = AtomicInteger(0)
+        manager.onPostHardwareInit = { _ ->
+            val idx = callCount.getAndIncrement()
+            if (idx < 3) {
+                pausedAttempts[idx].countDown()
+                resumeAttempts[idx].await(5, TimeUnit.SECONDS)
+            }
+        }
+
+        // Start Attempt 1
+        Thread { manager.startCapture(); finishedAttempts[0].countDown() }.start()
+        assertTrue(pausedAttempts[0].await(5, TimeUnit.SECONDS))
+        manager.stopCapture()
+
+        // Start Attempt 2
+        Thread { manager.startCapture(); finishedAttempts[1].countDown() }.start()
+        assertTrue(pausedAttempts[1].await(5, TimeUnit.SECONDS))
+        manager.stopCapture()
+
+        // Start Attempt 3
+        Thread { manager.startCapture(); finishedAttempts[2].countDown() }.start()
+        assertTrue(pausedAttempts[2].await(5, TimeUnit.SECONDS))
+
+        // Resume obsolete Attempt 1 and Attempt 2
+        resumeAttempts[0].countDown()
+        resumeAttempts[1].countDown()
+        assertTrue(finishedAttempts[0].await(5, TimeUnit.SECONDS))
+        assertTrue(finishedAttempts[1].await(5, TimeUnit.SECONDS))
+
+        // UI state must NOT be corrupted by Attempt 1 or 2
+        assertTrue("Record 1 must be released", records[0].isReleased)
+        assertTrue("Record 2 must be released", records[1].isReleased)
+        assertEquals(CaptureStatus.INITIALIZING, manager.uiState.value.status)
+
+        // Resume Attempt 3
+        resumeAttempts[2].countDown()
+        assertTrue(finishedAttempts[2].await(5, TimeUnit.SECONDS))
+
+        assertEquals(CaptureStatus.RUNNING, manager.uiState.value.status)
+        assertFalse("Record 3 must remain active", records[2].isReleased)
+
+        manager.stopCapture()
+        assertTrue(records[2].isReleased)
     }
 }
 
