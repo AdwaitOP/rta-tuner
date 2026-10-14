@@ -559,4 +559,168 @@ class IndependentTransactionResourceAuditTest {
         assertEquals(1, record.releases.get())
         retired(manager)
     }
+
+    @Test
+    fun fatalWorkerStartAndFatalTerminalReleasePreservesOriginalAndSuppressesCleanup() {
+        val original = OutOfMemoryError("original-start-oom")
+        val cleanupFatal = LinkageError("terminal-release-linkage")
+        val record = Record().also {
+            it.startAction = { throw original }
+            it.releaseAction = { throw cleanupFatal }
+        }
+        val manager = manager(record)
+        val uncaught = AtomicReference<Throwable>()
+        var worker: Thread? = null
+        manager.threadLauncher = { thread ->
+            worker = thread
+            thread.uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, error -> uncaught.set(error) }
+            thread.start()
+        }
+        assertTrue(manager.startCapture())
+        joined(worker!!)
+        assertEquals("release must be attempted exactly once", 1, record.releases.get())
+        retired(manager)
+        assertSame("original worker fatal must remain primary", original, uncaught.get())
+        assertTrue("cleanup failure must be attached as suppressed", original.suppressed.contains(cleanupFatal))
+    }
+
+    @Test
+    fun fatalWorkerReadAndFatalTerminalReleasePreservesOriginalAndSuppressesCleanup() {
+        val original = OutOfMemoryError("original-read-oom")
+        val cleanupFatal = LinkageError("terminal-release-linkage")
+        val record = Record().also {
+            it.readAction = { throw original }
+            it.releaseAction = { throw cleanupFatal }
+        }
+        val manager = manager(record)
+        val uncaught = AtomicReference<Throwable>()
+        var worker: Thread? = null
+        manager.threadLauncher = { thread ->
+            worker = thread
+            thread.uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, error -> uncaught.set(error) }
+            thread.start()
+        }
+        assertTrue(manager.startCapture())
+        joined(worker!!)
+        assertEquals("release must be attempted exactly once", 1, record.releases.get())
+        retired(manager)
+        assertSame("original worker fatal must remain primary", original, uncaught.get())
+        assertTrue("cleanup failure must be attached as suppressed", original.suppressed.contains(cleanupFatal))
+    }
+
+    @Test
+    fun fatalWorkerReadWithoutCleanupFatalPropagatesOriginalDirectly() {
+        val original = OutOfMemoryError("original-read-oom-clean")
+        val record = Record().also {
+            it.readAction = { throw original }
+        }
+        val manager = manager(record)
+        val uncaught = AtomicReference<Throwable>()
+        var worker: Thread? = null
+        manager.threadLauncher = { thread ->
+            worker = thread
+            thread.uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, error -> uncaught.set(error) }
+            thread.start()
+        }
+        assertTrue(manager.startCapture())
+        joined(worker!!)
+        assertEquals(1, record.releases.get())
+        retired(manager)
+        assertSame(original, uncaught.get())
+        assertEquals(0, original.suppressed.size)
+    }
+
+    @Test
+    fun cleanupFatalWithoutWorkerFatalPropagatesAsPrimary() {
+        val cleanupFatal = LinkageError("clean-exit-release-linkage")
+        val record = Record().also {
+            it.readAction = { AudioRecord.ERROR_DEAD_OBJECT }
+            it.releaseAction = { throw cleanupFatal }
+        }
+        val manager = manager(record)
+        val uncaught = AtomicReference<Throwable>()
+        var worker: Thread? = null
+        manager.threadLauncher = { thread ->
+            worker = thread
+            thread.uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, error -> uncaught.set(error) }
+            thread.start()
+        }
+        assertTrue(manager.startCapture())
+        joined(worker!!)
+        assertEquals(1, record.releases.get())
+        retired(manager)
+        assertSame("cleanup fatal must propagate as primary when no worker fatal occurred", cleanupFatal, uncaught.get())
+    }
+
+    @Test
+    fun ordinaryWorkerExceptionWithFatalCleanupReportsErrorAndPropagatesCleanupFatal() {
+        val cleanupFatal = LinkageError("terminal-release-linkage")
+        val record = Record().also {
+            it.startAction = { throw IllegalStateException("ordinary-start-failure") }
+            it.releaseAction = { throw cleanupFatal }
+        }
+        val manager = manager(record)
+        val uncaught = AtomicReference<Throwable>()
+        var worker: Thread? = null
+        manager.threadLauncher = { thread ->
+            worker = thread
+            thread.uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, error -> uncaught.set(error) }
+            thread.start()
+        }
+        assertTrue(manager.startCapture())
+        joined(worker!!)
+        assertEquals(1, record.releases.get())
+        retired(manager)
+        assertEquals(CaptureStatus.ERROR, manager.uiState.value.status)
+        assertTrue(manager.uiState.value.errorMessage?.contains("ordinary-start-failure") == true)
+        assertSame(cleanupFatal, uncaught.get())
+    }
+
+    @Test
+    fun obsoleteFatalWorkerCannotRetireOrOverwriteNewerReplacementSession() {
+        val cleanupFatal = LinkageError("old-worker-fatal")
+        val oldRecord = Record().also {
+            it.startAction = { throw cleanupFatal }
+        }
+        val healthyRecord = Record()
+        val enteredRelease = CountDownLatch(1)
+        val resumeRelease = CountDownLatch(1)
+        oldRecord.releaseAction = {
+            enteredRelease.countDown()
+            await(resumeRelease)
+        }
+        val calls = AtomicInteger()
+        val manager = manager(AudioRecordSourceFactory { _, _, _, _, _ ->
+            if (calls.getAndIncrement() == 0) oldRecord else healthyRecord
+        })
+        val uncaught = AtomicReference<Throwable>()
+        var oldWorker: Thread? = null
+        manager.threadLauncher = { thread ->
+            oldWorker = thread
+            thread.uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, error -> uncaught.set(error) }
+            thread.start()
+        }
+        assertTrue(manager.startCapture())
+        await(enteredRelease)
+        try {
+            manager.stopCapture()
+            manager.threadLauncher = {}
+            assertTrue(manager.startCapture())
+            val replacementSession = field(manager, "activeSession")
+            val replacementToken = field(manager, "activeAttemptToken")
+            resumeRelease.countDown()
+            joined(oldWorker!!)
+            assertSame(cleanupFatal, uncaught.get())
+            assertSame(replacementSession, field(manager, "activeSession"))
+            assertEquals(replacementToken, field(manager, "activeAttemptToken"))
+            assertEquals(CaptureStatus.RUNNING, manager.uiState.value.status)
+            assertEquals(1, oldRecord.releases.get())
+            assertEquals(0, healthyRecord.releases.get())
+        } finally {
+            resumeRelease.countDown()
+            oldWorker?.let { joined(it) }
+            manager.stopCapture()
+        }
+        assertEquals(1, healthyRecord.releases.get())
+    }
 }

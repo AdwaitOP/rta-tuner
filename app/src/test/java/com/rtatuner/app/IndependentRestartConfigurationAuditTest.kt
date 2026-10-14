@@ -40,14 +40,16 @@ class IndependentRestartConfigurationAuditTest {
     private lateinit var builtIn: AudioDeviceInfo
     private lateinit var usbA: AudioDeviceInfo
     private lateinit var usbB: AudioDeviceInfo
+    private lateinit var bluetooth: AudioDeviceInfo
 
     @Before fun setup() {
         app = RuntimeEnvironment.getApplication()
         builtIn = device(1, "Actual built-in", AudioDeviceInfo.TYPE_BUILTIN_MIC, 48000)
         usbA = device(101, "Requested USB A", AudioDeviceInfo.TYPE_USB_DEVICE, 48000)
         usbB = device(102, "Requested USB B", AudioDeviceInfo.TYPE_USB_DEVICE, 44100)
+        bluetooth = device(201, "Observed Bluetooth SCO", AudioDeviceInfo.TYPE_BLUETOOTH_SCO, 16000)
         val audio = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        Shadows.shadowOf(audio).setInputDevices(listOf(builtIn, usbA, usbB))
+        Shadows.shadowOf(audio).setInputDevices(listOf(builtIn, usbA, usbB, bluetooth))
     }
 
     private fun device(id: Int, name: String, type: Int, rate: Int): AudioDeviceInfo {
@@ -368,6 +370,225 @@ class IndependentRestartConfigurationAuditTest {
             assertEquals(48000, published.diagnostics.actualSampleRate)
             assertEquals(MediaRecorder.AudioSource.UNPROCESSED, a.requestedSource)
         } finally { resumeFrame.countDown(); f.manager.release() }
+    }
+
+    @Test fun absentNativeRouteRemainsUnknownUntilNonNullObservation() {
+        val a = AuditRecord(actualRoute = null)
+        val f = fixture(a, config = AudioCaptureConfig(1024, 512, preferredDeviceId = 101), nativeWorkers = true)
+        try {
+            assertTrue(f.manager.startCapture())
+            await(a.inRead, "Worker must start and complete first route query")
+            val unknown = f.manager.uiState.value
+            assertNull("No native route observed; routedDeviceId must be null", unknown.routedDeviceId)
+            assertEquals("Requested USB A", unknown.diagnostics.requestedDeviceName)
+            assertEquals("Pending", unknown.diagnostics.actualRoutedDeviceName)
+            assertEquals("Pending", unknown.diagnostics.actualRoutedDeviceType)
+            assertFalse(unknown.isRoutingMismatch)
+            assertNull(unknown.routingMismatchMessage)
+
+            // Later valid USB routing callback arrives
+            a.actualRoute = usbA
+            a.listeners.single().onRoutingChanged(null)
+            val observed = f.manager.uiState.value
+            assertEquals(101, observed.routedDeviceId)
+            assertEquals("Requested USB A", observed.diagnostics.actualRoutedDeviceName)
+            assertEquals("USB Audio Class (UAC)", observed.diagnostics.actualRoutedDeviceType)
+            assertFalse(observed.isRoutingMismatch)
+        } finally { f.manager.release() }
+    }
+
+    @Test fun automaticDefaultCaptureWithNullRouteRemainsPendingUntilNonNullBuiltInRoute() {
+        val a = AuditRecord(actualRoute = null)
+        val f = fixture(a, config = AudioCaptureConfig(1024, 512, preferredDeviceId = null), nativeWorkers = true)
+        try {
+            assertTrue(f.manager.startCapture())
+            await(a.inRead, "Worker must start and complete first route query")
+            val unknown = f.manager.uiState.value
+            assertNull("routedDeviceId must be null when native route is null", unknown.routedDeviceId)
+            assertEquals("Auto (System Default)", unknown.diagnostics.requestedDeviceName)
+            assertEquals("Pending", unknown.diagnostics.actualRoutedDeviceName)
+            assertEquals("Pending", unknown.diagnostics.actualRoutedDeviceType)
+            assertFalse(unknown.isRoutingMismatch)
+
+            // Later valid built-in routing callback arrives
+            a.actualRoute = builtIn
+            a.listeners.single().onRoutingChanged(null)
+            val observed = f.manager.uiState.value
+            assertEquals(1, observed.routedDeviceId)
+            assertEquals("Actual built-in", observed.diagnostics.actualRoutedDeviceName)
+            assertEquals("Built-in Mic", observed.diagnostics.actualRoutedDeviceType)
+            assertFalse(observed.isRoutingMismatch)
+        } finally { f.manager.release() }
+    }
+
+    @Test fun requestedVsActualMismatchReportingWhenObservedRouteDiffers() {
+        val a = AuditRecord(actualRoute = null)
+        val f = fixture(a, config = AudioCaptureConfig(1024, 512, preferredDeviceId = 101), nativeWorkers = true)
+        try {
+            assertTrue(f.manager.startCapture())
+            await(a.inRead, "Worker must start and complete first route query")
+            // While route is null, no false mismatch
+            assertFalse(f.manager.uiState.value.isRoutingMismatch)
+
+            // Routing resolves to built-in instead of requested USB A
+            a.actualRoute = builtIn
+            a.listeners.single().onRoutingChanged(null)
+            val observed = f.manager.uiState.value
+            assertEquals(1, observed.routedDeviceId)
+            assertTrue("Routing mismatch must be reported when observed route differs from requested", observed.isRoutingMismatch)
+            assertTrue("Diagnostics mismatch must be true", observed.diagnostics.isRoutingMismatch)
+            assertEquals("Requested 'Requested USB A' but audio is routed to 'Actual built-in'.", observed.routingMismatchMessage)
+        } finally { f.manager.release() }
+    }
+
+    @Test fun newPendingSessionCannotCarryOldBluetoothAndMismatchWarnings() {
+        val old = AuditRecord(actualRoute = bluetooth)
+        val replacement = AuditRecord(actualRoute = usbB)
+        val f = fixture(old, replacement, config = AudioCaptureConfig(1024, 512, preferredDeviceId = 101), nativeWorkers = true)
+        val newWorkerPaused = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        f.manager.onPreStartRecording = { session ->
+            if (session.generation == 2L) {
+                newWorkerPaused.countDown()
+                await(resume, "Resume replacement native start")
+            }
+        }
+        try {
+            assertTrue(f.manager.startCapture())
+            await(old.inRead, "Initial Bluetooth route publication")
+            assertTrue(f.manager.uiState.value.isRoutingMismatch)
+            assertTrue(f.manager.uiState.value.isBluetoothBandwidthLimited)
+            assertNotNull(f.manager.uiState.value.routingMismatchMessage)
+            assertNotNull(f.manager.uiState.value.bluetoothWarningText)
+
+            f.manager.setPreferredInputDevice(102)
+            await(newWorkerPaused, "Replacement session before native start")
+            val pending = f.manager.uiState.value
+            assertEquals(CaptureStatus.RUNNING, pending.status)
+            assertEquals(102, pending.selectedDeviceId)
+            assertNull(pending.routedDeviceId)
+            assertEquals("Pending", pending.diagnostics.actualRoutedDeviceName)
+            assertEquals("Pending", pending.diagnostics.actualRoutedDeviceType)
+            assertFalse("Old owner's routing mismatch cannot attach to pending replacement", pending.isRoutingMismatch)
+            assertNull("Old owner's mismatch message must be cleared", pending.routingMismatchMessage)
+            assertFalse("Old owner's Bluetooth warning flag cannot attach to pending replacement", pending.isBluetoothBandwidthLimited)
+            assertNull("Old owner's Bluetooth warning message must be cleared", pending.bluetoothWarningText)
+
+            resume.countDown()
+            await(replacement.inRead, "Replacement observes USB B route")
+            val observed = f.manager.uiState.value
+            assertEquals(102, observed.routedDeviceId)
+            assertEquals("Requested USB B", observed.diagnostics.actualRoutedDeviceName)
+            assertFalse("Warnings remain cleared when replacement routes as requested", observed.isRoutingMismatch)
+            assertFalse("Bluetooth warning remains cleared", observed.isBluetoothBandwidthLimited)
+            assertNull(observed.routingMismatchMessage)
+            assertNull(observed.bluetoothWarningText)
+        } finally { resume.countDown(); f.manager.release() }
+    }
+
+    @Test fun warningsReappearWhenReplacementSessionGenuinelyRoutesOverBluetooth() {
+        val old = AuditRecord(actualRoute = usbA)
+        val replacement = AuditRecord(actualRoute = bluetooth)
+        val f = fixture(old, replacement, config = AudioCaptureConfig(1024, 512, preferredDeviceId = 101), nativeWorkers = true)
+        val newWorkerPaused = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        f.manager.onPreStartRecording = { session ->
+            if (session.generation == 2L) {
+                newWorkerPaused.countDown()
+                await(resume, "Resume replacement native start")
+            }
+        }
+        try {
+            assertTrue(f.manager.startCapture())
+            await(old.inRead, "Old session USB A route")
+            assertFalse(f.manager.uiState.value.isRoutingMismatch)
+            assertFalse(f.manager.uiState.value.isBluetoothBandwidthLimited)
+
+            f.manager.setPreferredInputDevice(102)
+            await(newWorkerPaused, "Replacement session pending")
+            val pending = f.manager.uiState.value
+            assertFalse(pending.isRoutingMismatch)
+            assertFalse(pending.isBluetoothBandwidthLimited)
+
+            resume.countDown()
+            await(replacement.inRead, "Replacement observes Bluetooth route")
+            val observed = f.manager.uiState.value
+            assertEquals(201, observed.routedDeviceId)
+            assertTrue("Routing mismatch must be reported for Bluetooth fallback", observed.isRoutingMismatch)
+            assertTrue("Bluetooth bandwidth limited flag must be true", observed.isBluetoothBandwidthLimited)
+            assertNotNull(observed.routingMismatchMessage)
+            assertNotNull(observed.bluetoothWarningText)
+        } finally { resume.countDown(); f.manager.release() }
+    }
+
+    @Test fun explicitStopInvalidatesBothPendingOverlappingSwitches() {
+        val cleanupEntered = CountDownLatch(1)
+        val cleanupResume = CountDownLatch(1)
+        val refreshEntered = CountDownLatch(1)
+        val refreshResume = CountDownLatch(1)
+        val old = AuditRecord(onRelease = { cleanupEntered.countDown(); await(cleanupResume, "Resume first switch cleanup") })
+        val replacement = AuditRecord()
+        val f = fixture(old, replacement)
+        val thrownA = AtomicReference<Throwable?>()
+        val thrownB = AtomicReference<Throwable?>()
+        f.manager.onPreReconfigurationRestart = { token ->
+            if (token == 2L) {
+                refreshEntered.countDown()
+                await(refreshResume, "Resume second switch refresh")
+            }
+        }
+        assertTrue(f.manager.startCapture())
+        val a = Thread({ try { f.manager.setPreferredInputDevice(101) } catch (t: Throwable) { thrownA.set(t) } })
+        val b = Thread({ try { f.manager.setPreferredInputDevice(102) } catch (t: Throwable) { thrownB.set(t) } })
+        a.start()
+        try {
+            await(cleanupEntered, "First switch must be in cleanup")
+            b.start()
+            await(refreshEntered, "Second switch must own pending restart")
+            f.manager.stopCapture()
+        } finally {
+            refreshResume.countDown()
+            cleanupResume.countDown()
+            a.join(10000)
+            b.join(10000)
+        }
+        assertFalse(a.isAlive)
+        assertFalse(b.isAlive)
+        thrownA.get()?.let { throw AssertionError("Switch A failure", it) }
+        thrownB.get()?.let { throw AssertionError("Switch B failure", it) }
+        assertEquals(CaptureStatus.STOPPED, f.manager.uiState.value.status)
+        assertEquals(102, f.manager.uiState.value.selectedDeviceId)
+        assertEquals(1, f.created.get())
+        assertEquals(1, old.releases.get())
+        assertEquals(0, replacement.releases.get())
+        f.manager.release()
+    }
+
+    @Test fun staleRoutingCallbackCannotRestorePreviousSessionWarnings() {
+        val a = AuditRecord(actualRoute = bluetooth)
+        val b = AuditRecord(actualRoute = usbB)
+        val f = fixture(a, b, config = AudioCaptureConfig(1024, 512, preferredDeviceId = 101), nativeWorkers = true)
+        try {
+            assertTrue(f.manager.startCapture())
+            await(a.inRead, "A Bluetooth routing")
+            val staleListener = a.listeners.single()
+            assertTrue(f.manager.uiState.value.isRoutingMismatch)
+            assertTrue(f.manager.uiState.value.isBluetoothBandwidthLimited)
+
+            f.manager.setPreferredInputDevice(102)
+            await(b.inRead, "B USB B routing")
+            val bState = f.manager.uiState.value
+            assertEquals(102, bState.routedDeviceId)
+            assertFalse(bState.isRoutingMismatch)
+            assertFalse(bState.isBluetoothBandwidthLimited)
+
+            // Stale callback from A's recorder fires
+            staleListener.onRoutingChanged(null)
+            val afterStale = f.manager.uiState.value
+            assertEquals(bState, afterStale)
+            assertFalse("Stale callback must not restore obsolete mismatch warning", afterStale.isRoutingMismatch)
+            assertFalse("Stale callback must not restore obsolete Bluetooth warning", afterStale.isBluetoothBandwidthLimited)
+        } finally { f.manager.release() }
     }
 
     @Suppress("DEPRECATION")

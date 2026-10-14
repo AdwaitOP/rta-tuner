@@ -716,6 +716,10 @@ class AudioCaptureManager(
                         status = CaptureStatus.RUNNING,
                         errorMessage = null,
                         routedDeviceId = null,
+                        isRoutingMismatch = false,
+                        routingMismatchMessage = null,
+                        isBluetoothBandwidthLimited = false,
+                        bluetoothWarningText = null,
                         diagnostics = AudioCaptureDiagnostics(
                             activeAudioSource = activeSourceName,
                             requestedSampleRate = requestedRate,
@@ -822,6 +826,7 @@ class AudioCaptureManager(
      * Guaranteed to interact only with its owned [session] resources.
      */
     private fun runAudioCaptureLoop(session: CaptureSession) {
+        var workerPrimary: Throwable? = null
         try {
             try {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
@@ -962,6 +967,8 @@ class AudioCaptureManager(
         } catch (e: Exception) {
             Log.e(TAG, "Unhandled exception in capture loop for session ${session.generation}", e)
             notifyCaptureError(session, "Capture loop error: ${e.message}")
+        } catch (fatal: Throwable) {
+            workerPrimary = fatal
         } finally {
             var cleanupFatal: Throwable? = null
             try {
@@ -982,12 +989,24 @@ class AudioCaptureManager(
                         if (_uiState.value.status == CaptureStatus.RUNNING) {
                             _uiState.value = _uiState.value.copy(
                                 status = CaptureStatus.STOPPED,
-                                routedDeviceId = null
+                                routedDeviceId = null,
+                                isRoutingMismatch = false,
+                                routingMismatchMessage = null,
+                                isBluetoothBandwidthLimited = false,
+                                bluetoothWarningText = null
                             )
                         }
                     }
                 }
             } finally {
+                if (workerPrimary != null) {
+                    if (cleanupFatal != null && workerPrimary !== cleanupFatal) {
+                        try {
+                            workerPrimary.addSuppressed(cleanupFatal)
+                        } catch (_: Throwable) { }
+                    }
+                    throw workerPrimary
+                }
                 cleanupFatal?.let { throw it }
             }
             Log.i(TAG, "Audio capture thread for session ${session.generation} exited cleanly")
@@ -1043,7 +1062,11 @@ class AudioCaptureManager(
                 _uiState.value = _uiState.value.copy(
                     status = CaptureStatus.ERROR,
                     errorMessage = message,
-                    routedDeviceId = null
+                    routedDeviceId = null,
+                    isRoutingMismatch = false,
+                    routingMismatchMessage = null,
+                    isBluetoothBandwidthLimited = false,
+                    bluetoothWarningText = null
                 )
                 shouldClean = true
             } else {
@@ -1077,7 +1100,11 @@ class AudioCaptureManager(
                 status = CaptureStatus.STOPPED,
                 errorMessage = null,
                 isClipping = false,
-                routedDeviceId = null
+                routedDeviceId = null,
+                isRoutingMismatch = false,
+                routingMismatchMessage = null,
+                isBluetoothBandwidthLimited = false,
+                bluetoothWarningText = null
             )
         }
 
@@ -1105,13 +1132,13 @@ class AudioCaptureManager(
             return
         }
 
-        val actualName = routedDevice?.productName?.toString()?.takeIf { it.isNotBlank() }
-            ?: if (routedDevice != null) {
-                AudioInputDeviceInfo.classifyDevice(routedDevice.type).second
-            } else {
-                "Default Mic (Auto)"
-            }
-        val actualType = routedDevice?.let { AudioInputDeviceInfo.classifyDevice(it.type).second } ?: "Built-in"
+        val actualName = if (routedDevice != null) {
+            routedDevice.productName?.toString()?.takeIf { it.isNotBlank() }
+                ?: AudioInputDeviceInfo.classifyDevice(routedDevice.type).second
+        } else {
+            "Pending"
+        }
+        val actualType = routedDevice?.let { AudioInputDeviceInfo.classifyDevice(it.type).second } ?: "Pending"
         val isUsb = routedDevice?.let {
             it.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
             it.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
