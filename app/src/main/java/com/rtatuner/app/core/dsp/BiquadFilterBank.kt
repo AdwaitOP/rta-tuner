@@ -89,7 +89,15 @@ class BiquadFilterBank(
 
         private const val INV_SHORT_MAX = 1.0 / 32768.0
         private const val ANTI_DENORMAL_THRESHOLD = 1e-25
+
+        /**
+         * Authoritative DSP measurement-response revision identifying the corrected
+         * 4th-order 1/3-octave cascaded biquad filter bank.
+         */
+        val CURRENT_RESPONSE_REVISION: DspResponseRevision = DspResponseRevision.CURRENT
     }
+
+    val responseRevision: DspResponseRevision = CURRENT_RESPONSE_REVISION
 
     var sampleRate: Int = sampleRate
         private set

@@ -203,7 +203,8 @@ class AudioCaptureViewModel(
                     val calFrame = calibrationManager.processFrame(
                         raw31Bands = mgrState.octave31Db,
                         rawFftDb = mgrState.rawFftDb,
-                        binResolutionHz = binRes
+                        binResolutionHz = binRes,
+                        frameContext = mgrState.frameContext
                     )
 
                     val rawSpl = if (calFrame.isSplMode) calFrame.splOffsetDb else 0.0f

@@ -18,7 +18,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import com.rtatuner.app.core.dsp.BiquadFilterBank
+import com.rtatuner.app.core.dsp.DspResponseRevision
 import com.rtatuner.app.core.dsp.FftProcessor
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
@@ -123,8 +125,23 @@ internal class CaptureSession(
     val requestedRate: Int,
     val actualRate: Int,
     val windowSize: Int,
-    val hopSize: Int
+    val hopSize: Int,
+    val selectedSource: Int = MediaRecorder.AudioSource.UNPROCESSED,
+    val actualSource: Int = MediaRecorder.AudioSource.UNPROCESSED,
+    val effectsInfo: CaptureEffectsInfo = CaptureEffectsInfo()
 ) {
+    @Volatile
+    var currentFingerprint: CaptureFingerprint = CaptureFingerprint(
+        dspRevision = DspResponseRevision.CURRENT,
+        actualSampleRate = actualRate,
+        routedMicrophoneId = CaptureFingerprint.UNKNOWN_MICROPHONE_ID,
+        routedDeviceType = CaptureFingerprint.UNKNOWN_DEVICE_TYPE,
+        selectedAudioSource = selectedSource,
+        actualAudioSource = actualSource,
+        isSourceFallback = (selectedSource != actualSource),
+        effects = effectsInfo
+    )
+
     private val sessionLock = Any()
     @Volatile
     private var isCleanedUp = false
@@ -283,6 +300,27 @@ class AudioCaptureManager(
     }
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    /** Unique monotonic/UUID identifier for this AudioCaptureManager instance */
+    val managerId: String = UUID.randomUUID().toString()
+
+    private fun probeAcousticEffects(): CaptureEffectsInfo {
+        return try {
+            CaptureEffectsInfo(
+                aecAvailable = android.media.audiofx.AcousticEchoCanceler.isAvailable(),
+                agcAvailable = android.media.audiofx.AutomaticGainControl.isAvailable(),
+                nsAvailable = android.media.audiofx.NoiseSuppressor.isAvailable(),
+                isEffectsKnown = true
+            )
+        } catch (_: Throwable) {
+            CaptureEffectsInfo(
+                aecAvailable = false,
+                agcAvailable = false,
+                nsAvailable = false,
+                isEffectsKnown = false
+            )
+        }
+    }
 
     // State flow for UI and diagnostics
     private val _uiState = MutableStateFlow(AudioCaptureUiState())
@@ -673,7 +711,10 @@ class AudioCaptureManager(
                 requestedRate = requestedRate,
                 actualRate = sampleRate,
                 windowSize = windowSize,
-                hopSize = hopSize
+                hopSize = hopSize,
+                selectedSource = attemptConfig.preferredAudioSource,
+                actualSource = sourceNegotiation.actualAudioSource,
+                effectsInfo = probeAcousticEffects()
             )
             // Transfer ownership to session
             createdSession = session
@@ -1034,6 +1075,13 @@ class AudioCaptureManager(
                 return false
             }
             val current = _uiState.value
+            val frameContext = CapturedFrameContext(
+                managerId = managerId,
+                captureGeneration = session.generation,
+                frameSequence = totalFrames,
+                fingerprint = session.currentFingerprint,
+                isRunning = true
+            )
             _uiState.value = current.copy(
                 rmsDb = rmsDb,
                 peakDb = peakDb,
@@ -1046,7 +1094,8 @@ class AudioCaptureManager(
                     consecutiveZeroReads = 0,
                     fftExecutionTimeUs = fftExecutionTimeUs,
                     filterBankExecutionTimeUs = filterBankExecutionTimeUs
-                )
+                ),
+                frameContext = frameContext
             )
             return true
         }
@@ -1066,7 +1115,8 @@ class AudioCaptureManager(
                     isRoutingMismatch = false,
                     routingMismatchMessage = null,
                     isBluetoothBandwidthLimited = false,
-                    bluetoothWarningText = null
+                    bluetoothWarningText = null,
+                    frameContext = null
                 )
                 shouldClean = true
             } else {
@@ -1104,7 +1154,8 @@ class AudioCaptureManager(
                 isRoutingMismatch = false,
                 routingMismatchMessage = null,
                 isBluetoothBandwidthLimited = false,
-                bluetoothWarningText = null
+                bluetoothWarningText = null,
+                frameContext = null
             )
         }
 
@@ -1163,6 +1214,26 @@ class AudioCaptureManager(
 
         val routedId = routedDevice?.id
         val selectedId = _uiState.value.selectedDeviceId
+
+        val actualMicId = if (routedDevice != null) {
+            val name = routedDevice.productName?.toString()?.takeIf { it.isNotBlank() } ?: "Device #${routedDevice.id}"
+            "${routedDevice.id}:$name"
+        } else {
+            CaptureFingerprint.UNKNOWN_MICROPHONE_ID
+        }
+        val actualDeviceType = routedDevice?.let { AudioInputDeviceInfo.classifyDevice(it.type).second }
+            ?: CaptureFingerprint.UNKNOWN_DEVICE_TYPE
+
+        session.currentFingerprint = CaptureFingerprint(
+            dspRevision = DspResponseRevision.CURRENT,
+            actualSampleRate = session.actualRate,
+            routedMicrophoneId = actualMicId,
+            routedDeviceType = actualDeviceType,
+            selectedAudioSource = session.selectedSource,
+            actualAudioSource = session.actualSource,
+            isSourceFallback = (session.selectedSource != session.actualSource),
+            effects = session.effectsInfo
+        )
 
         val current = _uiState.value
         _uiState.value = current.copy(
@@ -1298,7 +1369,7 @@ class AudioCaptureManager(
                         "AudioSource ($preferredSource)"
                     }
                     Log.i(TAG, "Successfully initialized AudioRecord with source: $name")
-                    val result = RecordNegotiationResult(primaryRecord, name)
+                    val result = RecordNegotiationResult(primaryRecord, name, preferredSource)
                     primaryRecord = null // ownership successfully transferred
                     return result
                 } else {
@@ -1348,7 +1419,7 @@ class AudioCaptureManager(
                     }
                     if (fallbackState == AudioRecord.STATE_INITIALIZED) {
                         Log.i(TAG, "Successfully initialized fallback AudioRecord with source: MIC")
-                        val result = RecordNegotiationResult(fallbackRecord, "MIC (Fallback Source)")
+                        val result = RecordNegotiationResult(fallbackRecord, "MIC (Fallback Source)", MediaRecorder.AudioSource.MIC)
                         fallbackRecord = null // ownership successfully transferred
                         return result
                     } else {
@@ -1382,7 +1453,8 @@ class AudioCaptureManager(
 
     private data class RecordNegotiationResult(
         val record: AudioRecordSource,
-        val sourceName: String
+        val sourceName: String,
+        val actualAudioSource: Int
     )
 
     data class SampleRateResolution(

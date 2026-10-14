@@ -19,6 +19,13 @@ internal fun effectiveCalibrationState(
         policy.check(ProFeature.ADVANCED_TARGETS) is FeatureAccessResult.Allowed
     val micActive = requested.isMicCurveActive && requested.micCurve != null && micAllowed
 
+    // X01 compatibility gate: effective noise subtraction requires entitlement AND valid, non-recapture snapshot
+    val noiseSubRequested = requested.isNoiseSubtractionActive && noiseAllowed
+    val noiseEffective = noiseSubRequested &&
+        requested.noiseFloor.isCaptured &&
+        !requested.noiseFloor.requiresRecapture &&
+        requested.noiseFloor.fingerprint != null
+
     return requested.copy(
         isMicCurveActive = micActive,
         micCurveStatusText = when {
@@ -28,7 +35,8 @@ internal fun effectiveCalibrationState(
         },
         splCalibration = requested.splCalibration.copy(isSplMode = requested.splCalibration.isSplMode && splAllowed),
         isTargetCurveActive = requested.isTargetCurveActive && targetAllowed,
-        isNoiseSubtractionActive = requested.isNoiseSubtractionActive && noiseAllowed,
+        isNoiseSubtractionActive = noiseSubRequested,
+        isNoiseSubtractionEffective = noiseEffective,
         isCapturingNoiseFloor = requested.isCapturingNoiseFloor && noiseAllowed,
         noiseCaptureProgress = if (noiseAllowed) requested.noiseCaptureProgress else 0.0f
     )

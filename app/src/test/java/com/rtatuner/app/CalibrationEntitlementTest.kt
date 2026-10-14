@@ -39,6 +39,13 @@ class CalibrationEntitlementTest {
             .putBoolean("target_curve_active", true)
             .putString("noise_floor_bands", FloatArray(31) { -50f }.joinToString(","))
             .putLong("noise_floor_timestamp", 1234L)
+            .putString("noise_floor_fingerprint", com.rtatuner.app.core.audio.CaptureFingerprint(
+                actualSampleRate = 48000,
+                routedMicrophoneId = "builtin_mic",
+                routedDeviceType = "TYPE_BUILTIN_MIC",
+                selectedAudioSource = 6,
+                actualAudioSource = 6
+            ).toJsonString())
             .putBoolean("noise_floor_captured", true)
             .putBoolean("noise_subtraction_active", true)
             .commit()

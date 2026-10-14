@@ -1,5 +1,7 @@
 package com.rtatuner.app.core.calibration
 
+import com.rtatuner.app.core.audio.CaptureFingerprint
+import com.rtatuner.app.core.audio.NoiseFloorCompatibility
 import kotlin.math.log10
 
 /**
@@ -199,12 +201,22 @@ data class TargetCurve(
 
 /**
  * Snapshot of captured ambient room/cabin noise floor.
+ *
+ * Includes compatibility fingerprint metadata (X01) ensuring that legacy captures
+ * or measurements from different microphones, sample rates, or DSP revisions
+ * are safely gated rather than subtracted from incompatible live frames.
  */
 data class NoiseFloorSnapshot(
     val bands31Db: FloatArray = FloatArray(31) { -100.0f },
     val captureTimestampMs: Long = 0L,
-    val isCaptured: Boolean = false
+    val isCaptured: Boolean = false,
+    val fingerprint: CaptureFingerprint? = null,
+    val requiresRecapture: Boolean = false,
+    val compatibilityReason: String? = null
 ) {
+    val isLegacy: Boolean
+        get() = isCaptured && fingerprint == null
+
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (javaClass != other?.javaClass) return false
@@ -212,6 +224,9 @@ data class NoiseFloorSnapshot(
         if (!bands31Db.contentEquals(other.bands31Db)) return false
         if (captureTimestampMs != other.captureTimestampMs) return false
         if (isCaptured != other.isCaptured) return false
+        if (fingerprint != other.fingerprint) return false
+        if (requiresRecapture != other.requiresRecapture) return false
+        if (compatibilityReason != other.compatibilityReason) return false
         return true
     }
 
@@ -219,8 +234,80 @@ data class NoiseFloorSnapshot(
         var result = bands31Db.contentHashCode()
         result = 31 * result + captureTimestampMs.hashCode()
         result = 31 * result + isCaptured.hashCode()
+        result = 31 * result + (fingerprint?.hashCode() ?: 0)
+        result = 31 * result + requiresRecapture.hashCode()
+        result = 31 * result + (compatibilityReason?.hashCode() ?: 0)
         return result
     }
+}
+
+/**
+ * Evaluates compatibility of a captured noise floor snapshot against live capture context.
+ */
+fun evaluateNoiseFloorCompatibility(
+    snapshot: NoiseFloorSnapshot,
+    liveFingerprint: CaptureFingerprint?
+): NoiseFloorCompatibility {
+    if (!snapshot.isCaptured) {
+        return NoiseFloorCompatibility.Uncaptured
+    }
+    val snapshotFp = snapshot.fingerprint
+    if (snapshotFp == null) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "Legacy noise floor capture is incompatible with corrected DSP. Recapture required.",
+            requiresRecapture = true
+        )
+    }
+    if (liveFingerprint == null) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "Live audio capture context is stopped or inactive.",
+            requiresRecapture = false
+        )
+    }
+    if (!liveFingerprint.isMicrophoneKnown) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "Live microphone route is pending or unknown.",
+            requiresRecapture = false
+        )
+    }
+    if (!snapshotFp.isMicrophoneKnown) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "Captured microphone route was unknown. Recapture required.",
+            requiresRecapture = true
+        )
+    }
+    if (snapshotFp.dspRevision != liveFingerprint.dspRevision) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "DSP response revision mismatch (snapshot: ${snapshotFp.dspRevision.revisionId}, live: ${liveFingerprint.dspRevision.revisionId}). Recapture required.",
+            requiresRecapture = true
+        )
+    }
+    if (snapshotFp.actualSampleRate != liveFingerprint.actualSampleRate) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "Sample rate mismatch (snapshot: ${snapshotFp.actualSampleRate} Hz, live: ${liveFingerprint.actualSampleRate} Hz). Recapture required.",
+            requiresRecapture = true
+        )
+    }
+    if (snapshotFp.routedMicrophoneId != liveFingerprint.routedMicrophoneId) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "Microphone route mismatch (snapshot: '${snapshotFp.routedMicrophoneId}', live: '${liveFingerprint.routedMicrophoneId}'). Recapture required.",
+            requiresRecapture = true
+        )
+    }
+    if (snapshotFp.actualAudioSource != liveFingerprint.actualAudioSource) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "Audio source mismatch (snapshot: ${snapshotFp.actualAudioSource}, live: ${liveFingerprint.actualAudioSource}). Recapture required.",
+            requiresRecapture = true
+        )
+    }
+    if (snapshotFp.effects != liveFingerprint.effects) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "Audio capture effects mismatch. Recapture required.",
+            requiresRecapture = true
+        )
+    }
+
+    return NoiseFloorCompatibility.Compatible
 }
 
 /**

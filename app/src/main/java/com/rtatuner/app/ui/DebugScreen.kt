@@ -2549,7 +2549,7 @@ fun CalibrationControlsCard(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
+                        Column(modifier = Modifier.weight(1f, fill = false)) {
                             Text(
                                 text = "POWER-DOMAIN NOISE SUBTRACTION",
                                 color = Color(0xFFECEFF1),
@@ -2557,9 +2557,22 @@ fun CalibrationControlsCard(
                                 fontWeight = FontWeight.Bold,
                                 fontFamily = FontFamily.Monospace
                             )
+                            val statusText = when {
+                                !calib.noiseFloor.isCaptured -> "No background noise captured"
+                                calib.noiseFloor.requiresRecapture -> "Recapture required: ${calib.noiseFloor.compatibilityReason ?: "DSP format mismatch"}"
+                                calib.isNoiseSubtractionEffective -> "Noise profile active & compatible (31 bands)"
+                                calib.isNoiseSubtractionActive -> "Noise subtraction paused (${calib.noiseFloorCompatibility})"
+                                else -> "Noise profile captured (subtraction disabled)"
+                            }
+                            val statusColor = when {
+                                !calib.noiseFloor.isCaptured -> Color(0xFF90A4AE)
+                                calib.noiseFloor.requiresRecapture -> Color(0xFFFF5252)
+                                calib.isNoiseSubtractionEffective -> Color(0xFF00E676)
+                                else -> Color(0xFFFFB300)
+                            }
                             Text(
-                                text = if (calib.noiseFloor.isCaptured) "Noise profile active (31 bands)" else "No background noise captured",
-                                color = if (calib.noiseFloor.isCaptured) Color(0xFF00E676) else Color(0xFF90A4AE),
+                                text = statusText,
+                                color = statusColor,
                                 fontSize = 9.sp,
                                 fontFamily = FontFamily.Monospace
                             )
@@ -2568,7 +2581,7 @@ fun CalibrationControlsCard(
                         Switch(
                             checked = calib.isNoiseSubtractionActive,
                             onCheckedChange = { onSetNoiseSubtractionActive(it) },
-                            enabled = calib.noiseFloor.isCaptured,
+                            enabled = calib.noiseFloor.isCaptured && !calib.noiseFloor.requiresRecapture,
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = Color(0xFF00E676),
                                 checkedTrackColor = Color(0xFF2E7D32),
@@ -2582,6 +2595,29 @@ fun CalibrationControlsCard(
                                 disabledUncheckedTrackColor = Color(0xFF263238),
                                 disabledUncheckedBorderColor = Color(0xFF37474F)
                             )
+                        )
+                    }
+
+                    if (calib.noiseFloor.isCaptured) {
+                        val fp = calib.noiseFloor.fingerprint
+                        val dspRev = fp?.dspRevision?.revisionId ?: "Legacy (pre-Wave 1)"
+                        val mic = fp?.routedMicrophoneId ?: "Unknown"
+                        val rate = fp?.let { "${it.actualSampleRate} Hz" } ?: "Unknown"
+                        Text(
+                            text = "Metadata: DSP=$dspRev | Mic=$mic | $rate",
+                            color = Color(0xFF78909C),
+                            fontSize = 8.5.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+
+                    if (calib.noiseFloor.requiresRecapture) {
+                        Text(
+                            text = "COMPATIBILITY GATE: Live subtraction disabled because ${calib.noiseFloor.compatibilityReason ?: "noise floor context is incompatible"}. Capture a fresh baseline with the current microphone to enable.",
+                            color = Color(0xFFFF8A80),
+                            fontSize = 8.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
                         )
                     }
 
