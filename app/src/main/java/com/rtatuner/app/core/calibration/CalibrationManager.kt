@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
 import com.rtatuner.app.core.audio.AudioMath
+import com.rtatuner.app.core.audio.CaptureAuthoritySnapshot
 import com.rtatuner.app.core.audio.CaptureFingerprint
 import com.rtatuner.app.core.audio.CapturedFrameContext
 import com.rtatuner.app.core.audio.NoiseFloorCompatibility
@@ -153,8 +154,11 @@ class CalibrationManager internal constructor(
     private val noiseAccumPower = DoubleArray(Iso31Bands.NUM_BANDS) { 0.0 }
     private var activeNoiseCaptureManagerId: String? = null
     private var activeNoiseCaptureGeneration: Long? = null
+    private var activeNoiseCaptureEpoch: Long? = null
     private var activeNoiseCaptureFingerprint: CaptureFingerprint? = null
     private var lastAccumulatedFrameSequence: Long = -1L
+    @Volatile
+    private var currentAuthority: CaptureAuthoritySnapshot? = null
     @Volatile
     private var liveCaptureFingerprint: CaptureFingerprint? = null
     private val shouldResetSmoothing = AtomicBoolean(false)
@@ -172,6 +176,35 @@ class CalibrationManager internal constructor(
                 publishEffectiveStateLocked()
                 shouldResetSmoothing.set(true)
             }
+        }
+    }
+
+    fun updateCaptureAuthority(authority: CaptureAuthoritySnapshot) {
+        synchronized(stateLock) {
+            currentAuthority = authority
+
+            if (isCapturingNoise) {
+                val shouldCancel = !authority.isRunning ||
+                    !authority.isValidRunningAuthority ||
+                    (activeNoiseCaptureManagerId != null && authority.managerId != activeNoiseCaptureManagerId) ||
+                    (activeNoiseCaptureGeneration != null && authority.captureGeneration != activeNoiseCaptureGeneration) ||
+                    (activeNoiseCaptureEpoch != null && authority.routeEpoch != activeNoiseCaptureEpoch) ||
+                    (activeNoiseCaptureFingerprint != null && authority.fingerprint != activeNoiseCaptureFingerprint)
+
+                if (shouldCancel) {
+                    cancelNoiseCaptureLocked()
+                }
+            }
+
+            publishEffectiveStateLocked()
+            shouldResetSmoothing.set(true)
+        }
+    }
+
+    fun cancelNoiseCapture() {
+        synchronized(stateLock) {
+            cancelNoiseCaptureLocked()
+            publishEffectiveStateLocked()
         }
     }
 
@@ -285,7 +318,7 @@ class CalibrationManager internal constructor(
     }
 
     private fun publishEffectiveStateLocked() {
-        val effective = effectiveCalibrationState(requestedState, featurePolicy)
+        val effective = effectiveCalibrationState(requestedState, featurePolicy, currentAuthority)
         val curve = effective.micCurve?.copy(points = effective.micCurve.points.toList())
         val processingState = effective.copy(
             micCurve = curve,
@@ -326,29 +359,19 @@ class CalibrationManager internal constructor(
         if (isCapturingNoise) synchronized(stateLock) {
             if (isCapturingNoise) {
                 var canAccumulate = true
-                if (frameContext != null) {
-                    if (!frameContext.isRunning || frameContext.frameSequence <= 0) {
+                if (frameContext == null || !frameContext.isRunning) {
+                    cancelNoiseCaptureLocked()
+                    canAccumulate = false
+                } else {
+                    if (frameContext.managerId != activeNoiseCaptureManagerId ||
+                        frameContext.captureGeneration != activeNoiseCaptureGeneration ||
+                        (activeNoiseCaptureEpoch != null && frameContext.routeEpoch != activeNoiseCaptureEpoch) ||
+                        frameContext.fingerprint != activeNoiseCaptureFingerprint ||
+                        !frameContext.fingerprint.isMicrophoneKnown
+                    ) {
+                        cancelNoiseCaptureLocked()
                         canAccumulate = false
-                    }
-                    if (frameContext.frameSequence <= lastAccumulatedFrameSequence) {
-                        canAccumulate = false
-                    }
-                    if (activeNoiseCaptureManagerId == null) {
-                        activeNoiseCaptureManagerId = frameContext.managerId
-                        activeNoiseCaptureGeneration = frameContext.captureGeneration
-                        activeNoiseCaptureFingerprint = frameContext.fingerprint
-                    } else {
-                        if (frameContext.managerId != activeNoiseCaptureManagerId ||
-                            frameContext.captureGeneration != activeNoiseCaptureGeneration
-                        ) {
-                            canAccumulate = false
-                        }
-                        if (frameContext.fingerprint != activeNoiseCaptureFingerprint) {
-                            cancelNoiseCaptureLocked()
-                            canAccumulate = false
-                        }
-                    }
-                    if (!frameContext.fingerprint.isMicrophoneKnown) {
+                    } else if (frameContext.frameSequence <= lastAccumulatedFrameSequence) {
                         canAccumulate = false
                     }
                 }
@@ -357,29 +380,27 @@ class CalibrationManager internal constructor(
                     return@synchronized
                 }
 
-                if (canAccumulate) {
-                    if (frameContext != null) {
-                        lastAccumulatedFrameSequence = frameContext.frameSequence
-                    }
+                if (canAccumulate && frameContext != null) {
+                    lastAccumulatedFrameSequence = frameContext.frameSequence
                     noiseAccumFrames++
                     for (i in 0 until numBands) {
                         val db = raw31Bands[i]
                         noiseAccumPower[i] += 10.0.pow(db / 10.0)
                     }
-                }
 
-                val now = nowMs()
-                val elapsed = now - noiseCaptureStartMs
-                val progress = (elapsed.toFloat() / noiseCaptureDurationMs).coerceIn(0.0f, 1.0f)
+                    val now = nowMs()
+                    val elapsed = now - noiseCaptureStartMs
+                    val progress = (elapsed.toFloat() / noiseCaptureDurationMs).coerceIn(0.0f, 1.0f)
 
-                if (elapsed >= noiseCaptureDurationMs && noiseAccumFrames > 0) {
-                    finalizeNoiseCaptureLocked(activeNoiseCaptureFingerprint ?: frameContext?.fingerprint)
-                } else {
-                    requestedState = requestedState.copy(
-                        isCapturingNoiseFloor = true,
-                        noiseCaptureProgress = progress
-                    )
-                    _uiState.value = _uiState.value.copy(isCapturingNoiseFloor = true, noiseCaptureProgress = progress)
+                    if (elapsed >= noiseCaptureDurationMs && noiseAccumFrames > 0 && activeNoiseCaptureFingerprint != null) {
+                        finalizeNoiseCaptureLocked(activeNoiseCaptureFingerprint!!)
+                    } else if (isCapturingNoise) {
+                        requestedState = requestedState.copy(
+                            isCapturingNoiseFloor = true,
+                            noiseCaptureProgress = progress
+                        )
+                        _uiState.value = _uiState.value.copy(isCapturingNoiseFloor = true, noiseCaptureProgress = progress)
+                    }
                 }
             }
         }
@@ -390,24 +411,46 @@ class CalibrationManager internal constructor(
         val micOffsets31 = frameState.micOffsets31
         val noiseSnapshot = state.noiseFloor
 
-        // X01 compatibility gate evaluation
-        val liveFp = frameContext?.fingerprint ?: liveCaptureFingerprint ?: noiseSnapshot.fingerprint
-        val compatibility = evaluateNoiseFloorCompatibility(noiseSnapshot, liveFp)
-        val isCompatible = compatibility is NoiseFloorCompatibility.Compatible
+        // One current live compatibility decision:
+        val liveAuthority = currentAuthority
+        val isSubtractingNoise: Boolean
+        if (liveAuthority != null) {
+            val matchesAuthority = frameContext != null &&
+                frameContext.isRunning &&
+                frameContext.managerId == liveAuthority.managerId &&
+                frameContext.captureGeneration == liveAuthority.captureGeneration &&
+                frameContext.routeEpoch == liveAuthority.routeEpoch
 
-        if (_uiState.value.noiseFloorCompatibility != compatibility) {
-            _uiState.value = _uiState.value.copy(
-                noiseFloorCompatibility = compatibility,
-                isNoiseSubtractionEffective = !isCapturingNoise && state.isNoiseSubtractionActive && noiseSnapshot.isCaptured && !noiseSnapshot.requiresRecapture && isCompatible
-            )
+            isSubtractingNoise = !isCapturingNoise && state.isNoiseSubtractionEffective && matchesAuthority
+        } else {
+            val fallbackFp = if (frameContext != null && frameContext.isRunning && frameContext.fingerprint.isMicrophoneKnown) {
+                frameContext.fingerprint
+            } else {
+                null
+            }
+            val fallbackCompatibility = if (!noiseSnapshot.isCaptured) {
+                NoiseFloorCompatibility.Uncaptured
+            } else if (fallbackFp == null) {
+                NoiseFloorCompatibility.Incompatible("Live audio capture context is stopped or inactive.", requiresRecapture = false)
+            } else {
+                evaluateNoiseFloorCompatibility(noiseSnapshot, fallbackFp)
+            }
+            val isCompatible = fallbackCompatibility is NoiseFloorCompatibility.Compatible
+            isSubtractingNoise = !isCapturingNoise &&
+                state.isNoiseSubtractionActive &&
+                noiseSnapshot.isCaptured &&
+                !noiseSnapshot.requiresRecapture &&
+                isCompatible
+
+            if (_uiState.value.noiseFloorCompatibility != fallbackCompatibility ||
+                _uiState.value.isNoiseSubtractionEffective != isSubtractingNoise) {
+                _uiState.value = _uiState.value.copy(
+                    noiseFloorCompatibility = fallbackCompatibility,
+                    isNoiseSubtractionEffective = isSubtractingNoise
+                )
+            }
         }
 
-        // During active noise capture, display raw ambient noise rather than subtracting old baseline
-        val isSubtractingNoise = !isCapturingNoise &&
-            state.isNoiseSubtractionActive &&
-            noiseSnapshot.isCaptured &&
-            !noiseSnapshot.requiresRecapture &&
-            isCompatible
         val rawSplOffset = if (state.splCalibration.isSplMode) state.splCalibration.splOffsetDb else 0.0f
         val splOffset = if (rawSplOffset.isNaN() || rawSplOffset.isInfinite()) 0.0f else rawSplOffset
 
@@ -630,27 +673,53 @@ class CalibrationManager internal constructor(
 
     // --- Noise Floor Capture & Subtraction Actions ---
 
-    fun startNoiseFloorCapture(durationMs: Long = 2000L): FeatureAccessResult = mutateWithAccess(ProFeature.NOISE_FLOOR) {
+    fun startNoiseFloorCapture(
+        durationMs: Long = 2000L,
+        authority: CaptureAuthoritySnapshot? = null
+    ): FeatureAccessResult = synchronized(stateLock) {
+        val access = featurePolicy.check(ProFeature.NOISE_FLOOR)
+        if (access is FeatureAccessResult.Denied) return@synchronized access
+
+        if (authority != null) {
+            currentAuthority = authority
+        }
+        val currentAuth = currentAuthority
+        if (currentAuth == null || !currentAuth.isValidRunningAuthority) {
+            return@synchronized FeatureAccessResult.Denied(
+                ProFeature.NOISE_FLOOR,
+                "Active audio capture with a valid route is required to capture noise floor."
+            )
+        }
+
         noiseCaptureDurationMs = durationMs.coerceAtLeast(1L)
         noiseCaptureStartMs = nowMs()
         noiseAccumFrames = 0
         noiseAccumPower.fill(0.0)
         isCapturingNoise = true
-        activeNoiseCaptureManagerId = null
-        activeNoiseCaptureGeneration = null
-        activeNoiseCaptureFingerprint = null
-        lastAccumulatedFrameSequence = -1L
+
+        activeNoiseCaptureManagerId = currentAuth.managerId
+        activeNoiseCaptureGeneration = currentAuth.captureGeneration
+        activeNoiseCaptureEpoch = currentAuth.routeEpoch
+        activeNoiseCaptureFingerprint = currentAuth.fingerprint
+        lastAccumulatedFrameSequence = currentAuth.latestPublishedSequence
         shouldResetSmoothing.set(true)
 
         requestedState = requestedState.copy(
             isCapturingNoiseFloor = true,
             noiseCaptureProgress = 0.0f
         )
+        publishEffectiveStateLocked()
+        FeatureAccessResult.Allowed
     }
 
-    private fun finalizeNoiseCaptureLocked(capturedFingerprint: CaptureFingerprint?) {
+    private fun finalizeNoiseCaptureLocked(capturedFingerprint: CaptureFingerprint) {
         // Finalization is an operation boundary: revoke even if the observer has not run yet.
         if (featurePolicy.check(ProFeature.NOISE_FLOOR) is FeatureAccessResult.Denied) {
+            cancelNoiseCaptureLocked()
+            publishEffectiveStateLocked()
+            return
+        }
+        if (noiseAccumFrames <= 0) {
             cancelNoiseCaptureLocked()
             publishEffectiveStateLocked()
             return
@@ -658,7 +727,7 @@ class CalibrationManager internal constructor(
         isCapturingNoise = false
         val numBands = Iso31Bands.NUM_BANDS
         val capturedBands = FloatArray(numBands)
-        val frames = if (noiseAccumFrames > 0) noiseAccumFrames else 1
+        val frames = noiseAccumFrames
 
         for (i in 0 until numBands) {
             val avgPower = noiseAccumPower[i] / frames
@@ -671,15 +740,7 @@ class CalibrationManager internal constructor(
         }
 
         val timestamp = nowMs()
-        val validatedFingerprint = capturedFingerprint ?: liveCaptureFingerprint ?: CaptureFingerprint(
-            dspRevision = DspResponseRevision.CURRENT,
-            actualSampleRate = 48000,
-            routedMicrophoneId = "default_device_mic",
-            routedDeviceType = "Built-in",
-            selectedAudioSource = 7,
-            actualAudioSource = 7,
-            isSourceFallback = false
-        )
+        val validatedFingerprint = capturedFingerprint
         val requiresRecapture = !validatedFingerprint.isMicrophoneKnown
         val snapshot = NoiseFloorSnapshot(
             bands31Db = capturedBands,
@@ -748,6 +809,7 @@ class CalibrationManager internal constructor(
         noiseAccumPower.fill(0.0)
         activeNoiseCaptureManagerId = null
         activeNoiseCaptureGeneration = null
+        activeNoiseCaptureEpoch = null
         activeNoiseCaptureFingerprint = null
         lastAccumulatedFrameSequence = -1L
         requestedState = requestedState.copy(isCapturingNoiseFloor = false, noiseCaptureProgress = 0.0f)

@@ -45,16 +45,37 @@ data class DspResponseRevision(
 
         val CURRENT = DspResponseRevision()
 
-        fun fromJson(json: JSONObject?): DspResponseRevision {
-            if (json == null) return CURRENT
+        fun fromJson(json: JSONObject?): DspResponseRevision? {
+            if (json == null) return null
+            if (!json.has("revisionId") || json.isNull("revisionId")) return null
+            if (!json.has("filterType") || json.isNull("filterType")) return null
+            if (!json.has("coefficientRevision") || json.isNull("coefficientRevision")) return null
+            if (!json.has("centerFrequencyPreset") || json.isNull("centerFrequencyPreset")) return null
+            if (!json.has("qBandwidthDefinition") || json.isNull("qBandwidthDefinition")) return null
+            if (!json.has("cascadeAndNormalization") || json.isNull("cascadeAndNormalization")) return null
+            if (!json.has("edgeAnchoringDesign") || json.isNull("edgeAnchoringDesign")) return null
+
+            val revId = json.optString("revisionId")
+            val fType = json.optString("filterType")
+            val cRev = json.optInt("coefficientRevision", -1)
+            val preset = json.optString("centerFrequencyPreset")
+            val qDef = json.optString("qBandwidthDefinition")
+            val cNorm = json.optString("cascadeAndNormalization")
+            val edge = json.optString("edgeAnchoringDesign")
+
+            if (revId.isBlank() || fType.isBlank() || cRev <= 0 ||
+                preset.isBlank() || qDef.isBlank() || cNorm.isBlank() || edge.isBlank()) {
+                return null
+            }
+
             return DspResponseRevision(
-                revisionId = json.optString("revisionId", CURRENT_REVISION_ID),
-                filterType = json.optString("filterType", FILTER_TYPE_4TH_ORDER_CASCADE_BIQUAD),
-                coefficientRevision = json.optInt("coefficientRevision", COEFFICIENT_REVISION_WAVE1),
-                centerFrequencyPreset = json.optString("centerFrequencyPreset", PRESET_ISO_266_31_BAND),
-                qBandwidthDefinition = json.optString("qBandwidthDefinition", Q_1_3_OCTAVE_CASCADE_COMPENSATED),
-                cascadeAndNormalization = json.optString("cascadeAndNormalization", CASCADE_NORMALIZATION_UNITY_0DB_PEAK),
-                edgeAnchoringDesign = json.optString("edgeAnchoringDesign", EDGE_ANCHORING_BILINEAR_NYQUIST_WARPED)
+                revisionId = revId,
+                filterType = fType,
+                coefficientRevision = cRev,
+                centerFrequencyPreset = preset,
+                qBandwidthDefinition = qDef,
+                cascadeAndNormalization = cNorm,
+                edgeAnchoringDesign = edge
             )
         }
     }

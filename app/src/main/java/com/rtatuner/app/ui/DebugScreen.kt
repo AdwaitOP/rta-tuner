@@ -59,6 +59,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
 import com.rtatuner.app.core.audio.GeneratorMode
+import com.rtatuner.app.core.audio.NoiseFloorCompatibility
 import com.rtatuner.app.core.audio.SweepRangePreset
 import com.rtatuner.app.core.audio.SignalGeneratorState
 import com.rtatuner.app.core.calibration.CalibrationFileConvention
@@ -2581,7 +2582,7 @@ fun CalibrationControlsCard(
                         Switch(
                             checked = calib.isNoiseSubtractionActive,
                             onCheckedChange = { onSetNoiseSubtractionActive(it) },
-                            enabled = calib.noiseFloor.isCaptured && !calib.noiseFloor.requiresRecapture,
+                            enabled = calib.noiseFloor.isCaptured && !calib.noiseFloor.requiresRecapture && calib.noiseFloorCompatibility is NoiseFloorCompatibility.Compatible,
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = Color(0xFF00E676),
                                 checkedTrackColor = Color(0xFF2E7D32),

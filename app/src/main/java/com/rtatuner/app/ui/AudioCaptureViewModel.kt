@@ -192,6 +192,8 @@ class AudioCaptureViewModel(
                     if (source !== captureManager) return@synchronized
                     val now = System.currentTimeMillis()
 
+                    calibrationManager.updateCaptureAuthority(mgrState.captureAuthority)
+
                     // Pass raw audio spectral data through calibration engine (mic curve, noise subtraction, SPL, target deltas)
                     val diag = mgrState.diagnostics
                     val binRes = if (diag.windowSize > 0 && diag.actualSampleRate > 0) {
@@ -295,12 +297,16 @@ class AudioCaptureViewModel(
     }
 
     fun stopCapture() {
-        synchronized(captureControlLock) { captureManager.stopCapture() }
+        synchronized(captureControlLock) {
+            captureManager.stopCapture()
+            calibrationManager.updateCaptureAuthority(captureManager.uiState.value.captureAuthority)
+        }
     }
 
     fun retryCapture() {
         synchronized(captureControlLock) {
             captureManager.stopCapture()
+            calibrationManager.updateCaptureAuthority(captureManager.uiState.value.captureAuthority)
             startCapture()
         }
     }
@@ -374,6 +380,7 @@ class AudioCaptureViewModel(
         if (newSize == currentWindowSize) return FeatureAccessResult.Allowed
         val wasRunning = captureManager.uiState.value.status == CaptureStatus.RUNNING
         captureCollectorJob?.cancel()
+        calibrationManager.cancelNoiseCapture()
         captureManager.release()
 
         // Release may take time: a downgrade during it must not create a restricted manager.
@@ -477,7 +484,7 @@ class AudioCaptureViewModel(
     }
 
     fun startNoiseFloorCapture() {
-        reportAccess(calibrationManager.startNoiseFloorCapture(2000L))
+        reportAccess(calibrationManager.startNoiseFloorCapture(2000L, captureManager.uiState.value.captureAuthority))
     }
 
     fun setNoiseSubtractionActive(active: Boolean) {

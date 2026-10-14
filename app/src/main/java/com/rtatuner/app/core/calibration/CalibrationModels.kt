@@ -2,6 +2,7 @@ package com.rtatuner.app.core.calibration
 
 import com.rtatuner.app.core.audio.CaptureFingerprint
 import com.rtatuner.app.core.audio.NoiseFloorCompatibility
+import com.rtatuner.app.core.dsp.DspResponseRevision
 import kotlin.math.log10
 
 /**
@@ -282,6 +283,18 @@ fun evaluateNoiseFloorCompatibility(
             requiresRecapture = true
         )
     }
+    if (snapshotFp.dspRevision != DspResponseRevision.CURRENT) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "DSP response revision '${snapshotFp.dspRevision.revisionId}' is unsupported. Recapture required.",
+            requiresRecapture = true
+        )
+    }
+    if (snapshotFp.actualSampleRate <= 0 || liveFingerprint.actualSampleRate <= 0) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "Invalid sample rate. Recapture required.",
+            requiresRecapture = true
+        )
+    }
     if (snapshotFp.actualSampleRate != liveFingerprint.actualSampleRate) {
         return NoiseFloorCompatibility.Incompatible(
             reason = "Sample rate mismatch (snapshot: ${snapshotFp.actualSampleRate} Hz, live: ${liveFingerprint.actualSampleRate} Hz). Recapture required.",
@@ -294,9 +307,33 @@ fun evaluateNoiseFloorCompatibility(
             requiresRecapture = true
         )
     }
+    if (snapshotFp.routedDeviceType != liveFingerprint.routedDeviceType) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "Device type mismatch (snapshot: '${snapshotFp.routedDeviceType}', live: '${liveFingerprint.routedDeviceType}'). Recapture required.",
+            requiresRecapture = true
+        )
+    }
     if (snapshotFp.actualAudioSource != liveFingerprint.actualAudioSource) {
         return NoiseFloorCompatibility.Incompatible(
             reason = "Audio source mismatch (snapshot: ${snapshotFp.actualAudioSource}, live: ${liveFingerprint.actualAudioSource}). Recapture required.",
+            requiresRecapture = true
+        )
+    }
+    if (snapshotFp.selectedAudioSource != liveFingerprint.selectedAudioSource) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "Selected audio source mismatch (snapshot: ${snapshotFp.selectedAudioSource}, live: ${liveFingerprint.selectedAudioSource}). Recapture required.",
+            requiresRecapture = true
+        )
+    }
+    if (snapshotFp.isSourceFallback != liveFingerprint.isSourceFallback) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "Audio source fallback state mismatch. Recapture required.",
+            requiresRecapture = true
+        )
+    }
+    if (!snapshotFp.effects.isEffectsKnown || !liveFingerprint.effects.isEffectsKnown) {
+        return NoiseFloorCompatibility.Incompatible(
+            reason = "Audio capture processing effects state is unknown. Recapture required.",
             requiresRecapture = true
         )
     }

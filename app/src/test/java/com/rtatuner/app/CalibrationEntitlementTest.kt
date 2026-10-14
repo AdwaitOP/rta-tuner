@@ -3,8 +3,13 @@ package com.rtatuner.app
 import android.content.Context
 import android.content.SharedPreferences
 import com.rtatuner.app.core.audio.AudioMath
+import com.rtatuner.app.core.audio.CaptureAuthoritySnapshot
+import com.rtatuner.app.core.audio.CaptureEffectsInfo
+import com.rtatuner.app.core.audio.CaptureFingerprint
+import com.rtatuner.app.core.audio.CapturedFrameContext
 import com.rtatuner.app.core.calibration.CalibrationManager
 import com.rtatuner.app.core.calibration.TargetCurve
+import com.rtatuner.app.core.dsp.DspResponseRevision
 import com.rtatuner.app.core.entitlement.EntitlementTier
 import com.rtatuner.app.core.entitlement.FakeEntitlementRepository
 import com.rtatuner.app.core.entitlement.FeatureAccessDeniedException
@@ -49,6 +54,31 @@ class CalibrationEntitlementTest {
             .putBoolean("noise_floor_captured", true)
             .putBoolean("noise_subtraction_active", true)
             .commit()
+    }
+
+    private fun testContext(seq: Long = 1L): CapturedFrameContext {
+        val fp = CaptureFingerprint(
+            dspRevision = DspResponseRevision.CURRENT,
+            actualSampleRate = 48000,
+            routedMicrophoneId = "builtin_mic",
+            routedDeviceType = "TYPE_BUILTIN_MIC",
+            selectedAudioSource = 6,
+            actualAudioSource = 6,
+            effects = CaptureEffectsInfo(false, false, false, true)
+        )
+        return CapturedFrameContext("test-mgr", 1L, seq, fp, true, 1L)
+    }
+
+    private fun testAuthority(seq: Long = 0L): CaptureAuthoritySnapshot {
+        val ctx = testContext(seq)
+        return CaptureAuthoritySnapshot(
+            managerId = ctx.managerId,
+            captureGeneration = ctx.captureGeneration,
+            routeEpoch = ctx.routeEpoch,
+            fingerprint = ctx.fingerprint,
+            isRunning = true,
+            latestPublishedSequence = seq
+        )
     }
 
     @Test
@@ -107,9 +137,10 @@ class CalibrationEntitlementTest {
         val entitlements = FakeEntitlementRepository()
         val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope)
         try {
+            manager.updateCaptureAuthority(testAuthority(0L))
             entitlements.setTier(EntitlementTier.PRO_LIFETIME)
             runCurrent()
-            val pro = manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f)
+            val pro = manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f, frameContext = testContext(1L))
             val expectedBand = AudioMath.subtractNoiseFloor(-40f, -50f, AudioMath.MIN_DB_FS).correctedDb + 3f + 100f
             assertArrayEquals(FloatArray(31) { expectedBand }, pro.calibrated31Db, 0.0001f)
             assertArrayEquals(FloatArray(8) { 63f }, pro.calibratedRawFftDb, 0.0001f)
@@ -119,7 +150,7 @@ class CalibrationEntitlementTest {
 
             entitlements.setTier(EntitlementTier.FREE)
             runCurrent()
-            val free = manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f)
+            val free = manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f, frameContext = testContext(2L))
             assertArrayEquals(FloatArray(31) { -40f }, free.calibrated31Db, 0f)
             assertArrayEquals(FloatArray(8) { -40f }, free.calibratedRawFftDb, 0f)
             assertFalse(free.isSplMode)
@@ -176,8 +207,10 @@ class CalibrationEntitlementTest {
         val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
         val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope)
         try {
-            assertEquals(FeatureAccessResult.Allowed, manager.startNoiseFloorCapture(60_000L))
-            manager.processFrame(FloatArray(31) { -80f }, floatArrayOf(-80f), 100f)
+            val auth = testAuthority(0L)
+            manager.updateCaptureAuthority(auth)
+            assertEquals(FeatureAccessResult.Allowed, manager.startNoiseFloorCapture(60_000L, authority = auth))
+            manager.processFrame(FloatArray(31) { -80f }, floatArrayOf(-80f), 100f, frameContext = testContext(1L))
             assertTrue(manager.uiState.value.isCapturingNoiseFloor)
             entitlements.setTier(EntitlementTier.FREE)
             runCurrent()
@@ -201,11 +234,13 @@ class CalibrationEntitlementTest {
         val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
         val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope, nowMs = { now })
         try {
-            manager.startNoiseFloorCapture(100L)
+            val auth = testAuthority(0L)
+            manager.updateCaptureAuthority(auth)
+            manager.startNoiseFloorCapture(100L, authority = auth)
             now += 200L
             entitlements.setTier(EntitlementTier.FREE)
             // Do not dispatch the collector: persistence must guard this race itself.
-            val frame = manager.processFrame(FloatArray(31) { -80f }, floatArrayOf(-80f), 100f)
+            val frame = manager.processFrame(FloatArray(31) { -80f }, floatArrayOf(-80f), 100f, frameContext = testContext(1L))
             assertFalse(manager.uiState.value.isCapturingNoiseFloor)
             assertEquals(before, prefs.all)
             assertArrayEquals(FloatArray(31) { -80f }, frame.calibrated31Db, 0f)
@@ -218,10 +253,12 @@ class CalibrationEntitlementTest {
         val prefs = preferences()
         val manager = CalibrationManager(prefs, FeatureAccessPolicy(FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)), backgroundScope, nowMs = { now })
         try {
-            assertEquals(FeatureAccessResult.Allowed, manager.startNoiseFloorCapture(100L))
-            manager.processFrame(FloatArray(31) { -40f }, floatArrayOf(-40f), 100f)
+            val auth = testAuthority(0L)
+            manager.updateCaptureAuthority(auth)
+            assertEquals(FeatureAccessResult.Allowed, manager.startNoiseFloorCapture(100L, authority = auth))
+            manager.processFrame(FloatArray(31) { -40f }, floatArrayOf(-40f), 100f, frameContext = testContext(1L))
             now += 100L
-            manager.processFrame(FloatArray(31) { -50f }, floatArrayOf(-50f), 100f)
+            manager.processFrame(FloatArray(31) { -50f }, floatArrayOf(-50f), 100f, frameContext = testContext(2L))
             val expected = (10.0 * kotlin.math.log10((0.0001 + 0.00001) / 2.0)).toFloat()
             assertArrayEquals(FloatArray(31) { expected }, manager.uiState.value.noiseFloor.bands31Db, 0.0001f)
             assertTrue(manager.uiState.value.isNoiseSubtractionActive)

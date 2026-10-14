@@ -4,6 +4,10 @@ import android.content.Context
 import android.content.SharedPreferences
 import com.rtatuner.app.core.audio.AudioCaptureUiState
 import com.rtatuner.app.core.audio.AudioMath
+import com.rtatuner.app.core.audio.CaptureAuthoritySnapshot
+import com.rtatuner.app.core.audio.CaptureEffectsInfo
+import com.rtatuner.app.core.audio.CaptureFingerprint
+import com.rtatuner.app.core.audio.CapturedFrameContext
 import com.rtatuner.app.core.calibration.CalibratedSpectralFrame
 import com.rtatuner.app.core.calibration.CalibrationCurveParser
 import com.rtatuner.app.core.calibration.CalibrationFileConvention
@@ -11,6 +15,7 @@ import com.rtatuner.app.core.calibration.CalibrationManager
 import com.rtatuner.app.core.calibration.MicCalibrationCurve
 import com.rtatuner.app.core.calibration.MicCalibrationPoint
 import com.rtatuner.app.core.calibration.TargetCurve
+import com.rtatuner.app.core.dsp.DspResponseRevision
 import com.rtatuner.app.core.dsp.Iso31Bands
 import com.rtatuner.app.core.entitlement.EntitlementTier
 import com.rtatuner.app.core.entitlement.FakeEntitlementRepository
@@ -36,6 +41,31 @@ class CalibrationTest {
 
     private fun testPreferences(): SharedPreferences = RuntimeEnvironment.getApplication()
         .getSharedPreferences("calib-test-${UUID.randomUUID()}", Context.MODE_PRIVATE)
+
+    private fun testContext(seq: Long = 1L): CapturedFrameContext {
+        val fp = CaptureFingerprint(
+            dspRevision = DspResponseRevision.CURRENT,
+            actualSampleRate = 48000,
+            routedMicrophoneId = "builtin_mic",
+            routedDeviceType = "TYPE_BUILTIN_MIC",
+            selectedAudioSource = 6,
+            actualAudioSource = 6,
+            effects = CaptureEffectsInfo(false, false, false, true)
+        )
+        return CapturedFrameContext("test-mgr", 1L, seq, fp, true, 1L)
+    }
+
+    private fun testAuthority(seq: Long = 0L): CaptureAuthoritySnapshot {
+        val ctx = testContext(seq)
+        return CaptureAuthoritySnapshot(
+            managerId = ctx.managerId,
+            captureGeneration = ctx.captureGeneration,
+            routeEpoch = ctx.routeEpoch,
+            fingerprint = ctx.fingerprint,
+            isRunning = true,
+            latestPublishedSequence = seq
+        )
+    }
 
     @Test
     fun testCalibrationParserWithValidFormats() {
@@ -137,12 +167,14 @@ class CalibrationTest {
         val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
         val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements))
 
+        manager.updateCaptureAuthority(testAuthority(0L))
+
         // Capture noise floor at -46 dBFS across all bands
-        manager.startNoiseFloorCapture(durationMs = 10L)
+        manager.startNoiseFloorCapture(durationMs = 10L, authority = testAuthority(0L))
         // Feed 1 frame of -46 dBFS noise floor
-        manager.processFrame(FloatArray(31) { -46.0f }, FloatArray(8) { -46.0f }, 100.0f)
+        manager.processFrame(FloatArray(31) { -46.0f }, FloatArray(8) { -46.0f }, 100.0f, frameContext = testContext(1L))
         Thread.sleep(20)
-        manager.processFrame(FloatArray(31) { -46.0f }, FloatArray(8) { -46.0f }, 100.0f)
+        manager.processFrame(FloatArray(31) { -46.0f }, FloatArray(8) { -46.0f }, 100.0f, frameContext = testContext(2L))
         assertTrue(manager.uiState.value.isNoiseSubtractionActive)
         assertTrue(manager.uiState.value.noiseFloor.isCaptured)
 
@@ -152,19 +184,19 @@ class CalibrationTest {
 
         // Case 1: Calibration disabled -> output is pure clean raw signal
         manager.setMicCurveActive(false)
-        val frameUncal = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, 100.0f)
+        val frameUncal = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, 100.0f, frameContext = testContext(3L))
         assertEquals("Uncalibrated output must equal raw power subtraction", expectedCleanRaw, frameUncal.calibrated31Db[0], 0.001f)
 
         // Case 2: Calibration enabled with +5 dB offset
         manager.loadMicCurve("Boost5", "20.0 5.0\n20000.0 5.0", CalibrationFileConvention.ADDITIVE_CORRECTION)
-        val frameBoost = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, 100.0f)
+        val frameBoost = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, 100.0f, frameContext = testContext(4L))
         val rawEquivalentBoost = frameBoost.calibrated31Db[0] - 5.0f
         assertEquals("Raw subtraction underlying +5dB calib must match uncalibrated subtraction exactly",
             expectedCleanRaw, rawEquivalentBoost, 0.001f)
 
         // Case 3: Calibration enabled with -5 dB offset
         manager.loadMicCurve("Cut5", "20.0 -5.0\n20000.0 -5.0", CalibrationFileConvention.ADDITIVE_CORRECTION)
-        val frameCut = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, 100.0f)
+        val frameCut = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, 100.0f, frameContext = testContext(5L))
         val rawEquivalentCut = frameCut.calibrated31Db[0] - (-5.0f)
         assertEquals("Raw subtraction underlying -5dB calib must match uncalibrated subtraction exactly",
             expectedCleanRaw, rawEquivalentCut, 0.001f)
@@ -178,14 +210,16 @@ class CalibrationTest {
         val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
         val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements))
 
+        manager.updateCaptureAuthority(testAuthority(0L))
+
         // Set Curve 1 (+2 dB)
         manager.loadMicCurve("Curve1", "20.0 2.0\n20000.0 2.0", CalibrationFileConvention.ADDITIVE_CORRECTION)
 
         // Capture noise floor at -50 dBFS
-        manager.startNoiseFloorCapture(durationMs = 10L)
-        manager.processFrame(FloatArray(31) { -50.0f }, FloatArray(8) { -50.0f }, 100.0f)
+        manager.startNoiseFloorCapture(durationMs = 10L, authority = testAuthority(0L))
+        manager.processFrame(FloatArray(31) { -50.0f }, FloatArray(8) { -50.0f }, 100.0f, frameContext = testContext(1L))
         Thread.sleep(20)
-        manager.processFrame(FloatArray(31) { -50.0f }, FloatArray(8) { -50.0f }, 100.0f)
+        manager.processFrame(FloatArray(31) { -50.0f }, FloatArray(8) { -50.0f }, 100.0f, frameContext = testContext(2L))
 
         val capturedNoiseBands = manager.uiState.value.noiseFloor.bands31Db.clone()
         assertEquals(-50.0f, capturedNoiseBands[0], 0.1f)
@@ -198,7 +232,7 @@ class CalibrationTest {
             capturedNoiseBands, manager.uiState.value.noiseFloor.bands31Db, 0.0001f)
 
         // Feed -40 dBFS signal: raw clean is -40.457 dBFS, then Curve 2's -4 dB is applied -> -44.457 dBFS
-        val frame = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, 100.0f)
+        val frame = manager.processFrame(FloatArray(31) { -40.0f }, FloatArray(8) { -40.0f }, 100.0f, frameContext = testContext(3L))
         val expectedCleanRaw = AudioMath.subtractNoiseFloor(-40.0f, -50.0f, AudioMath.MIN_DB_FS).correctedDb
         assertEquals(expectedCleanRaw - 4.0f, frame.calibrated31Db[0], 0.01f)
 
@@ -211,32 +245,34 @@ class CalibrationTest {
         val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
         val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements))
 
+        manager.updateCaptureAuthority(testAuthority(0L))
+
         // Noise floor: Band 0 is at -43 dBFS (will be 3 dB SNR = unreliable)
         //              Band 1 is at -50 dBFS (will be 10 dB SNR = reliable)
         val noiseBands = FloatArray(31) { -50.0f }.also { it[0] = -43.0f }
-        manager.startNoiseFloorCapture(durationMs = 10L)
-        manager.processFrame(noiseBands, FloatArray(8) { -50.0f }, 100.0f)
+        manager.startNoiseFloorCapture(durationMs = 10L, authority = testAuthority(0L))
+        manager.processFrame(noiseBands, FloatArray(8) { -50.0f }, 100.0f, frameContext = testContext(1L))
         Thread.sleep(20)
-        manager.processFrame(noiseBands, FloatArray(8) { -50.0f }, 100.0f)
+        manager.processFrame(noiseBands, FloatArray(8) { -50.0f }, 100.0f, frameContext = testContext(2L))
 
         // Signal: -40 dBFS across all bands
         val signalBands = FloatArray(31) { -40.0f }
 
         // Test with calibration disabled
         manager.setMicCurveActive(false)
-        val frameUncal = manager.processFrame(signalBands, FloatArray(8) { -40.0f }, 100.0f)
+        val frameUncal = manager.processFrame(signalBands, FloatArray(8) { -40.0f }, 100.0f, frameContext = testContext(3L))
         assertTrue("Band 0 (3 dB SNR) must be unreliable", frameUncal.unreliableBands[0])
         assertFalse("Band 1 (10 dB SNR) must be reliable", frameUncal.unreliableBands[1])
 
         // Test with massive +15 dB calibration boost
         manager.loadMicCurve("BigBoost", "20.0 15.0\n20000.0 15.0", CalibrationFileConvention.ADDITIVE_CORRECTION)
-        val frameBoost = manager.processFrame(signalBands, FloatArray(8) { -40.0f }, 100.0f)
+        val frameBoost = manager.processFrame(signalBands, FloatArray(8) { -40.0f }, 100.0f, frameContext = testContext(4L))
         assertTrue("Band 0 must still be unreliable regardless of +15 dB mic boost", frameBoost.unreliableBands[0])
         assertFalse("Band 1 must still be reliable regardless of +15 dB mic boost", frameBoost.unreliableBands[1])
 
         // Test with massive -15 dB calibration cut
         manager.loadMicCurve("BigCut", "20.0 -15.0\n20000.0 -15.0", CalibrationFileConvention.ADDITIVE_CORRECTION)
-        val frameCut = manager.processFrame(signalBands, FloatArray(8) { -40.0f }, 100.0f)
+        val frameCut = manager.processFrame(signalBands, FloatArray(8) { -40.0f }, 100.0f, frameContext = testContext(5L))
         assertTrue("Band 0 must still be unreliable regardless of -15 dB mic cut", frameCut.unreliableBands[0])
         assertFalse("Band 1 must still be reliable regardless of -15 dB mic cut", frameCut.unreliableBands[1])
 

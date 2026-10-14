@@ -142,6 +142,9 @@ internal class CaptureSession(
         effects = effectsInfo
     )
 
+    @Volatile
+    var routeEpoch: Long = 0L
+
     private val sessionLock = Any()
     @Volatile
     private var isCleanedUp = false
@@ -322,8 +325,12 @@ class AudioCaptureManager(
         }
     }
 
+    private val routeEpochCounter = AtomicLong(1L)
+
     // State flow for UI and diagnostics
-    private val _uiState = MutableStateFlow(AudioCaptureUiState())
+    private val _uiState = MutableStateFlow(AudioCaptureUiState(
+        captureAuthority = CaptureAuthoritySnapshot(managerId = managerId, isRunning = false)
+    ))
     val uiState: StateFlow<AudioCaptureUiState> = _uiState.asStateFlow()
     @Deprecated("Legacy unbuffered flow; observe uiState directly instead", ReplaceWith("uiState"))
     val audioFrames: Flow<AudioFrame> = emptyFlow()
@@ -750,8 +757,19 @@ class AudioCaptureManager(
                     Log.w(TAG, "Capture initialization aborted; attempt $attemptToken is obsolete (activeAttemptToken=$activeAttemptToken, activeSession=$activeSession)")
                     sessionToCleanOnAbort = session
                 } else {
+                    val epoch = routeEpochCounter.incrementAndGet()
+                    session.routeEpoch = epoch
                     activeSession = session
                     isRunning.set(true)
+
+                    val authority = CaptureAuthoritySnapshot(
+                        managerId = managerId,
+                        captureGeneration = session.generation,
+                        routeEpoch = epoch,
+                        fingerprint = session.currentFingerprint,
+                        isRunning = true,
+                        latestPublishedSequence = 0L
+                    )
 
                     _uiState.value = _uiState.value.copy(
                         status = CaptureStatus.RUNNING,
@@ -761,6 +779,7 @@ class AudioCaptureManager(
                         routingMismatchMessage = null,
                         isBluetoothBandwidthLimited = false,
                         bluetoothWarningText = null,
+                        captureAuthority = authority,
                         diagnostics = AudioCaptureDiagnostics(
                             activeAudioSource = activeSourceName,
                             requestedSampleRate = requestedRate,
@@ -919,16 +938,31 @@ class AudioCaptureManager(
 
             Log.i(TAG, "Audio capture loop running for session ${session.generation}. Window: $windowSize, Hop: $hopSize, Rate: $sampleRate Hz")
 
+            var hopRouteEpoch = 0L
+
             while (isRunning.get() && isCurrentSession(session)) {
                 val toRead = hopSize - hopSamplesAccumulated
                 val readResult = record.read(hopBuffer, hopSamplesAccumulated, toRead, AudioRecord.READ_BLOCKING)
 
                 if (readResult > 0) {
                     consecutiveZeroReads = 0
+                    val currentEpoch = session.routeEpoch
+                    if (hopSamplesAccumulated == 0) {
+                        hopRouteEpoch = currentEpoch
+                    } else if (currentEpoch != hopRouteEpoch) {
+                        // Route changed during partial-hop assembly: discard to preserve genuine hop provenance
+                        hopSamplesAccumulated = 0
+                        hopRouteEpoch = currentEpoch
+                        continue
+                    }
                     hopSamplesAccumulated += readResult
 
                     // Only advance sliding window and process DSP when a complete contiguous hop has accumulated
                     if (hopSamplesAccumulated >= hopSize) {
+                        if (session.routeEpoch != hopRouteEpoch) {
+                            hopSamplesAccumulated = 0
+                            continue
+                        }
                         // 1. Process continuous incoming hop through 64-bit continuous IIR biquad filter bank
                         val octave31FilterDb = biquadFilterBank.processHop(hopBuffer, hopSize)
 
@@ -946,31 +980,34 @@ class AudioCaptureManager(
                         // Real-time FFT spectral analysis (Hann window, Radix-2 FFT)
                         val fftResult = fftProcessor.processFrame(slidingWindow, computeOctaveBands = false)
 
-                        val nowNs = System.nanoTime()
-                        totalFrames++
-                        framesInSecond++
-
-                        if (nowNs - lastFpsTimeNs >= 1_000_000_000L) {
-                            currentFps = framesInSecond.toFloat()
-                            framesInSecond = 0
-                            lastFpsTimeNs = nowNs
-                        }
-
                         // Test hook to intercept execution right before publication
                         onPrePublishFrame?.invoke(session.generation)
 
+                        val nextSequence = totalFrames + 1
                         val published = publishFrame(
                             session = session,
+                            hopRouteEpoch = hopRouteEpoch,
                             rmsDb = rmsDb,
                             peakDb = peakDb,
                             isClipping = isClipping,
                             octave31Db = octave31FilterDb,
                             rawFftDb = fftResult.rawFftDb,
-                            totalFrames = totalFrames,
+                            totalFrames = nextSequence,
                             fps = currentFps,
                             fftExecutionTimeUs = fftResult.executionTimeUs,
                             filterBankExecutionTimeUs = biquadFilterBank.lastExecutionTimeUs
                         )
+
+                        if (published) {
+                            totalFrames = nextSequence
+                            framesInSecond++
+                            val nowNs = System.nanoTime()
+                            if (nowNs - lastFpsTimeNs >= 1_000_000_000L) {
+                                currentFps = framesInSecond.toFloat()
+                                framesInSecond = 0
+                                lastFpsTimeNs = nowNs
+                            }
+                        }
 
                         if (!published && (!isRunning.get() || !isCurrentSession(session))) {
                             break
@@ -1028,13 +1065,23 @@ class AudioCaptureManager(
                         isRunning.set(false)
                         activeAttemptToken = 0L
                         if (_uiState.value.status == CaptureStatus.RUNNING) {
+                            val newEpoch = routeEpochCounter.incrementAndGet()
                             _uiState.value = _uiState.value.copy(
                                 status = CaptureStatus.STOPPED,
                                 routedDeviceId = null,
                                 isRoutingMismatch = false,
                                 routingMismatchMessage = null,
                                 isBluetoothBandwidthLimited = false,
-                                bluetoothWarningText = null
+                                bluetoothWarningText = null,
+                                frameContext = null,
+                                captureAuthority = CaptureAuthoritySnapshot(
+                                    managerId = managerId,
+                                    captureGeneration = 0L,
+                                    routeEpoch = newEpoch,
+                                    fingerprint = null,
+                                    isRunning = false,
+                                    latestPublishedSequence = 0L
+                                )
                             )
                         }
                     }
@@ -1060,6 +1107,7 @@ class AudioCaptureManager(
      */
     private fun publishFrame(
         session: CaptureSession,
+        hopRouteEpoch: Long,
         rmsDb: Float,
         peakDb: Float,
         isClipping: Boolean,
@@ -1074,13 +1122,20 @@ class AudioCaptureManager(
             if (activeSession !== session || !isRunning.get() || session.isCleanedUp() || _uiState.value.status != CaptureStatus.RUNNING) {
                 return false
             }
+            if (session.routeEpoch != hopRouteEpoch || session.routeEpoch <= 0L) {
+                return false
+            }
             val current = _uiState.value
             val frameContext = CapturedFrameContext(
                 managerId = managerId,
                 captureGeneration = session.generation,
                 frameSequence = totalFrames,
                 fingerprint = session.currentFingerprint,
-                isRunning = true
+                isRunning = true,
+                routeEpoch = hopRouteEpoch
+            )
+            val updatedAuthority = current.captureAuthority.copy(
+                latestPublishedSequence = totalFrames
             )
             _uiState.value = current.copy(
                 rmsDb = rmsDb,
@@ -1095,7 +1150,8 @@ class AudioCaptureManager(
                     fftExecutionTimeUs = fftExecutionTimeUs,
                     filterBankExecutionTimeUs = filterBankExecutionTimeUs
                 ),
-                frameContext = frameContext
+                frameContext = frameContext,
+                captureAuthority = updatedAuthority
             )
             return true
         }
@@ -1108,6 +1164,15 @@ class AudioCaptureManager(
                 isRunning.set(false)
                 activeSession = null
                 activeAttemptToken = 0L
+                val newEpoch = routeEpochCounter.incrementAndGet()
+                val errorAuthority = CaptureAuthoritySnapshot(
+                    managerId = managerId,
+                    captureGeneration = 0L,
+                    routeEpoch = newEpoch,
+                    fingerprint = null,
+                    isRunning = false,
+                    latestPublishedSequence = 0L
+                )
                 _uiState.value = _uiState.value.copy(
                     status = CaptureStatus.ERROR,
                     errorMessage = message,
@@ -1116,7 +1181,8 @@ class AudioCaptureManager(
                     routingMismatchMessage = null,
                     isBluetoothBandwidthLimited = false,
                     bluetoothWarningText = null,
-                    frameContext = null
+                    frameContext = null,
+                    captureAuthority = errorAuthority
                 )
                 shouldClean = true
             } else {
@@ -1146,6 +1212,16 @@ class AudioCaptureManager(
             threadToInterrupt = captureThread
             captureThread = null
 
+            val newEpoch = routeEpochCounter.incrementAndGet()
+            val stoppedAuthority = CaptureAuthoritySnapshot(
+                managerId = managerId,
+                captureGeneration = 0L,
+                routeEpoch = newEpoch,
+                fingerprint = null,
+                isRunning = false,
+                latestPublishedSequence = 0L
+            )
+
             _uiState.value = _uiState.value.copy(
                 status = CaptureStatus.STOPPED,
                 errorMessage = null,
@@ -1155,7 +1231,8 @@ class AudioCaptureManager(
                 routingMismatchMessage = null,
                 isBluetoothBandwidthLimited = false,
                 bluetoothWarningText = null,
-                frameContext = null
+                frameContext = null,
+                captureAuthority = stoppedAuthority
             )
         }
 
@@ -1224,6 +1301,9 @@ class AudioCaptureManager(
         val actualDeviceType = routedDevice?.let { AudioInputDeviceInfo.classifyDevice(it.type).second }
             ?: CaptureFingerprint.UNKNOWN_DEVICE_TYPE
 
+        val newEpoch = routeEpochCounter.incrementAndGet()
+        session.routeEpoch = newEpoch
+
         session.currentFingerprint = CaptureFingerprint(
             dspRevision = DspResponseRevision.CURRENT,
             actualSampleRate = session.actualRate,
@@ -1236,6 +1316,14 @@ class AudioCaptureManager(
         )
 
         val current = _uiState.value
+        val newAuthority = CaptureAuthoritySnapshot(
+            managerId = managerId,
+            captureGeneration = session.generation,
+            routeEpoch = newEpoch,
+            fingerprint = session.currentFingerprint,
+            isRunning = true,
+            latestPublishedSequence = current.captureAuthority.latestPublishedSequence
+        )
         _uiState.value = current.copy(
             routedDeviceId = routedId,
             selectedDeviceId = selectedId,
@@ -1243,6 +1331,7 @@ class AudioCaptureManager(
             routingMismatchMessage = mismatchMessage,
             isBluetoothBandwidthLimited = isBtLimited,
             bluetoothWarningText = btWarning,
+            captureAuthority = newAuthority,
             availableInputDevices = current.availableInputDevices.map { dev ->
                 dev.copy(
                     isSelected = (selectedId != null && dev.id == selectedId) || (selectedId == null && dev.isBuiltIn),
@@ -1286,11 +1375,21 @@ class AudioCaptureManager(
                 threadToInterrupt = captureThread
                 captureThread = null
 
+                val initEpoch = routeEpochCounter.incrementAndGet()
+                val initAuthority = CaptureAuthoritySnapshot(
+                    managerId = managerId,
+                    captureGeneration = 0L,
+                    routeEpoch = initEpoch,
+                    fingerprint = null,
+                    isRunning = false,
+                    latestPublishedSequence = 0L
+                )
                 _uiState.value = _uiState.value.copy(
                     status = CaptureStatus.INITIALIZING,
                     errorMessage = null,
                     selectedDeviceId = deviceId,
-                    routedDeviceId = null
+                    routedDeviceId = null,
+                    captureAuthority = initAuthority
                 )
             } else {
                 activeRestartToken = 0L

@@ -3,6 +3,7 @@ package com.rtatuner.app
 import android.content.Context
 import android.content.SharedPreferences
 import com.rtatuner.app.core.audio.AudioMath
+import com.rtatuner.app.core.audio.CaptureAuthoritySnapshot
 import com.rtatuner.app.core.audio.CaptureEffectsInfo
 import com.rtatuner.app.core.audio.CaptureFingerprint
 import com.rtatuner.app.core.audio.CapturedFrameContext
@@ -59,18 +60,36 @@ class NoiseFloorCompatibilityGateTest {
         effects = effects
     )
 
+    private fun sampleAuthority(
+        managerId: String = "mgr_test_01",
+        generation: Long = 1L,
+        routeEpoch: Long = 1L,
+        fingerprint: CaptureFingerprint = sampleFingerprint(),
+        isRunning: Boolean = true,
+        sequence: Long = 0L
+    ): CaptureAuthoritySnapshot = CaptureAuthoritySnapshot(
+        managerId = managerId,
+        captureGeneration = generation,
+        routeEpoch = routeEpoch,
+        fingerprint = fingerprint,
+        isRunning = isRunning,
+        latestPublishedSequence = sequence
+    )
+
     private fun sampleFrameContext(
         managerId: String = "mgr_test_01",
         generation: Long = 1L,
         sequence: Long = 100L,
         fingerprint: CaptureFingerprint = sampleFingerprint(),
-        isRunning: Boolean = true
+        isRunning: Boolean = true,
+        routeEpoch: Long = 1L
     ): CapturedFrameContext = CapturedFrameContext(
         managerId = managerId,
         captureGeneration = generation,
         frameSequence = sequence,
         fingerprint = fingerprint,
-        isRunning = isRunning
+        isRunning = isRunning,
+        routeEpoch = routeEpoch
     )
 
     // =========================================================================
@@ -223,10 +242,11 @@ class NoiseFloorCompatibilityGateTest {
         val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope, nowMs = { now })
 
         try {
-            manager.startNoiseFloorCapture(durationMs = 200L)
-            assertTrue(manager.uiState.value.isCapturingNoiseFloor)
-
             val baseFingerprint = sampleFingerprint(sampleRate = 48000, micId = "micA")
+            val auth = sampleAuthority(managerId = "mgr1", fingerprint = baseFingerprint)
+            manager.updateCaptureAuthority(auth)
+            manager.startNoiseFloorCapture(durationMs = 200L, authority = auth)
+            assertTrue(manager.uiState.value.isCapturingNoiseFloor)
 
             // Frame 1: Valid PCM hop (seq = 1) at -40 dB
             now += 50L
@@ -238,14 +258,6 @@ class NoiseFloorCompatibilityGateTest {
             now += 50L
             manager.processFrame(FloatArray(31) { -10f }, FloatArray(8) { -10f }, 100f, frameContext = ctx1)
 
-            // Status-only emission (isRunning = false) with loud -10 dB -> must be ignored
-            val ctxNotRunning = ctx1.copy(isRunning = false, frameSequence = 2L)
-            manager.processFrame(FloatArray(31) { -10f }, FloatArray(8) { -10f }, 100f, frameContext = ctxNotRunning)
-
-            // Replaced manager ID with loud -10 dB -> must be ignored
-            val ctxReplacedMgr = ctx1.copy(managerId = "replaced_mgr", frameSequence = 3L)
-            manager.processFrame(FloatArray(31) { -10f }, FloatArray(8) { -10f }, 100f, frameContext = ctxReplacedMgr)
-
             // Frame 2: Valid hop (seq = 2) at -50 dB
             now += 150L // Total elapsed = 250L >= 200L -> triggers finalization
             val ctx2 = sampleFrameContext(managerId = "mgr1", generation = 1L, sequence = 2L, fingerprint = baseFingerprint)
@@ -256,10 +268,39 @@ class NoiseFloorCompatibilityGateTest {
             assertTrue(manager.uiState.value.noiseFloor.isCaptured)
 
             // The resulting noise floor must be the exact power average of -40 dB and -50 dB ONLY.
-            // If the duplicate, non-running, or replaced manager (-10 dB) frames had been accumulated,
-            // the average power would be ~ -10 dB.
+            // If the duplicate (-10 dB) frame had been accumulated, the average power would be ~ -10 dB.
             val expectedAvg = (10.0 * kotlin.math.log10((0.0001 + 0.00001) / 2.0)).toFloat()
             assertArrayEquals(FloatArray(31) { expectedAvg }, manager.uiState.value.noiseFloor.bands31Db, 0.001f)
+        } finally {
+            manager.close()
+        }
+    }
+
+    @Test
+    fun requirementC_statusOnlyOrNonRunningFrameCancelsAcquisitionImmediately() = runTest {
+        var now = 1000L
+        val prefs = testPreferences()
+        val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
+        val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope, nowMs = { now })
+
+        try {
+            val baseFingerprint = sampleFingerprint(sampleRate = 48000, micId = "micA")
+            val auth = sampleAuthority(managerId = "mgr1", fingerprint = baseFingerprint)
+            manager.updateCaptureAuthority(auth)
+            manager.startNoiseFloorCapture(durationMs = 200L, authority = auth)
+            assertTrue(manager.uiState.value.isCapturingNoiseFloor)
+
+            // Frame 1: Valid PCM hop (seq = 1)
+            val ctx1 = sampleFrameContext(managerId = "mgr1", generation = 1L, sequence = 1L, fingerprint = baseFingerprint)
+            manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f, frameContext = ctx1)
+            assertTrue(manager.uiState.value.isCapturingNoiseFloor)
+
+            // Status-only emission (isRunning = false) -> cancels active acquisition immediately per Stage 5
+            val ctxNotRunning = ctx1.copy(isRunning = false, frameSequence = 2L)
+            manager.processFrame(FloatArray(31) { -10f }, FloatArray(8) { -10f }, 100f, frameContext = ctxNotRunning)
+
+            assertFalse("Status-only or stopped frame must cancel active acquisition", manager.uiState.value.isCapturingNoiseFloor)
+            assertFalse("Cancelled acquisition must not capture noise floor", manager.uiState.value.noiseFloor.isCaptured)
         } finally {
             manager.close()
         }
@@ -289,12 +330,14 @@ class NoiseFloorCompatibilityGateTest {
             assertTrue("Pre-existing floor is loaded", manager.uiState.value.noiseFloor.isCaptured)
             assertEquals("Pre-existing timestamp preserved", originalTimestamp, manager.uiState.value.noiseFloor.captureTimestampMs)
 
-            // Start new noise floor capture
-            manager.startNoiseFloorCapture(durationMs = 200L)
-            assertTrue(manager.uiState.value.isCapturingNoiseFloor)
-
             val micA = sampleFingerprint(sampleRate = 48000, micId = "micA")
             val micB = sampleFingerprint(sampleRate = 48000, micId = "micB")
+            val authA = sampleAuthority(fingerprint = micA)
+            manager.updateCaptureAuthority(authA)
+
+            // Start new noise floor capture
+            manager.startNoiseFloorCapture(durationMs = 200L, authority = authA)
+            assertTrue(manager.uiState.value.isCapturingNoiseFloor)
 
             // Frame 1 with micA
             now += 50L
@@ -303,6 +346,8 @@ class NoiseFloorCompatibilityGateTest {
             assertTrue(manager.uiState.value.isCapturingNoiseFloor)
 
             // Routing switched to micB mid-capture!
+            val authB = sampleAuthority(routeEpoch = 2L, fingerprint = micB)
+            manager.updateCaptureAuthority(authB)
             now += 50L
             val ctx2 = sampleFrameContext(sequence = 2L, fingerprint = micB)
             manager.processFrame(FloatArray(31) { -60f }, FloatArray(8) { -60f }, 100f, frameContext = ctx2)
@@ -390,7 +435,9 @@ class NoiseFloorCompatibilityGateTest {
         )
 
         try {
-            manager.startNoiseFloorCapture(durationMs = 100L)
+            val auth = sampleAuthority(managerId = "mgr1", fingerprint = fp)
+            manager.updateCaptureAuthority(auth)
+            manager.startNoiseFloorCapture(durationMs = 100L, authority = auth)
             val ctx1 = sampleFrameContext(managerId = "mgr1", generation = 1L, sequence = 1L, fingerprint = fp)
             manager.processFrame(FloatArray(31) { -50f }, FloatArray(8) { -50f }, 100f, frameContext = ctx1)
 
@@ -435,7 +482,9 @@ class NoiseFloorCompatibilityGateTest {
 
         try {
             // 1. Capture on micA
-            manager.startNoiseFloorCapture(durationMs = 100L)
+            val authA = sampleAuthority(fingerprint = micA)
+            manager.updateCaptureAuthority(authA)
+            manager.startNoiseFloorCapture(durationMs = 100L, authority = authA)
             manager.processFrame(FloatArray(31) { -50f }, FloatArray(8) { -50f }, 100f, frameContext = sampleFrameContext(sequence = 1L, fingerprint = micA))
             now += 150L
             manager.processFrame(FloatArray(31) { -50f }, FloatArray(8) { -50f }, 100f, frameContext = sampleFrameContext(sequence = 2L, fingerprint = micA))
@@ -446,7 +495,9 @@ class NoiseFloorCompatibilityGateTest {
             assertArrayEquals(FloatArray(31) { expectedSubtracted }, frameMicA.calibrated31Db, 0.001f)
 
             // 2. Microphone switches to micB
-            val frameMicB = manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f, frameContext = sampleFrameContext(sequence = 4L, fingerprint = micB))
+            val authB = sampleAuthority(routeEpoch = 2L, fingerprint = micB)
+            manager.updateCaptureAuthority(authB)
+            val frameMicB = manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f, frameContext = sampleFrameContext(sequence = 4L, fingerprint = micB, routeEpoch = 2L))
             // Live subtraction is gated off dynamically due to route mismatch
             assertArrayEquals("Noise subtraction must NOT apply when route differs from capture context", FloatArray(31) { -40f }, frameMicB.calibrated31Db, 0.001f)
 
@@ -454,7 +505,9 @@ class NoiseFloorCompatibilityGateTest {
             assertEquals(micA, manager.uiState.value.noiseFloor.fingerprint)
 
             // 3. Microphone switches back to micA
-            val frameMicAReturn = manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f, frameContext = sampleFrameContext(sequence = 5L, fingerprint = micA))
+            val authAReturn = sampleAuthority(routeEpoch = 3L, fingerprint = micA)
+            manager.updateCaptureAuthority(authAReturn)
+            val frameMicAReturn = manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f, frameContext = sampleFrameContext(sequence = 5L, fingerprint = micA, routeEpoch = 3L))
             // Subtraction resumes automatically
             assertArrayEquals("Noise subtraction resumes when route matches snapshot again", FloatArray(31) { expectedSubtracted }, frameMicAReturn.calibrated31Db, 0.001f)
         } finally {
@@ -516,8 +569,10 @@ class NoiseFloorCompatibilityGateTest {
         val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope, nowMs = { now })
 
         try {
-            manager.startNoiseFloorCapture(durationMs = 200L)
             val baseFp = sampleFingerprint()
+            val auth = sampleAuthority(managerId = "mgr_A", generation = 2L, fingerprint = baseFp)
+            manager.updateCaptureAuthority(auth)
+            manager.startNoiseFloorCapture(durationMs = 200L, authority = auth)
 
             // Frame 1: generation = 2L, sequence = 1L
             now += 50L
@@ -525,24 +580,42 @@ class NoiseFloorCompatibilityGateTest {
             manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f, frameContext = ctxValid)
             assertEquals(0.25f, manager.uiState.value.noiseCaptureProgress, 0.01f)
 
-            // Stale generation frame: generation = 1L
+            // Stale generation frame: generation = 1L -> cancels acquisition immediately per Stage 5
             now += 50L
             val ctxStaleGen = sampleFrameContext(managerId = "mgr_A", generation = 1L, sequence = 2L, fingerprint = baseFp)
             manager.processFrame(FloatArray(31) { -10f }, FloatArray(8) { -10f }, 100f, frameContext = ctxStaleGen)
 
-            // Replaced manager frame: managerId = "mgr_B"
-            val ctxOtherMgr = sampleFrameContext(managerId = "mgr_B", generation = 2L, sequence = 3L, fingerprint = baseFp)
+            assertFalse("Stale or changed generation must cancel acquisition immediately", manager.uiState.value.isCapturingNoiseFloor)
+            assertFalse("Cancelled acquisition must not capture noise floor", manager.uiState.value.noiseFloor.isCaptured)
+        } finally {
+            manager.close()
+        }
+    }
+
+    @Test
+    fun requirementC_replacedManagerCancelsAcquisitionImmediately() = runTest {
+        var now = 1000L
+        val prefs = testPreferences()
+        val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
+        val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope, nowMs = { now })
+
+        try {
+            val baseFp = sampleFingerprint()
+            val auth = sampleAuthority(managerId = "mgr_A", generation = 1L, fingerprint = baseFp)
+            manager.updateCaptureAuthority(auth)
+            manager.startNoiseFloorCapture(durationMs = 200L, authority = auth)
+
+            // Frame 1: valid hop
+            val ctxValid = sampleFrameContext(managerId = "mgr_A", generation = 1L, sequence = 1L, fingerprint = baseFp)
+            manager.processFrame(FloatArray(31) { -40f }, FloatArray(8) { -40f }, 100f, frameContext = ctxValid)
+            assertTrue(manager.uiState.value.isCapturingNoiseFloor)
+
+            // Replaced manager frame: managerId = "mgr_B" -> cancels acquisition immediately per Stage 5
+            val ctxOtherMgr = sampleFrameContext(managerId = "mgr_B", generation = 1L, sequence = 2L, fingerprint = baseFp)
             manager.processFrame(FloatArray(31) { -10f }, FloatArray(8) { -10f }, 100f, frameContext = ctxOtherMgr)
 
-            // Frame 2: valid hop (sequence = 2L on mgr_A, gen 2)
-            now += 150L
-            val ctxValid2 = sampleFrameContext(managerId = "mgr_A", generation = 2L, sequence = 2L, fingerprint = baseFp)
-            manager.processFrame(FloatArray(31) { -50f }, FloatArray(8) { -50f }, 100f, frameContext = ctxValid2)
-
-            // Finalized: only -40 dB and -50 dB frames are averaged
-            assertTrue(manager.uiState.value.noiseFloor.isCaptured)
-            val expectedAvg = (10.0 * kotlin.math.log10((0.0001 + 0.00001) / 2.0)).toFloat()
-            assertArrayEquals(FloatArray(31) { expectedAvg }, manager.uiState.value.noiseFloor.bands31Db, 0.001f)
+            assertFalse("Replaced manager must cancel acquisition immediately", manager.uiState.value.isCapturingNoiseFloor)
+            assertFalse("Cancelled acquisition must not capture noise floor", manager.uiState.value.noiseFloor.isCaptured)
         } finally {
             manager.close()
         }
@@ -597,6 +670,8 @@ class NoiseFloorCompatibilityGateTest {
         val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope)
 
         try {
+            val auth = sampleAuthority(fingerprint = fp)
+            manager.updateCaptureAuthority(auth)
             val liveCtx = sampleFrameContext(fingerprint = fp)
             val expectedSubtracted = AudioMath.subtractNoiseFloor(-40f, -50f, AudioMath.MIN_DB_FS).correctedDb
 
@@ -640,6 +715,8 @@ class NoiseFloorCompatibilityGateTest {
         val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope)
 
         try {
+            val auth = sampleAuthority(fingerprint = fp)
+            manager.updateCaptureAuthority(auth)
             val liveCtx = sampleFrameContext(fingerprint = fp)
             val expectedSubtracted = AudioMath.subtractNoiseFloor(-40f, -50f, AudioMath.MIN_DB_FS).correctedDb
 
@@ -683,6 +760,8 @@ class NoiseFloorCompatibilityGateTest {
         val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope)
 
         try {
+            val auth = sampleAuthority(fingerprint = fp)
+            manager.updateCaptureAuthority(auth)
             val liveCtx = sampleFrameContext(fingerprint = fp)
             assertTrue(manager.uiState.value.isNoiseSubtractionEffective)
 
@@ -717,6 +796,8 @@ class NoiseFloorCompatibilityGateTest {
         val manager = CalibrationManager(prefs, FeatureAccessPolicy(entitlements), backgroundScope)
 
         try {
+            val auth = sampleAuthority(fingerprint = fp)
+            manager.updateCaptureAuthority(auth)
             // Apply mic curve with +3 dB offset
             manager.loadMicCurve("Flat+3dB", "20 3.0\n20000 3.0", com.rtatuner.app.core.calibration.CalibrationFileConvention.ADDITIVE_CORRECTION)
             manager.setMicCurveActive(true)
