@@ -508,14 +508,18 @@ class BiquadFilterBankTest {
                 kotlin.math.abs(rel48[b]) < 0.35f
             )
         }
-        // Band 30 (20 kHz at 48 kHz Fs): Upper skirt is bounded by the 24 kHz Nyquist ceiling, yielding -0.94 dB
-        // Deficit is eliminated compared to the baseline defect of -7.15 dB without shifting the resonance away from 20 kHz.
-        assertTrue(
-            "20 kHz band at 48 kHz must be within 1.1 dB (was ${rel48[30]} dB, baseline defect was -7.15 dB)",
-            kotlin.math.abs(rel48[30]) < 1.10f
+        // Band 30 (20 kHz at 48 kHz Fs): Upper skirt is bounded by the 24 kHz Nyquist ceiling, yielding -0.942 dB.
+        // The severe baseline FFT deficit (-7.15 dB) is significantly mitigated, but not completely eliminated.
+        assertEquals(
+            "20 kHz pink-noise deviation at 48 kHz must match verified reference ~ -0.942 dB",
+            -0.942f,
+            rel48[30],
+            0.05f
         )
-        assertTrue("16 kHz deficit eliminated (baseline defect was -3.81 dB, now ${rel48[29]} dB)", rel48[29] > -0.35f)
-        assertTrue("20 kHz deficit eliminated (baseline defect was -7.15 dB, now ${rel48[30]} dB)", rel48[30] > -1.10f)
+        assertTrue(
+            "16 kHz pink-noise deficit is mitigated (legacy defect was -3.81 dB, now ${rel48[29]} dB)",
+            rel48[29] in -0.15f..0.20f
+        )
 
         // --- 44.1 kHz Verification ---
         val rel44 = computePinkNoiseRelativeLevels(44100)
@@ -530,10 +534,12 @@ class BiquadFilterBankTest {
             )
         }
         // Band 30 (20 kHz at 44.1 kHz Fs): Nyquist wall is at 22.05 kHz, so nominal upper cutoff (22,449 Hz)
-        // is physically above Nyquist. The filter naturally rolls off to zero at Nyquist, yielding -1.34 dB.
-        assertTrue(
-            "20 kHz band at 44.1 kHz must be within 1.5 dB (was ${rel44[30]} dB, baseline defect was -7.15 dB)",
-            kotlin.math.abs(rel44[30]) < 1.50f
+        // is physically above Nyquist. The filter naturally rolls off to zero at Nyquist, yielding -1.339 dB.
+        assertEquals(
+            "20 kHz pink-noise deviation at 44.1 kHz must match verified reference ~ -1.339 dB",
+            -1.339f,
+            rel44[30],
+            0.05f
         )
     }
 
@@ -579,7 +585,7 @@ class BiquadFilterBankTest {
     @Test
     fun testNominalBandEdgeResponseWithinTolerances() {
         val filterBank = BiquadFilterBank(sampleRate = sampleRate)
-        val representativeBands = listOf(7, 17, 24, 27, 29) // 100 Hz, 1 kHz, 5 kHz, 10 kHz, 16 kHz
+        val representativeBands = listOf(7, 17, 24, 27, 29, 30) // 100 Hz, 1 kHz, 5 kHz, 10 kHz, 16 kHz, 20 kHz
 
         for (b in representativeBands) {
             val f0 = Iso31Bands.CENTER_FREQUENCIES[b].toDouble()
@@ -608,10 +614,17 @@ class BiquadFilterBankTest {
             val upperDrop = centerResp - upperResp
 
             println("Band $b ($f0 Hz): Center=$centerResp dBFS, Lower($lowerEdge Hz) drop=$lowerDrop dB, Upper($upperEdge Hz) drop=$upperDrop dB")
-            // 4th-order cascade response at nominal band edge drops by ~3.01 dB (-3 dB half-power cutoff)
-            // Near Nyquist (e.g. 16 kHz), bilinear warping causes slight asymmetric spreading (lower: 2.39 dB, upper: 3.76 dB).
-            assertTrue("Band $b lower edge drop ($lowerDrop dB) should be near -3.01 dB (within 2.2 dB .. 3.5 dB)", lowerDrop in 2.2f..3.5f)
-            assertTrue("Band $b upper edge drop ($upperDrop dB) should be near -3.01 dB (within 2.7 dB .. 4.5 dB)", upperDrop in 2.7f..4.5f)
+            if (b == 30) {
+                // At 48 kHz (Nyquist 24 kHz), Band 30 lower edge is anchored at -3.01 dB drop,
+                // while upper nominal edge (22,449 Hz) rolls off to ~10.15 dB due to Nyquist compression.
+                assertTrue("Band 30 lower edge drop ($lowerDrop dB) should be near 3.01 dB", lowerDrop in 2.8f..3.3f)
+                assertTrue("Band 30 upper edge drop ($upperDrop dB) should be near 10.15 dB", upperDrop in 9.5f..11.0f)
+            } else {
+                // 4th-order cascade response at nominal band edge drops by ~3.01 dB (-3 dB half-power cutoff)
+                // Near Nyquist (e.g. 16 kHz), bilinear warping causes slight asymmetric spreading (lower: 2.39 dB, upper: 3.76 dB).
+                assertTrue("Band $b lower edge drop ($lowerDrop dB) should be near -3.01 dB (within 2.2 dB .. 3.5 dB)", lowerDrop in 2.2f..3.5f)
+                assertTrue("Band $b upper edge drop ($upperDrop dB) should be near -3.01 dB (within 2.7 dB .. 4.5 dB)", upperDrop in 2.7f..4.5f)
+            }
         }
     }
 
@@ -716,6 +729,38 @@ class BiquadFilterBankTest {
                     )
                 }
 
+                // Explicit verification of independently validated reference values:
+                if (fs == 48000) {
+                    when (b) {
+                        17 -> { // 1 kHz
+                            assertEquals("1 kHz lower edge at 48k matches verified reference", -3.009, gainF1, 0.05)
+                            assertEquals("1 kHz upper edge at 48k matches verified reference", -3.012, gainF2, 0.05)
+                        }
+                        29 -> { // 16 kHz
+                            assertEquals("16 kHz lower edge at 48k matches verified reference", -2.389, gainF1, 0.05)
+                            assertEquals("16 kHz upper edge at 48k matches verified reference", -3.762, gainF2, 0.05)
+                        }
+                        30 -> { // 20 kHz
+                            assertEquals("20 kHz lower edge at 48k matches verified reference", -3.010, gainF1, 0.05)
+                            assertEquals("20 kHz upper edge at 48k matches verified reference", -10.154, gainF2, 0.05)
+                        }
+                    }
+                } else if (fs == 44100) {
+                    when (b) {
+                        29 -> { // 16 kHz
+                            assertEquals("16 kHz lower edge at 44.1k matches verified reference", -2.186, gainF1, 0.05)
+                            assertEquals("16 kHz upper edge at 44.1k matches verified reference", -4.081, gainF2, 0.05)
+                        }
+                        30 -> { // 20 kHz
+                            assertEquals("20 kHz lower edge at 44.1k matches verified reference", -3.010, gainF1, 0.05)
+                            assertTrue(
+                                "20 kHz upper nominal edge at 44.1k (22,449 Hz) is above Nyquist (22,050 Hz) and must not be a valid digital frequency",
+                                gainF2.isNaN()
+                            )
+                        }
+                    }
+                }
+
                 // 4. Measure actual -3 dB cutoff boundaries
                 var fLow3dB = Double.NaN
                 for (step in 1..10000) {
@@ -724,14 +769,19 @@ class BiquadFilterBankTest {
                     if (calcGain(testF) <= -3.0103) { fLow3dB = testF; break }
                 }
                 var fHigh3dB = Double.NaN
-                for (step in 1..10000) {
-                    val testF = f0 + step * ((nyquist - f0) / 10000.0)
+                for (step in 1..20000) {
+                    val testF = f0 * (1.0 + step / 20000.0)
                     if (testF >= nyquist) break
                     if (calcGain(testF) <= -3.0103) { fHigh3dB = testF; break }
                 }
 
-                // Lower -3 dB cutoff matches nominal f1 within 3% across the entire audio spectrum
-                assertEquals("Band $b lower -3 dB cutoff must match nominal f1", f1, fLow3dB, f1 * 0.03)
+                // Lower -3 dB cutoff matches nominal f1 within 3.0% across the entire audio spectrum
+                assertEquals("Band $b lower -3 dB cutoff must match nominal f1 within 3.0%", f1, fLow3dB, f1 * 0.030)
+
+                // Upper -3 dB cutoff matches nominal f2 within 3.0% for bands below 0.90 * Nyquist
+                if (f2 < nyquist * 0.90) {
+                    assertEquals("Band $b upper -3 dB cutoff must match nominal f2 within 3.0%", f2, fHigh3dB, f2 * 0.030)
+                }
 
                 // 5. Compute white noise Equivalent Noise Bandwidth (ENBW)
                 var wPower = 0.0
@@ -746,7 +796,23 @@ class BiquadFilterBankTest {
                 }
                 assertTrue("ENBW must be positive and finite", wPower > 0.0 && !wPower.isInfinite())
 
-                // 6. Adjacent band rejection: at lower adjacent center (f0 * 2^(-1/3)), IEC 61260 Class 1 specifies >= 5.5 dB
+                // Explicit ENBW bounds:
+                // Mid-bands (f2 < nyquist * 0.85): normalized ENBW (wPower / f0) is ~0.282 for 4th-order cascade, bounded in [0.25, 0.31]
+                if (f2 < nyquist * 0.85) {
+                    val normalizedEnbw = wPower / f0
+                    assertTrue(
+                        "Band $b ($f0 Hz) normalized ENBW ($normalizedEnbw) must be within [0.25, 0.31]",
+                        normalizedEnbw in 0.25..0.31
+                    )
+                } else {
+                    // Near-Nyquist bands (16 kHz and 20 kHz): absolute ENBW bounded in [3000, 5000] Hz
+                    assertTrue(
+                        "Near-Nyquist band $b ($f0 Hz) ENBW ($wPower Hz) must be within [3000, 5000] Hz",
+                        wPower in 3000.0..5000.0
+                    )
+                }
+
+                // 6. Adjacent band rejection: at lower adjacent center (f0 * 2^(-1/3)), verifying >= 5.5 dB attenuation
                 val adjLowerFreq = f0 / (Iso31Bands.OCTAVE_RATIO * Iso31Bands.OCTAVE_RATIO)
                 val adjAtten = gainF0 - calcGain(adjLowerFreq)
                 assertTrue(

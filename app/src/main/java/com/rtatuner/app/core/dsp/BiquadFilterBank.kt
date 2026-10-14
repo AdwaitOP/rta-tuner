@@ -9,18 +9,51 @@ import kotlin.math.sqrt
 
 /**
  * Continuous 4th-order IIR bandpass filter bank (two cascaded 2nd-order biquad sections per band)
- * for real-time fractional-octave spectrum analysis (IEC 61260 Class 0/1 compliance architecture).
+ * for real-time fractional-octave spectrum analysis.
  *
- * Each displayed band is filtered by two cascaded 2nd-order BPF sections (constant 0 dB peak gain each,
- * producing 0 dB overall peak gain at f0 and 24 dB/octave asymptotic skirts: 12 dB/octave per side).
+ * Design architecture & standards context:
+ * - Employs 1/3-octave band spacing according to ISO 266 nominal center frequencies.
+ * - Architecture is inspired by fractional-octave bandpass filtering principles described in IEC 61260,
+ *   but CabinRTA is NOT a certified IEC 61260 Class 0, Class 1, or Class 2 instrument and does not
+ *   claim certified compliance.
  *
- * Key DSP characteristics:
+ * Exact Center Gain vs. Approximate Nominal-Edge Response:
+ * - Exact Nominal-Center Resonance: Each band is filtered by two cascaded 2nd-order BPF sections
+ *   with an exact 0.000 dB peak gain (unity gain) at the nominal center frequency f0. The center frequency
+ *   is pre-warped into the analog prototype domain (Omega0 = tan(pi * f0 / Fs)), ensuring that discrete-time
+ *   resonance occurs precisely at f0 for all valid audio bands below Nyquist without frequency pulling.
+ * - Approximate Nominal-Edge Response: While continuous analog prototypes achieve symmetric -3.01 dB
+ *   half-power points at the nominal band edges (f1 = f0 * 2^(-1/6), f2 = f0 * 2^(1/6)), the bilinear
+ *   transform mapping s = (1 - z^-1)/(1 + z^-1) introduces nonlinear frequency warping Omega = tan(pi * f / Fs).
+ *   At low and mid frequencies (e.g. 1 kHz at 48 kHz), edge gains match nominal -3.01 dB closely (-3.009 dB / -3.012 dB).
+ *   However, as frequencies approach Nyquist (e.g. 16 kHz and 20 kHz), nonlinear compression distorts the upper
+ *   skirt, making nominal band-edge response an engineering approximation rather than an exact -3.01 dB boundary.
+ *
+ * High-Frequency / Nyquist Trade-off:
+ * - At 48 kHz (Nyquist = 24 kHz):
+ *   * 1 kHz lower/upper edges: approximately -3.009 dB / -3.012 dB.
+ *   * 16 kHz lower/upper edges: approximately -2.389 dB / -3.762 dB.
+ *   * 20 kHz band: lower edge is anchored at approximately -3.010 dB, but the upper nominal cutoff
+ *     (22,449 Hz) is compressed against the 24 kHz Nyquist ceiling, yielding approximately -10.154 dB.
+ *     Integrated pink-noise deviation in the 20 kHz band is approximately -0.942 dB relative to 1 kHz.
+ * - At 44.1 kHz (Nyquist = 22.05 kHz):
+ *   * 16 kHz lower/upper edges: approximately -2.186 dB / -4.081 dB.
+ *   * 20 kHz band: lower edge is approximately -3.010 dB. The nominal upper cutoff (22,449 Hz) is physically
+ *     above the Nyquist frequency (22,050 Hz) and therefore does not exist as a valid digital frequency.
+ *     The digital filter response naturally rolls off to zero (-infinity dB) at Nyquist.
+ *     Integrated pink-noise deviation in the 20 kHz band is approximately -1.339 dB relative to 1 kHz.
+ * - High-Frequency Deficit Mitigation:
+ *   The pre-warped biquad filter bank significantly mitigates the severe high-frequency deficit of the legacy
+ *   FFT binning implementation (which dropped by -7.15 dB at 20 kHz). However, due to the unavoidable discrete-time
+ *   Nyquist ceiling and tangent frequency compression, the deficit is mitigated rather than completely eliminated.
+ *
+ * Key DSP implementation characteristics:
  * - 64-bit Double state (Transposed Direct Form II) across both cascaded biquad stages to prevent
  *   numerical instability, limit cycles, and quantization noise at low frequencies (< 100 Hz).
  * - State persistence across hops: audio stream is processed continuously without per-frame reset.
  * - Computes true RMS power per band over each hop and converts to dBFS using AudioMath.linearToDbFs.
  * - Zero heap allocations in processHop().
- * - Coefficients recomputed only upon sample rate or band configuration changes (preset switches).
+ * - Coefficients recomputed only upon sample rate or band configuration changes.
  */
 class BiquadFilterBank(
     sampleRate: Int = DEFAULT_SAMPLE_RATE,
@@ -171,21 +204,30 @@ class BiquadFilterBank(
     /**
      * Recomputes 4th-order bandpass filter bank coefficients (two cascaded 2nd-order biquads per band).
      *
-     * Mathematical derivation:
+     * Mathematical derivation & response characteristics:
      * - Each band is filtered by two cascaded 2nd-order bandpass biquads with 0 dB peak gain.
      * - The overall cascade transfer function is H_cascade(z) = [H_stage(z)]^2.
-     * - Bilinear transform maps s = (1 - z^-1) / (1 + z^-1) with Omega = tan(pi * f / Fs).
-     * - Center resonance: Setting Omega0 = tan(pi * f0 / Fs) guarantees that the digital filter
-     *   resonance is exactly at the nominal center frequency f0 with identically 0 dB peak gain
-     *   for all 31 ISO bands, avoiding high-frequency geometric center warping.
+     * - Bilinear transform maps s = (1 - z^-1) / (1 + z^-1) with analog prototype frequency Omega = tan(pi * f / Fs).
+     * - Exact center resonance: Setting Omega0 = tan(pi * f0 / Fs) guarantees that the digital filter
+     *   resonance is exactly at the nominal center frequency f0 with identically 0.000 dB peak gain
+     *   for all valid audio bands below Nyquist without geometric center warping.
      * - Cascade bandwidth expansion: Cascading two identical 2nd-order bandpass stages contracts
-     *   the -3 dB bandwidth by a factor of sqrt(sqrt(2) - 1) ≈ 0.64359425. To achieve -3 dB at the
-     *   nominal band edges, the per-stage bandwidth parameter beta must be expanded by
+     *   the -3 dB bandwidth by a factor of sqrt(sqrt(2) - 1) ≈ 0.64359425. To compensate for this
+     *   cascade contraction, the per-stage bandwidth parameter beta is expanded by
      *   1.0 / CASCADE_BANDWIDTH_EXPANSION_FACTOR.
-     * - Nyquist constraint: For high-frequency bands near or exceeding Nyquist (e.g. 20 kHz at 44.1 kHz
-     *   where nominal upper cutoff 22,449 Hz > Nyquist 22,050 Hz), the bandwidth is anchored to the
-     *   pre-warped lower band edge f1 = f0 / 2^(1/6), allowing the upper skirt to naturally roll off
-     *   to zero at Nyquist without unphysical frequency pulling or numerical divergence.
+     * - Exact center vs. approximate edge response:
+     *   Center gain is exact (0.000 dB) at f0 because Omega0 is pre-warped.
+     *   Nominal band edge gains (-3.01 dB) are exact in the continuous analog prototype, but in the
+     *   discrete-time domain, nonlinear tangent warping Omega = tan(pi * f / Fs) compresses the
+     *   upper band skirt as frequencies approach Nyquist.
+     * - High-frequency / Nyquist trade-off:
+     *   For mid frequencies (e.g. 1 kHz at 48 kHz), lower and upper edge gains are ~ -3.009 dB / -3.012 dB.
+     *   At 16 kHz (48 kHz), edges spread to ~ -2.389 dB / -3.762 dB.
+     *   At 20 kHz (48 kHz), the lower edge is anchored at ~ -3.010 dB, but the upper nominal edge (22,449 Hz)
+     *   rolls off to ~ -10.154 dB due to tangent compression against the 24 kHz Nyquist ceiling.
+     *   At 44.1 kHz, Nyquist is at 22,050 Hz, so the 20 kHz nominal upper edge (22,449 Hz) is above Nyquist and
+     *   does not exist in discrete-time digital audio; the lower edge is ~ -3.010 dB and the upper skirt
+     *   naturally rolls off to zero at Nyquist.
      */
     private fun recomputeCoefficients() {
         val nyquist = sampleRate * 0.5
