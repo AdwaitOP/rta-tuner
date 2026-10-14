@@ -188,11 +188,25 @@ internal class CaptureSession(
             shouldStop = isRecordingStarted
         }
 
+        var fatalError: Throwable? = null
+
+        fun recordFatal(t: Throwable) {
+            if (fatalError == null) {
+                fatalError = t
+            } else if (fatalError !== t) {
+                try {
+                    fatalError?.addSuppressed(t)
+                } catch (_: Throwable) { }
+            }
+        }
+
         if (!shouldStop) {
             try {
                 shouldStop = (record.recordingState == AudioRecord.RECORDSTATE_RECORDING)
             } catch (e: Exception) {
                 Log.w("AudioCaptureManager", "Exception querying recordingState during cleanup in session $generation", e)
+            } catch (t: Throwable) {
+                recordFatal(t)
             }
         }
 
@@ -201,6 +215,8 @@ internal class CaptureSession(
                 record.removeOnRoutingChangedListener(listenerToRemove)
             } catch (e: Exception) {
                 Log.w("AudioCaptureManager", "Error removing routing listener in session $generation", e)
+            } catch (t: Throwable) {
+                recordFatal(t)
             }
         }
 
@@ -209,6 +225,8 @@ internal class CaptureSession(
                 record.stop()
             } catch (e: Exception) {
                 Log.w("AudioCaptureManager", "Exception stopping record in session $generation", e)
+            } catch (t: Throwable) {
+                recordFatal(t)
             }
         }
 
@@ -216,7 +234,11 @@ internal class CaptureSession(
             record.release()
         } catch (e: Exception) {
             Log.w("AudioCaptureManager", "Exception releasing record in session $generation", e)
+        } catch (t: Throwable) {
+            recordFatal(t)
         }
+
+        fatalError?.let { throw it }
     }
 }
 
@@ -693,15 +715,17 @@ class AudioCaptureManager(
                     _uiState.value = _uiState.value.copy(
                         status = CaptureStatus.RUNNING,
                         errorMessage = null,
+                        routedDeviceId = null,
                         diagnostics = AudioCaptureDiagnostics(
                             activeAudioSource = activeSourceName,
                             requestedSampleRate = requestedRate,
                             actualSampleRate = sampleRate,
                             detectedInputRate = rateResolution.detectedInputRate,
                             detectedOutputRate = rateResolution.detectedOutputRate,
-                            inputDeviceName = inputDeviceName,
+                            inputDeviceName = "Pending",
                             requestedDeviceName = targetDevice?.productName?.toString() ?: "Auto (System Default)",
-                            actualRoutedDeviceName = inputDeviceName,
+                            actualRoutedDeviceName = "Pending",
+                            actualRoutedDeviceType = "Pending",
                             windowSize = windowSize,
                             hopSize = hopSize,
                             bufferSizeInBytes = hardwareBufferSize,
@@ -731,18 +755,24 @@ class AudioCaptureManager(
             return true
         } catch (t: Throwable) {
             // Clean up all resources created by this attempt (B05, B06)
+            var cleanupFatal: Throwable? = null
             try {
                 if (createdSession != null) {
                     createdSession.cleanup()
                 } else {
-                    newlyCreatedRecord?.release()
+                    val toRelease = newlyCreatedRecord
+                    newlyCreatedRecord = null
+                    toRelease?.release()
                 }
             } catch (cleanEx: Exception) {
                 Log.w(TAG, "Exception cleaning up resources after initialization failure in attempt $attemptToken", cleanEx)
+            } catch (cleanFatal: Throwable) {
+                cleanupFatal = cleanFatal
+                Log.e(TAG, "Fatal error cleaning up resources after initialization failure in attempt $attemptToken", cleanFatal)
             }
 
-            // For fatal JVM errors, preserve error propagation while avoiding resource leaks (B05)
-            if (isFatalError(t)) {
+            // Authoritative attempt retirement must run in a guaranteed exit path (B05)
+            try {
                 synchronized(lifecycleLock) {
                     if (activeAttemptToken == attemptToken) {
                         activeAttemptToken = 0L
@@ -750,28 +780,35 @@ class AudioCaptureManager(
                             activeSession = null
                             isRunning.set(false)
                         }
+                        if (!isFatalError(t) && cleanupFatal == null) {
+                            _uiState.value = _uiState.value.copy(
+                                status = CaptureStatus.ERROR,
+                                errorMessage = "Capture initialization failed: ${t.message ?: t.javaClass.simpleName}",
+                                routedDeviceId = null
+                            )
+                        }
+                    } else {
+                        Log.w(TAG, "Suppressed initialization error from obsolete attempt $attemptToken: ${t.message}")
                     }
                 }
-                throw t
+            } finally {
+                // If initialization failed with a fatal error, preserve that original error as primary (B05)
+                if (isFatalError(t)) {
+                    if (cleanupFatal != null && t !== cleanupFatal) {
+                        try {
+                            t.addSuppressed(cleanupFatal)
+                        } catch (_: Throwable) { }
+                    }
+                    throw t
+                }
+
+                // If cleanup itself was the only fatal failure, propagate it after lifecycle retirement (B05)
+                if (cleanupFatal != null) {
+                    throw cleanupFatal
+                }
             }
 
             Log.e(TAG, "Exception during capture initialization for attempt $attemptToken", t)
-            synchronized(lifecycleLock) {
-                if (activeAttemptToken == attemptToken) {
-                    activeAttemptToken = 0L
-                    if (activeSession === createdSession) {
-                        activeSession = null
-                        isRunning.set(false)
-                    }
-                    _uiState.value = _uiState.value.copy(
-                        status = CaptureStatus.ERROR,
-                        errorMessage = "Capture initialization failed: ${t.message ?: t.javaClass.simpleName}",
-                        routedDeviceId = null
-                    )
-                } else {
-                    Log.w(TAG, "Suppressed initialization error from obsolete attempt $attemptToken: ${t.message}")
-                }
-            }
             return false
         }
     }
@@ -786,16 +823,23 @@ class AudioCaptureManager(
      */
     private fun runAudioCaptureLoop(session: CaptureSession) {
         try {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to set audio thread priority for session ${session.generation}", e)
-        }
+            try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to set audio thread priority for session ${session.generation}", e)
+            }
 
-        onPreStartRecording?.invoke(session)
+            onPreStartRecording?.invoke(session)
 
-        val record = session.record
-        try {
-            val started = session.startRecording()
+            val record = session.record
+            val started = try {
+                session.startRecording()
+            } catch (e: Exception) {
+                Log.e(TAG, "Exception starting AudioRecord for session ${session.generation}", e)
+                notifyCaptureError(session, "Failed to start audio recording: ${e.message}")
+                return
+            }
+
             if (!started) {
                 // If session was already cleaned up (stopped before worker could run), exit cleanly without false error (B03)
                 if (!session.isCleanedUp()) {
@@ -806,34 +850,29 @@ class AudioCaptureManager(
                 }
                 return
             }
+
             synchronized(lifecycleLock) {
                 updateActualRoutedDeviceLocked(session, record.routedDevice, session.targetDevice)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Exception starting AudioRecord for session ${session.generation}", e)
-            notifyCaptureError(session, "Failed to start audio recording: ${e.message}")
-            return
-        }
 
-        val windowSize = session.windowSize
-        val hopSize = session.hopSize
-        val sampleRate = session.actualRate
+            val windowSize = session.windowSize
+            val hopSize = session.hopSize
+            val sampleRate = session.actualRate
 
-        // Pre-allocated buffers: zero allocations inside the loop
-        val hopBuffer = ShortArray(hopSize)
-        var hopSamplesAccumulated = 0
-        val slidingWindow = ShortArray(windowSize)
-        val fftProcessor = FftProcessor(windowSize = windowSize, sampleRate = sampleRate)
-        val biquadFilterBank = BiquadFilterBank(sampleRate = sampleRate)
-        var consecutiveZeroReads = 0
-        var totalFrames = 0L
-        var lastFpsTimeNs = System.nanoTime()
-        var framesInSecond = 0
-        var currentFps = 0f
+            // Pre-allocated buffers: zero allocations inside the loop
+            val hopBuffer = ShortArray(hopSize)
+            var hopSamplesAccumulated = 0
+            val slidingWindow = ShortArray(windowSize)
+            val fftProcessor = FftProcessor(windowSize = windowSize, sampleRate = sampleRate)
+            val biquadFilterBank = BiquadFilterBank(sampleRate = sampleRate)
+            var consecutiveZeroReads = 0
+            var totalFrames = 0L
+            var lastFpsTimeNs = System.nanoTime()
+            var framesInSecond = 0
+            var currentFps = 0f
 
-        Log.i(TAG, "Audio capture loop running for session ${session.generation}. Window: $windowSize, Hop: $hopSize, Rate: $sampleRate Hz")
+            Log.i(TAG, "Audio capture loop running for session ${session.generation}. Window: $windowSize, Hop: $hopSize, Rate: $sampleRate Hz")
 
-        try {
             while (isRunning.get() && isCurrentSession(session)) {
                 val toRead = hopSize - hopSamplesAccumulated
                 val readResult = record.read(hopBuffer, hopSamplesAccumulated, toRead, AudioRecord.READ_BLOCKING)
@@ -924,12 +963,32 @@ class AudioCaptureManager(
             Log.e(TAG, "Unhandled exception in capture loop for session ${session.generation}", e)
             notifyCaptureError(session, "Capture loop error: ${e.message}")
         } finally {
-            session.cleanup()
-            synchronized(lifecycleLock) {
-                if (activeSession === session) {
-                    activeSession = null
-                    isRunning.set(false)
+            var cleanupFatal: Throwable? = null
+            try {
+                session.cleanup()
+            } catch (cleanEx: Exception) {
+                Log.w(TAG, "Exception cleaning up session ${session.generation} on worker exit", cleanEx)
+            } catch (cleanFatal: Throwable) {
+                cleanupFatal = cleanFatal
+                Log.e(TAG, "Fatal error cleaning up session ${session.generation} on worker exit", cleanFatal)
+            }
+
+            try {
+                synchronized(lifecycleLock) {
+                    if (activeSession === session) {
+                        activeSession = null
+                        isRunning.set(false)
+                        activeAttemptToken = 0L
+                        if (_uiState.value.status == CaptureStatus.RUNNING) {
+                            _uiState.value = _uiState.value.copy(
+                                status = CaptureStatus.STOPPED,
+                                routedDeviceId = null
+                            )
+                        }
+                    }
                 }
+            } finally {
+                cleanupFatal?.let { throw it }
             }
             Log.i(TAG, "Audio capture thread for session ${session.generation} exited cleanly")
         }
@@ -1114,7 +1173,7 @@ class AudioCaptureManager(
         synchronized(lifecycleLock) {
             // Mutate configuration strictly under lifecycleLock (B07)
             activeConfig = activeConfig.copy(preferredDeviceId = deviceId)
-            val wasActive = isRunning.get() || activeAttemptToken != 0L
+            val wasActive = isRunning.get() || activeAttemptToken != 0L || activeRestartToken != 0L
 
             if (wasActive) {
                 // Reserve restart ownership under lifecycleLock (B04)
@@ -1189,6 +1248,7 @@ class AudioCaptureManager(
 
         // 1. Try preferred source (UNPROCESSED)
         var primaryRecord: AudioRecordSource? = null
+        var primaryFatal: Throwable? = null
         try {
             primaryRecord = audioRecordFactory.create(
                 preferredSource,
@@ -1216,33 +1276,33 @@ class AudioCaptureManager(
                     return result
                 } else {
                     Log.w(TAG, "AudioRecord state not initialized with preferred source $preferredSource")
-                    try {
-                        primaryRecord.release()
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Exception releasing uninitialized primary record", e)
-                    }
-                    primaryRecord = null
                 }
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed creating AudioRecord with source $preferredSource: ${e.message}")
-            try {
-                primaryRecord?.release()
-            } catch (relEx: Exception) {
-                Log.w(TAG, "Exception releasing primary record after failure", relEx)
-            }
-            primaryRecord = null
+        } catch (t: Throwable) {
+            primaryFatal = t
+            throw t
         } finally {
+            val toRelease = primaryRecord
+            primaryRecord = null
             try {
-                primaryRecord?.release()
-            } catch (e: Exception) {
-                Log.w(TAG, "Exception releasing unowned primary record in finally", e)
+                toRelease?.release()
+            } catch (cleanEx: Exception) {
+                Log.w(TAG, "Exception releasing unowned primary record in finally", cleanEx)
+            } catch (cleanFatal: Throwable) {
+                if (primaryFatal != null && primaryFatal !== cleanFatal) {
+                    try { primaryFatal?.addSuppressed(cleanFatal) } catch (_: Throwable) { }
+                } else {
+                    throw cleanFatal
+                }
             }
         }
 
         // 2. Fallback to standard MIC
         if (preferredSource != MediaRecorder.AudioSource.MIC) {
             var fallbackRecord: AudioRecordSource? = null
+            var fallbackFatal: Throwable? = null
             try {
                 Log.i(TAG, "Attempting fallback to MediaRecorder.AudioSource.MIC")
                 fallbackRecord = audioRecordFactory.create(
@@ -1266,27 +1326,26 @@ class AudioCaptureManager(
                         return result
                     } else {
                         Log.e(TAG, "Fallback AudioRecord with MIC failed to initialize")
-                        try {
-                            fallbackRecord.release()
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Exception releasing uninitialized fallback record", e)
-                        }
-                        fallbackRecord = null
                     }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Exception initializing fallback MIC AudioRecord", e)
-                try {
-                    fallbackRecord?.release()
-                } catch (relEx: Exception) {
-                    Log.w(TAG, "Exception releasing fallback record after failure", relEx)
-                }
-                fallbackRecord = null
+            } catch (t: Throwable) {
+                fallbackFatal = t
+                throw t
             } finally {
+                val toRelease = fallbackRecord
+                fallbackRecord = null
                 try {
-                    fallbackRecord?.release()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Exception releasing unowned fallback record in finally", e)
+                    toRelease?.release()
+                } catch (cleanEx: Exception) {
+                    Log.w(TAG, "Exception releasing unowned fallback record in finally", cleanEx)
+                } catch (cleanFatal: Throwable) {
+                    if (fallbackFatal != null && fallbackFatal !== cleanFatal) {
+                        try { fallbackFatal?.addSuppressed(cleanFatal) } catch (_: Throwable) { }
+                    } else {
+                        throw cleanFatal
+                    }
                 }
             }
         }
