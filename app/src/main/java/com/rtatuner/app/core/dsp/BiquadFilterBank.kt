@@ -171,26 +171,21 @@ class BiquadFilterBank(
     /**
      * Recomputes 4th-order bandpass filter bank coefficients (two cascaded 2nd-order biquads per band).
      *
-     * Employs exact bilinear transform frequency pre-warping to prevent high-frequency
-     * bandwidth collapse near Nyquist, and compensates for the -3 dB bandwidth contraction
-     * inherent in cascading two identical 2nd-order biquad stages:
-     *
-     * 1. For each band, determine nominal band edges f1 and f2 from center frequency f0 and quality factor Q.
-     * 2. Pre-warp band edges to continuous-time analog prototype angular frequencies:
-     *      Omega1 = tan(pi * f1 / Fs)
-     *      Omega2 = tan(pi * f2 / Fs)
-     * 3. Analog bandwidth and center:
-     *      DeltaOmega = Omega2 - Omega1
-     *      Omega0_sq = Omega1 * Omega2
-     * 4. Account for two cascaded sections (-3 dB cascade cutoff matching nominal band edges):
-     *      beta = DeltaOmega / sqrt(sqrt(2) - 1)
-     * 5. Normalized 2nd-order biquad coefficients for each stage:
-     *      a0 = 1.0 + beta + Omega0_sq
-     *      b0 = beta / a0
-     *      b1 = 0.0
-     *      b2 = -b0
-     *      a1 = 2.0 * (Omega0_sq - 1.0) / a0
-     *      a2 = (1.0 - beta + Omega0_sq) / a0
+     * Mathematical derivation:
+     * - Each band is filtered by two cascaded 2nd-order bandpass biquads with 0 dB peak gain.
+     * - The overall cascade transfer function is H_cascade(z) = [H_stage(z)]^2.
+     * - Bilinear transform maps s = (1 - z^-1) / (1 + z^-1) with Omega = tan(pi * f / Fs).
+     * - Center resonance: Setting Omega0 = tan(pi * f0 / Fs) guarantees that the digital filter
+     *   resonance is exactly at the nominal center frequency f0 with identically 0 dB peak gain
+     *   for all 31 ISO bands, avoiding high-frequency geometric center warping.
+     * - Cascade bandwidth expansion: Cascading two identical 2nd-order bandpass stages contracts
+     *   the -3 dB bandwidth by a factor of sqrt(sqrt(2) - 1) ≈ 0.64359425. To achieve -3 dB at the
+     *   nominal band edges, the per-stage bandwidth parameter beta must be expanded by
+     *   1.0 / CASCADE_BANDWIDTH_EXPANSION_FACTOR.
+     * - Nyquist constraint: For high-frequency bands near or exceeding Nyquist (e.g. 20 kHz at 44.1 kHz
+     *   where nominal upper cutoff 22,449 Hz > Nyquist 22,050 Hz), the bandwidth is anchored to the
+     *   pre-warped lower band edge f1 = f0 / 2^(1/6), allowing the upper skirt to naturally roll off
+     *   to zero at Nyquist without unphysical frequency pulling or numerical divergence.
      */
     private fun recomputeCoefficients() {
         val nyquist = sampleRate * 0.5
@@ -209,24 +204,34 @@ class BiquadFilterBank(
             } else {
                 val f1 = f0 / k
                 val f2Nominal = f0 * k
-                // For bands approaching Nyquist (e.g. 20 kHz at 44.1 kHz), ensure upper edge is strictly below Nyquist
-                val f2 = if (f2Nominal >= nyquist) nyquist * 0.999 else f2Nominal
 
-                val omega1 = Math.PI * f1 / sampleRate
-                val omega2 = Math.PI * f2 / sampleRate
-                val tan1 = Math.tan(omega1)
-                val tan2 = Math.tan(omega2)
-                val omega0Sq = tan1 * tan2
-                val deltaOmega = tan2 - tan1
-                val beta = deltaOmega
+                // Pre-warp nominal center frequency to analog domain to guarantee 0 dB peak gain at f0
+                val tan0 = Math.tan(Math.PI * f0 / sampleRate)
+                val tan1 = Math.tan(Math.PI * f1 / sampleRate)
+                val omega0Sq = tan0 * tan0
+
+                // Required stage bandwidth beta for the cascade to reach -3.01 dB at lower cutoff f1:
+                val beta1 = (omega0Sq - tan1 * tan1) / (cascadeFactor * tan1)
+
+                // For bands safely below Nyquist (f2 < 0.90 * Nyquist), balance bandwidth between
+                // lower and upper cutoff edges via geometric mean. For bands near or above Nyquist,
+                // anchor to the lower cutoff requirement beta1.
+                val beta = if (f2Nominal < nyquist * 0.90) {
+                    val tan2 = Math.tan(Math.PI * f2Nominal / sampleRate)
+                    val beta2 = (tan2 * tan2 - omega0Sq) / (cascadeFactor * tan2)
+                    sqrt(beta1 * beta2)
+                } else {
+                    beta1
+                }
+
                 val a0 = 1.0 + beta + omega0Sq
-
                 b0Coeffs[b] = beta / a0
                 a1Coeffs[b] = (2.0 * (omega0Sq - 1.0)) / a0
                 a2Coeffs[b] = (1.0 - beta + omega0Sq) / a0
             }
         }
     }
+
 
     /**
      * Processes a continuous hop of 16-bit PCM samples through all 4th-order bandpass filters.
