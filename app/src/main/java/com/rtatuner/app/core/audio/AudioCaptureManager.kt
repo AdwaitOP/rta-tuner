@@ -8,6 +8,8 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Handler
+import android.os.Looper
 import android.os.Process
 import android.util.Log
 import kotlinx.coroutines.flow.Flow
@@ -18,7 +20,128 @@ import kotlinx.coroutines.flow.emptyFlow
 import com.rtatuner.app.core.dsp.BiquadFilterBank
 import com.rtatuner.app.core.dsp.FftProcessor
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
+
+/**
+ * Abstraction over AudioRecord hardware operations to ensure testability,
+ * deterministic mocking, and strict generation ownership.
+ */
+@Suppress("DEPRECATION")
+interface AudioRecordSource {
+    val state: Int
+    val recordingState: Int
+    val routedDevice: AudioDeviceInfo?
+    fun setPreferredDevice(device: AudioDeviceInfo?): Boolean
+    fun addOnRoutingChangedListener(listener: AudioRecord.OnRoutingChangedListener, handler: Handler?)
+    fun removeOnRoutingChangedListener(listener: AudioRecord.OnRoutingChangedListener)
+    fun startRecording()
+    fun read(audioData: ShortArray, offsetInShorts: Int, sizeInShorts: Int, readMode: Int): Int
+    fun stop()
+    fun release()
+}
+
+/**
+ * Factory for creating [AudioRecordSource] instances.
+ */
+fun interface AudioRecordSourceFactory {
+    fun create(
+        audioSource: Int,
+        sampleRate: Int,
+        channelConfig: Int,
+        audioEncoding: Int,
+        bufferSizeInBytes: Int
+    ): AudioRecordSource?
+}
+
+/**
+ * Default production implementation wrapping Android framework AudioRecord.
+ */
+@Suppress("DEPRECATION")
+class AndroidAudioRecordSource(val record: AudioRecord) : AudioRecordSource {
+    override val state: Int get() = record.state
+    override val recordingState: Int get() = record.recordingState
+    override val routedDevice: AudioDeviceInfo? get() = record.routedDevice
+    override fun setPreferredDevice(device: AudioDeviceInfo?): Boolean = record.setPreferredDevice(device)
+    override fun addOnRoutingChangedListener(listener: AudioRecord.OnRoutingChangedListener, handler: Handler?) {
+        record.addOnRoutingChangedListener(listener, handler)
+    }
+    override fun removeOnRoutingChangedListener(listener: AudioRecord.OnRoutingChangedListener) {
+        record.removeOnRoutingChangedListener(listener)
+    }
+    override fun startRecording() = record.startRecording()
+    override fun read(audioData: ShortArray, offsetInShorts: Int, sizeInShorts: Int, readMode: Int): Int =
+        record.read(audioData, offsetInShorts, sizeInShorts, readMode)
+    override fun stop() = record.stop()
+    override fun release() = record.release()
+}
+
+/**
+ * Default production factory creating real AudioRecord instances.
+ */
+class DefaultAudioRecordSourceFactory : AudioRecordSourceFactory {
+    @SuppressLint("MissingPermission")
+    override fun create(
+        audioSource: Int,
+        sampleRate: Int,
+        channelConfig: Int,
+        audioEncoding: Int,
+        bufferSizeInBytes: Int
+    ): AudioRecordSource? {
+        val record = AudioRecord(audioSource, sampleRate, channelConfig, audioEncoding, bufferSizeInBytes)
+        return AndroidAudioRecordSource(record)
+    }
+}
+
+/**
+ * Represents a single lifecycle generation of audio capture.
+ * Encapsulates the hardware record source, listeners, and resources.
+ * Ensures that stale background threads cannot release or corrupt newer sessions.
+ */
+@Suppress("DEPRECATION")
+internal class CaptureSession(
+    val generation: Long,
+    val record: AudioRecordSource,
+    var routingListener: AudioRecord.OnRoutingChangedListener? = null,
+    val targetDevice: AudioDeviceInfo?,
+    val requestedRate: Int,
+    val actualRate: Int,
+    val windowSize: Int,
+    val hopSize: Int
+) {
+    private val isCleanedUp = AtomicBoolean(false)
+
+    fun isCleanedUp(): Boolean = isCleanedUp.get()
+
+    fun cleanup() {
+        if (!isCleanedUp.compareAndSet(false, true)) {
+            return
+        }
+        val listener = routingListener
+        routingListener = null
+        if (listener != null) {
+            try {
+                record.removeOnRoutingChangedListener(listener)
+            } catch (e: Exception) {
+                Log.w("AudioCaptureManager", "Error removing routing listener in session $generation", e)
+            }
+        }
+
+        try {
+            if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                record.stop()
+            }
+        } catch (e: Exception) {
+            Log.w("AudioCaptureManager", "Exception stopping record in session $generation", e)
+        }
+
+        try {
+            record.release()
+        } catch (e: Exception) {
+            Log.w("AudioCaptureManager", "Exception releasing record in session $generation", e)
+        }
+    }
+}
 
 /**
  * Manages low-latency raw audio acquisition from device hardware.
@@ -27,6 +150,8 @@ import kotlin.math.max
  * - Hardware native sample rate negotiation (input device rates prioritized)
  * - Safe source negotiation: UNPROCESSED (raw PCM, no AGC/AEC/NS) with fallback to MIC
  * - Defensive buffer size validation (preventing negative AudioRecord error returns)
+ * - Explicit capture generation / session ownership preventing stale worker interference
+ * - Accumulation of partial AudioRecord reads into complete, contiguous processing hops
  * - Dedicated capture thread running at Process.THREAD_PRIORITY_URGENT_AUDIO
  * - 50% overlap sliding window buffer
  * - Zero-allocation RMS/Peak math and clipping detection
@@ -36,6 +161,20 @@ class AudioCaptureManager(
     private val context: Context,
     private val config: AudioCaptureConfig = AudioCaptureConfig()
 ) {
+    internal var audioRecordFactory: AudioRecordSourceFactory = DefaultAudioRecordSourceFactory()
+    internal var minBufferSizeProvider: (sampleRate: Int, channelConfig: Int, audioFormat: Int) -> Int =
+        { sr, ch, fmt -> AudioRecord.getMinBufferSize(sr, ch, fmt) }
+
+    internal constructor(
+        context: Context,
+        config: AudioCaptureConfig,
+        audioRecordFactory: AudioRecordSourceFactory,
+        minBufferSizeProvider: (sampleRate: Int, channelConfig: Int, audioFormat: Int) -> Int =
+            { sr, ch, fmt -> AudioRecord.getMinBufferSize(sr, ch, fmt) }
+    ) : this(context, config) {
+        this.audioRecordFactory = audioRecordFactory
+        this.minBufferSizeProvider = minBufferSizeProvider
+    }
     companion object {
         private const val TAG = "AudioCaptureManager"
         private const val DEFAULT_SAMPLE_RATE = 48000
@@ -52,12 +191,12 @@ class AudioCaptureManager(
     val audioFrames: Flow<AudioFrame> = emptyFlow()
 
     private val isRunning = AtomicBoolean(false)
+    private val sessionGeneration = AtomicLong(0L)
+    @Volatile
+    private var activeSession: CaptureSession? = null
     private var captureThread: Thread? = null
-    private var audioRecord: AudioRecord? = null
 
     private var activeConfig: AudioCaptureConfig = config
-    private var requestedTargetDevice: AudioDeviceInfo? = null
-    private var routingListener: AudioRecord.OnRoutingChangedListener? = null
 
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
@@ -91,7 +230,7 @@ class AudioCaptureManager(
                     val name = removedActive.productName?.toString()?.takeIf { it.isNotBlank() } ?: "Active microphone"
                     val msg = "$name was disconnected during active capture."
                     Log.w(TAG, msg)
-                    notifyCaptureError(msg)
+                    activeSession?.let { notifyCaptureError(it, msg) }
                 }
             }
         }
@@ -99,7 +238,7 @@ class AudioCaptureManager(
 
     init {
         try {
-            audioManager.registerAudioDeviceCallback(deviceCallback, android.os.Handler(android.os.Looper.getMainLooper()))
+            audioManager.registerAudioDeviceCallback(deviceCallback, Handler(Looper.getMainLooper()))
         } catch (e: Exception) {
             Log.w(TAG, "Failed to register AudioDeviceCallback", e)
         }
@@ -176,7 +315,6 @@ class AudioCaptureManager(
             }
 
             for (device in inputDevices) {
-                // Look for built-in mic, headset, or USB input
                 val rates = device.sampleRates
                 if (rates.isNotEmpty()) {
                     if (rates.contains(DEFAULT_SAMPLE_RATE)) return DEFAULT_SAMPLE_RATE
@@ -186,7 +324,6 @@ class AudioCaptureManager(
                 }
             }
 
-            // Secondary check: undocumented or manufacturer specific input property probe
             val inputPropRate = audioManager.getProperty("android.media.property.INPUT_SAMPLE_RATE")
                 ?: audioManager.getProperty("PROPERTY_INPUT_SAMPLE_RATE")
             inputPropRate?.toIntOrNull()?.let { return it }
@@ -221,10 +358,15 @@ class AudioCaptureManager(
     @SuppressLint("MissingPermission")
     @Synchronized
     fun startCapture(): Boolean {
-        if (isRunning.get()) {
+        if (isRunning.get() && activeSession?.let { !it.isCleanedUp() } == true) {
             Log.d(TAG, "Capture already in progress")
             return true
         }
+
+        // Clean up any stale or lingering session before starting anew
+        activeSession?.cleanup()
+        activeSession = null
+        isRunning.set(false)
 
         _uiState.value = _uiState.value.copy(
             status = CaptureStatus.INITIALIZING,
@@ -234,9 +376,9 @@ class AudioCaptureManager(
         val rateResolution = resolveSampleRate()
         val requestedRate = rateResolution.resolvedRate
 
-        // 1. Validate AudioRecord.getMinBufferSize() defensively against negative error codes
+        // 1. Validate AudioRecord buffer size defensively against negative error codes
         var sampleRate = requestedRate
-        var minBufferSize = AudioRecord.getMinBufferSize(
+        var minBufferSize = minBufferSizeProvider(
             sampleRate,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT
@@ -247,7 +389,7 @@ class AudioCaptureManager(
             val altRate = if (sampleRate == DEFAULT_SAMPLE_RATE) FALLBACK_SAMPLE_RATE else DEFAULT_SAMPLE_RATE
             Log.w(TAG, "Invalid minBufferSize ($minBufferSize) for $sampleRate Hz. Attempting fallback: $altRate Hz")
             sampleRate = altRate
-            minBufferSize = AudioRecord.getMinBufferSize(
+            minBufferSize = minBufferSizeProvider(
                 sampleRate,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
@@ -289,9 +431,8 @@ class AudioCaptureManager(
 
         val record = sourceNegotiation.record
         val activeSourceName = sourceNegotiation.sourceName
-        audioRecord = record
 
-        // Look up target device and apply setPreferredDevice
+        // Look up target device
         val targetDevice = activeConfig.preferredDeviceId?.let { prefId ->
             try {
                 audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.id == prefId }
@@ -299,90 +440,129 @@ class AudioCaptureManager(
                 null
             }
         }
-        requestedTargetDevice = targetDevice
 
-        if (targetDevice != null) {
-            val setSuccess = record.setPreferredDevice(targetDevice)
-            Log.i(TAG, "setPreferredDevice(${targetDevice.productName}, id=${targetDevice.id}) returned $setSuccess")
-        }
-
-        // Attach routing listener
-        routingListener = AudioRecord.OnRoutingChangedListener { audRecord ->
-            updateActualRoutedDevice(audRecord.routedDevice, requestedTargetDevice)
-        }
-        try {
-            record.addOnRoutingChangedListener(
-                routingListener,
-                android.os.Handler(android.os.Looper.getMainLooper())
-            )
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to register OnRoutingChangedListener", e)
-        }
-
-        val inputDeviceName = targetDevice?.productName?.toString() ?: getPrimaryInputDeviceName()
-
-        _uiState.value = _uiState.value.copy(
-            status = CaptureStatus.RUNNING,
-            errorMessage = null,
-            diagnostics = AudioCaptureDiagnostics(
-                activeAudioSource = activeSourceName,
-                requestedSampleRate = requestedRate,
-                actualSampleRate = sampleRate,
-                detectedInputRate = rateResolution.detectedInputRate,
-                detectedOutputRate = rateResolution.detectedOutputRate,
-                inputDeviceName = inputDeviceName,
-                requestedDeviceName = targetDevice?.productName?.toString() ?: "Auto (System Default)",
-                actualRoutedDeviceName = inputDeviceName,
-                windowSize = windowSize,
-                hopSize = hopSize,
-                bufferSizeInBytes = hardwareBufferSize,
-                minBufferSizeInBytes = minBufferSize
-            )
+        val generation = sessionGeneration.incrementAndGet()
+        val session = CaptureSession(
+            generation = generation,
+            record = record,
+            targetDevice = targetDevice,
+            requestedRate = requestedRate,
+            actualRate = sampleRate,
+            windowSize = windowSize,
+            hopSize = hopSize
         )
 
-        isRunning.set(true)
+        try {
+            if (targetDevice != null) {
+                val setSuccess = record.setPreferredDevice(targetDevice)
+                Log.i(TAG, "setPreferredDevice(${targetDevice.productName}, id=${targetDevice.id}) returned $setSuccess")
+            }
 
-        // 4. Launch dedicated real-time audio thread
-        val thread = Thread({
-            runAudioCaptureLoop(
-                record = record,
-                sampleRate = sampleRate,
-                windowSize = windowSize,
-                hopSize = hopSize
+            // Attach routing listener bound to this generation session
+            val listener = AudioRecord.OnRoutingChangedListener { audRecord ->
+                if (isCurrentSession(session)) {
+                    updateActualRoutedDevice(audRecord.routedDevice, targetDevice)
+                }
+            }
+            session.routingListener = listener
+
+            try {
+                record.addOnRoutingChangedListener(
+                    listener,
+                    Handler(Looper.getMainLooper())
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to register OnRoutingChangedListener for session $generation", e)
+            }
+
+            val inputDeviceName = targetDevice?.productName?.toString() ?: getPrimaryInputDeviceName()
+
+            activeSession = session
+            isRunning.set(true)
+
+            _uiState.value = _uiState.value.copy(
+                status = CaptureStatus.RUNNING,
+                errorMessage = null,
+                diagnostics = AudioCaptureDiagnostics(
+                    activeAudioSource = activeSourceName,
+                    requestedSampleRate = requestedRate,
+                    actualSampleRate = sampleRate,
+                    detectedInputRate = rateResolution.detectedInputRate,
+                    detectedOutputRate = rateResolution.detectedOutputRate,
+                    inputDeviceName = inputDeviceName,
+                    requestedDeviceName = targetDevice?.productName?.toString() ?: "Auto (System Default)",
+                    actualRoutedDeviceName = inputDeviceName,
+                    windowSize = windowSize,
+                    hopSize = hopSize,
+                    bufferSizeInBytes = hardwareBufferSize,
+                    minBufferSizeInBytes = minBufferSize
+                )
             )
-        }, "AudioCaptureThread")
 
-        captureThread = thread
-        thread.start()
-        return true
+            // 4. Launch dedicated real-time audio thread
+            val thread = Thread({
+                runAudioCaptureLoop(session)
+            }, "AudioCaptureThread-$generation")
+
+            captureThread = thread
+            thread.start()
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception starting capture session $generation", e)
+            session.cleanup()
+            if (activeSession === session) {
+                activeSession = null
+                isRunning.set(false)
+            }
+            _uiState.value = _uiState.value.copy(
+                status = CaptureStatus.ERROR,
+                errorMessage = "Failed to launch capture thread: ${e.message}"
+            )
+            return false
+        }
+    }
+
+    private fun isCurrentSession(session: CaptureSession): Boolean {
+        return activeSession === session && !session.isCleanedUp()
     }
 
     /**
      * Dedicated capture loop executed on high-priority audio thread.
+     * Guaranteed to interact only with its owned [session] resources.
      */
-    private fun runAudioCaptureLoop(
-        record: AudioRecord,
-        sampleRate: Int,
-        windowSize: Int,
-        hopSize: Int
-    ) {
-        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+    private fun runAudioCaptureLoop(session: CaptureSession) {
+        try {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to set audio thread priority for session ${session.generation}", e)
+        }
 
+        val record = session.record
         try {
             record.startRecording()
             if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                notifyCaptureError("AudioRecord failed to enter RECORDING state (${record.recordingState})")
+                notifyCaptureError(
+                    session,
+                    "AudioRecord failed to enter RECORDING state (${record.recordingState})"
+                )
                 return
             }
-            updateActualRoutedDevice(record.routedDevice, requestedTargetDevice)
+            if (isCurrentSession(session)) {
+                updateActualRoutedDevice(record.routedDevice, session.targetDevice)
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Exception starting AudioRecord", e)
-            notifyCaptureError("Failed to start audio recording: ${e.message}")
+            Log.e(TAG, "Exception starting AudioRecord for session ${session.generation}", e)
+            notifyCaptureError(session, "Failed to start audio recording: ${e.message}")
             return
         }
 
+        val windowSize = session.windowSize
+        val hopSize = session.hopSize
+        val sampleRate = session.actualRate
+
         // Pre-allocated buffers: zero allocations inside the loop
-        val readBuffer = ShortArray(hopSize)
+        val hopBuffer = ShortArray(hopSize)
+        var hopSamplesAccumulated = 0
         val slidingWindow = ShortArray(windowSize)
         val fftProcessor = FftProcessor(windowSize = windowSize, sampleRate = sampleRate)
         val biquadFilterBank = BiquadFilterBank(sampleRate = sampleRate)
@@ -392,94 +572,123 @@ class AudioCaptureManager(
         var framesInSecond = 0
         var currentFps = 0f
 
-        Log.i(TAG, "Audio capture loop running. Window: $windowSize, Hop: $hopSize, Rate: $sampleRate Hz")
+        Log.i(TAG, "Audio capture loop running for session ${session.generation}. Window: $windowSize, Hop: $hopSize, Rate: $sampleRate Hz")
 
-        while (isRunning.get()) {
-            val readResult = record.read(readBuffer, 0, hopSize, AudioRecord.READ_BLOCKING)
+        try {
+            while (isRunning.get() && isCurrentSession(session)) {
+                val toRead = hopSize - hopSamplesAccumulated
+                val readResult = record.read(hopBuffer, hopSamplesAccumulated, toRead, AudioRecord.READ_BLOCKING)
 
-            if (readResult > 0) {
-                consecutiveZeroReads = 0
+                if (readResult > 0) {
+                    consecutiveZeroReads = 0
+                    hopSamplesAccumulated += readResult
 
-                // 1. Process continuous incoming hop through 64-bit continuous IIR biquad filter bank (persists state across hops)
-                val octave31FilterDb = biquadFilterBank.processHop(readBuffer, readResult)
+                    // Only advance sliding window and process DSP when a complete contiguous hop has accumulated
+                    if (hopSamplesAccumulated >= hopSize) {
+                        // 1. Process continuous incoming hop through 64-bit continuous IIR biquad filter bank
+                        val octave31FilterDb = biquadFilterBank.processHop(hopBuffer, hopSize)
 
-                // 2. 50% overlap sliding window update
-                val shiftCount = windowSize - hopSize
-                if (shiftCount > 0) {
-                    System.arraycopy(slidingWindow, hopSize, slidingWindow, 0, shiftCount)
-                }
-                System.arraycopy(readBuffer, 0, slidingWindow, shiftCount, hopSize)
+                        // 2. 50% overlap sliding window update
+                        val shiftCount = windowSize - hopSize
+                        if (shiftCount > 0) {
+                            System.arraycopy(slidingWindow, hopSize, slidingWindow, 0, shiftCount)
+                        }
+                        System.arraycopy(hopBuffer, 0, slidingWindow, shiftCount, hopSize)
 
-                // Compute instantaneous acoustic metrics with zero object allocations
-                val (rmsDb, peakDb) = AudioMath.computeRmsAndPeakDb(slidingWindow, windowSize)
-                val isClipping = AudioMath.isClipping(readBuffer, readResult)
+                        // Compute instantaneous acoustic metrics with zero object allocations
+                        val (rmsDb, peakDb) = AudioMath.computeRmsAndPeakDb(slidingWindow, windowSize)
+                        val isClipping = AudioMath.isClipping(hopBuffer, hopSize)
 
-                // Real-time FFT spectral analysis (Hann window, Radix-2 FFT powering raw FFT line mode)
-                // Skips redundant 31-band binning since 64-bit continuous IIR BiquadFilterBank is authoritative for 1/3-octave view
-                val fftResult = fftProcessor.processFrame(slidingWindow, computeOctaveBands = false)
+                        // Real-time FFT spectral analysis (Hann window, Radix-2 FFT)
+                        val fftResult = fftProcessor.processFrame(slidingWindow, computeOctaveBands = false)
 
-                val nowNs = System.nanoTime()
-                totalFrames++
-                framesInSecond++
+                        val nowNs = System.nanoTime()
+                        totalFrames++
+                        framesInSecond++
 
-                if (nowNs - lastFpsTimeNs >= 1_000_000_000L) {
-                    currentFps = framesInSecond.toFloat()
-                    framesInSecond = 0
-                    lastFpsTimeNs = nowNs
-                }
+                        if (nowNs - lastFpsTimeNs >= 1_000_000_000L) {
+                            currentFps = framesInSecond.toFloat()
+                            framesInSecond = 0
+                            lastFpsTimeNs = nowNs
+                        }
 
-                // Update UI state diagnostics periodically (avoid overwhelming Main thread)
-                _uiState.value = _uiState.value.let { current ->
-                    current.copy(
-                        rmsDb = rmsDb,
-                        peakDb = peakDb,
-                        isClipping = isClipping,
-                        octave31Db = octave31FilterDb,
-                        rawFftDb = fftResult.rawFftDb,
-                        diagnostics = current.diagnostics.copy(
-                            totalFramesCaptured = totalFrames,
-                            fps = currentFps,
-                            consecutiveZeroReads = 0,
-                            fftExecutionTimeUs = fftResult.executionTimeUs,
-                            filterBankExecutionTimeUs = biquadFilterBank.lastExecutionTimeUs
-                        )
-                    )
-                }
-            } else if (readResult == 0) {
-                consecutiveZeroReads++
-                _uiState.value = _uiState.value.let { current ->
-                    current.copy(
-                        diagnostics = current.diagnostics.copy(
-                            consecutiveZeroReads = consecutiveZeroReads
-                        )
-                    )
-                }
-                if (consecutiveZeroReads >= MAX_CONSECUTIVE_ZERO_READS) {
-                    val msg = "Capture stalled — Audio hardware returned 0 samples repeatedly ($consecutiveZeroReads reads)"
+                        // Update UI state diagnostics if this worker still owns the active session
+                        if (isCurrentSession(session)) {
+                            _uiState.value = _uiState.value.let { current ->
+                                current.copy(
+                                    rmsDb = rmsDb,
+                                    peakDb = peakDb,
+                                    isClipping = isClipping,
+                                    octave31Db = octave31FilterDb,
+                                    rawFftDb = fftResult.rawFftDb,
+                                    diagnostics = current.diagnostics.copy(
+                                        totalFramesCaptured = totalFrames,
+                                        fps = currentFps,
+                                        consecutiveZeroReads = 0,
+                                        fftExecutionTimeUs = fftResult.executionTimeUs,
+                                        filterBankExecutionTimeUs = biquadFilterBank.lastExecutionTimeUs
+                                    )
+                                )
+                            }
+                        }
+
+                        hopSamplesAccumulated = 0
+                    }
+                } else if (readResult == 0) {
+                    consecutiveZeroReads++
+                    if (isCurrentSession(session)) {
+                        _uiState.value = _uiState.value.let { current ->
+                            current.copy(
+                                diagnostics = current.diagnostics.copy(
+                                    consecutiveZeroReads = consecutiveZeroReads
+                                )
+                            )
+                        }
+                    }
+                    if (consecutiveZeroReads >= MAX_CONSECUTIVE_ZERO_READS) {
+                        val msg = "Capture stalled — Audio hardware returned 0 samples repeatedly ($consecutiveZeroReads reads)"
+                        Log.e(TAG, msg)
+                        notifyCaptureError(session, msg)
+                        break
+                    }
+                } else {
+                    // readResult < 0: explicit hardware or HAL failure code
+                    val errorReason = AudioMath.mapAudioRecordError(readResult)
+                    val msg = "Capture interrupted — $errorReason"
                     Log.e(TAG, msg)
-                    notifyCaptureError(msg)
+                    notifyCaptureError(session, msg)
                     break
                 }
-            } else {
-                // readResult < 0: explicit hardware or HAL failure code
-                val errorReason = AudioMath.mapAudioRecordError(readResult)
-                val msg = "Capture interrupted — $errorReason"
-                Log.e(TAG, msg)
-                notifyCaptureError(msg)
-                break
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Unhandled exception in capture loop for session ${session.generation}", e)
+            notifyCaptureError(session, "Capture loop error: ${e.message}")
+        } finally {
+            session.cleanup()
+            synchronized(this) {
+                if (activeSession === session) {
+                    activeSession = null
+                    isRunning.set(false)
+                }
+            }
+            Log.i(TAG, "Audio capture thread for session ${session.generation} exited cleanly")
         }
-
-        cleanupAudioRecord()
-        Log.i(TAG, "Audio capture thread exited cleanly")
     }
 
-    private fun notifyCaptureError(message: String) {
-        isRunning.set(false)
-        _uiState.value = _uiState.value.copy(
-            status = CaptureStatus.ERROR,
-            errorMessage = message
-        )
+    private fun notifyCaptureError(session: CaptureSession, message: String) {
+        synchronized(this) {
+            if (activeSession === session) {
+                isRunning.set(false)
+                activeSession = null
+                _uiState.value = _uiState.value.copy(
+                    status = CaptureStatus.ERROR,
+                    errorMessage = message
+                )
+            } else {
+                Log.w(TAG, "Suppressed stale capture error from session ${session.generation}: $message")
+            }
+        }
+        session.cleanup()
     }
 
     /**
@@ -487,9 +696,11 @@ class AudioCaptureManager(
      */
     @Synchronized
     fun stopCapture() {
-        if (!isRunning.getAndSet(false)) {
-            return
-        }
+        val session = activeSession
+        activeSession = null
+        isRunning.set(false)
+
+        session?.cleanup()
 
         try {
             captureThread?.interrupt()
@@ -497,8 +708,6 @@ class AudioCaptureManager(
         } catch (e: Exception) {
             Log.w(TAG, "Exception interrupting capture thread", e)
         }
-
-        cleanupAudioRecord()
 
         _uiState.value = _uiState.value.copy(
             status = CaptureStatus.STOPPED,
@@ -509,30 +718,6 @@ class AudioCaptureManager(
 
     fun setDisplayMode(mode: FftDisplayMode) {
         _uiState.value = _uiState.value.copy(displayMode = mode)
-    }
-
-    private fun cleanupAudioRecord() {
-        try {
-            audioRecord?.let { record ->
-                routingListener?.let {
-                    try {
-                        record.removeOnRoutingChangedListener(it)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Error removing routing listener", e)
-                    }
-                }
-                routingListener = null
-                if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                    record.stop()
-                }
-                record.release()
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Exception releasing AudioRecord", e)
-        } finally {
-            audioRecord = null
-            routingListener = null
-        }
     }
 
     private fun updateActualRoutedDevice(routedDevice: AudioDeviceInfo?, targetDevice: AudioDeviceInfo?) {
@@ -633,14 +818,14 @@ class AudioCaptureManager(
 
         // 1. Try preferred source (UNPROCESSED)
         try {
-            val record = AudioRecord(
+            val record = audioRecordFactory.create(
                 preferredSource,
                 sampleRate,
                 channelConfig,
                 audioEncoding,
                 bufferSizeInBytes
             )
-            if (record.state == AudioRecord.STATE_INITIALIZED) {
+            if (record != null && record.state == AudioRecord.STATE_INITIALIZED) {
                 val name = if (preferredSource == MediaRecorder.AudioSource.UNPROCESSED) {
                     "UNPROCESSED (Raw Direct HAL)"
                 } else {
@@ -650,7 +835,7 @@ class AudioCaptureManager(
                 return RecordNegotiationResult(record, name)
             } else {
                 Log.w(TAG, "AudioRecord state not initialized with preferred source $preferredSource")
-                record.release()
+                record?.release()
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed creating AudioRecord with source $preferredSource: ${e.message}")
@@ -660,19 +845,19 @@ class AudioCaptureManager(
         if (preferredSource != MediaRecorder.AudioSource.MIC) {
             try {
                 Log.i(TAG, "Attempting fallback to MediaRecorder.AudioSource.MIC")
-                val fallbackRecord = AudioRecord(
+                val fallbackRecord = audioRecordFactory.create(
                     MediaRecorder.AudioSource.MIC,
                     sampleRate,
                     channelConfig,
                     audioEncoding,
                     bufferSizeInBytes
                 )
-                if (fallbackRecord.state == AudioRecord.STATE_INITIALIZED) {
+                if (fallbackRecord != null && fallbackRecord.state == AudioRecord.STATE_INITIALIZED) {
                     Log.i(TAG, "Successfully initialized fallback AudioRecord with source: MIC")
                     return RecordNegotiationResult(fallbackRecord, "MIC (Fallback Source)")
                 } else {
                     Log.e(TAG, "Fallback AudioRecord with MIC failed to initialize")
-                    fallbackRecord.release()
+                    fallbackRecord?.release()
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Exception initializing fallback MIC AudioRecord", e)
@@ -683,7 +868,7 @@ class AudioCaptureManager(
     }
 
     private data class RecordNegotiationResult(
-        val record: AudioRecord,
+        val record: AudioRecordSource,
         val sourceName: String
     )
 
