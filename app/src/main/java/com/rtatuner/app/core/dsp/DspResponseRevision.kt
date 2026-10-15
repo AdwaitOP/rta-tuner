@@ -47,35 +47,29 @@ data class DspResponseRevision(
 
         fun fromJson(json: JSONObject?): DspResponseRevision? {
             if (json == null) return null
-            if (!json.has("revisionId") || json.isNull("revisionId")) return null
-            if (!json.has("filterType") || json.isNull("filterType")) return null
-            if (!json.has("coefficientRevision") || json.isNull("coefficientRevision")) return null
-            if (!json.has("centerFrequencyPreset") || json.isNull("centerFrequencyPreset")) return null
-            if (!json.has("qBandwidthDefinition") || json.isNull("qBandwidthDefinition")) return null
-            if (!json.has("cascadeAndNormalization") || json.isNull("cascadeAndNormalization")) return null
-            if (!json.has("edgeAnchoringDesign") || json.isNull("edgeAnchoringDesign")) return null
-
-            val revId = json.optString("revisionId")
-            val fType = json.optString("filterType")
-            val cRev = json.optInt("coefficientRevision", -1)
-            val preset = json.optString("centerFrequencyPreset")
-            val qDef = json.optString("qBandwidthDefinition")
-            val cNorm = json.optString("cascadeAndNormalization")
-            val edge = json.optString("edgeAnchoringDesign")
-
-            if (revId.isBlank() || fType.isBlank() || cRev <= 0 ||
-                preset.isBlank() || qDef.isBlank() || cNorm.isBlank() || edge.isBlank()) {
-                return null
+            val strFields = listOf("revisionId", "filterType", "centerFrequencyPreset", "qBandwidthDefinition", "cascadeAndNormalization", "edgeAnchoringDesign")
+            for (f in strFields) {
+                if (!json.has(f) || json.isNull(f)) return null
+                val raw = json.opt(f)
+                if (raw !is String || raw.isBlank()) return null
             }
 
+            if (!json.has("coefficientRevision") || json.isNull("coefficientRevision")) return null
+            val rawRev = json.opt("coefficientRevision")
+            if (rawRev !is Number) return null
+            if (rawRev is Double && rawRev.toInt().toDouble() != rawRev) return null
+            if (rawRev is Float && rawRev.toInt().toFloat() != rawRev) return null
+            val cRev = rawRev.toInt()
+            if (cRev <= 0) return null
+
             return DspResponseRevision(
-                revisionId = revId,
-                filterType = fType,
+                revisionId = json.getString("revisionId"),
+                filterType = json.getString("filterType"),
                 coefficientRevision = cRev,
-                centerFrequencyPreset = preset,
-                qBandwidthDefinition = qDef,
-                cascadeAndNormalization = cNorm,
-                edgeAnchoringDesign = edge
+                centerFrequencyPreset = json.getString("centerFrequencyPreset"),
+                qBandwidthDefinition = json.getString("qBandwidthDefinition"),
+                cascadeAndNormalization = json.getString("cascadeAndNormalization"),
+                edgeAnchoringDesign = json.getString("edgeAnchoringDesign")
             )
         }
     }

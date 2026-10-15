@@ -10,6 +10,7 @@ import com.rtatuner.app.core.audio.AudioCaptureManager
 import com.rtatuner.app.core.audio.AudioMath
 import com.rtatuner.app.core.audio.AudioRecordSource
 import com.rtatuner.app.core.audio.CaptureFingerprint
+import com.rtatuner.app.core.audio.CaptureAuthoritySnapshot
 import com.rtatuner.app.core.audio.CapturedFrameContext
 import com.rtatuner.app.core.audio.CaptureStatus
 import com.rtatuner.app.core.calibration.CalibrationFileConvention
@@ -183,13 +184,14 @@ class IndependentAuditIntegrationNumericsTest {
             val entitlements = FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)
             val calibration = CalibrationManager(saveFloor(rate, floor), FeatureAccessPolicy(entitlements))
             try {
+                calibration.updateCaptureAuthority(CaptureAuthoritySnapshot("numerics-owner", 1L, 1L, fingerprint(rate), true, 0L))
                 assertTrue(calibration.loadMicCurve("Measured plus 3", "20 3\n20000 3", CalibrationFileConvention.MEASURED_RESPONSE).isSuccess)
                 calibration.setSplOffset(104f)
                 calibration.setSplMode(true)
                 calibration.setTargetCurve(TargetCurve.FLAT)
                 calibration.setTargetCurveActive(true)
                 val fft = FloatArray(1025) { -70f + it % 40 }
-                val context = CapturedFrameContext("numerics-owner", 1L, 1L, fingerprint(rate))
+                val context = CapturedFrameContext("numerics-owner", 1L, 1L, fingerprint(rate), true, 1L)
                 val result = calibration.processFrame(raw, fft, rate / 2048f, context)
                 assertEquals(31, result.calibrated31Db.size)
                 for (i in 0 until 31) {
@@ -217,12 +219,13 @@ class IndependentAuditIntegrationNumericsTest {
             val calibration = CalibrationManager(saveFloor(rate, floor),
                 FeatureAccessPolicy(FakeEntitlementRepository(EntitlementTier.PRO_LIFETIME)))
             try {
+                calibration.updateCaptureAuthority(CaptureAuthoritySnapshot("numeric-owner", 1L, 1L, fingerprint(rate), true, 0L))
                 val raw = FloatArray(31) { -40f }
                 raw[0] = -55f; raw[1] = -50f; raw[2] = -49.999996f
                 raw[3] = Float.NaN; raw[4] = Float.NEGATIVE_INFINITY
                 val fft = floatArrayOf(Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY, -42f)
                 val result = calibration.processFrame(raw, fft, 20f,
-                    CapturedFrameContext("numeric-owner", 1L, 1L, fingerprint(rate)))
+                    CapturedFrameContext("numeric-owner", 1L, 1L, fingerprint(rate), true, 1L))
                 for (i in intArrayOf(0, 1, 2, 3, 4)) {
                     assertEquals("Residual band=$i", -100f, result.calibrated31Db[i], 0f)
                     assertTrue(result.unreliableBands[i])

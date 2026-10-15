@@ -29,19 +29,19 @@ data class CaptureEffectsInfo(
     companion object {
         fun fromJson(json: JSONObject?): CaptureEffectsInfo? {
             if (json == null) return null
-            if (!json.has("aec") || !json.has("agc") || !json.has("ns") || !json.has("known")) {
-                return null
+            val requiredKeys = listOf("aec", "agc", "ns", "known", "aecEnabled", "agcEnabled", "nsEnabled")
+            for (key in requiredKeys) {
+                if (!json.has(key) || json.isNull(key)) return null
+                val raw = json.opt(key)
+                if (raw !is Boolean) return null
             }
-            if (json.isNull("aec") || json.isNull("agc") || json.isNull("ns") || json.isNull("known")) {
-                return null
-            }
-            val aec = try { json.getBoolean("aec") } catch (_: Exception) { return null }
-            val agc = try { json.getBoolean("agc") } catch (_: Exception) { return null }
-            val ns = try { json.getBoolean("ns") } catch (_: Exception) { return null }
-            val known = try { json.getBoolean("known") } catch (_: Exception) { return null }
-            val aecEn = json.optBoolean("aecEnabled", false)
-            val agcEn = json.optBoolean("agcEnabled", false)
-            val nsEn = json.optBoolean("nsEnabled", false)
+            val aec = json.getBoolean("aec")
+            val agc = json.getBoolean("agc")
+            val ns = json.getBoolean("ns")
+            val known = json.getBoolean("known")
+            val aecEn = json.getBoolean("aecEnabled")
+            val agcEn = json.getBoolean("agcEnabled")
+            val nsEn = json.getBoolean("nsEnabled")
 
             return CaptureEffectsInfo(
                 aecAvailable = aec,
@@ -125,35 +125,50 @@ data class CaptureFingerprint(
                 val dspJson = json.optJSONObject("dspRevision") ?: return null
                 val dspRev = DspResponseRevision.fromJson(dspJson) ?: return null
 
-                // Required: sampleRate integer
+                // Required: sampleRate integer (strict whole Number, no numeric string, no fraction)
                 if (!json.has("sampleRate") || json.isNull("sampleRate")) return null
-                val sampleRate = json.getInt("sampleRate")
+                val rawRate = json.opt("sampleRate")
+                if (rawRate !is Number) return null
+                if (rawRate is Double && rawRate.toInt().toDouble() != rawRate) return null
+                if (rawRate is Float && rawRate.toInt().toFloat() != rawRate) return null
+                val sampleRate = rawRate.toInt()
                 if (sampleRate != 44100 && sampleRate != 48000) return null
 
-                // Required: micId string
+                // Required: micId string (strict String, not Number, not Blank, not UNKNOWN/PENDING)
                 if (!json.has("micId") || json.isNull("micId")) return null
-                val micId = json.getString("micId")
-                if (micId.isBlank() || micId == UNKNOWN_MICROPHONE_ID || micId == PENDING_MICROPHONE_ID) return null
+                val rawMicId = json.opt("micId")
+                if (rawMicId !is String) return null
+                if (rawMicId.isBlank() || rawMicId == UNKNOWN_MICROPHONE_ID || rawMicId == PENDING_MICROPHONE_ID) return null
 
-                // Required: devType string
+                // Required: devType string (strict String, not Boolean, not Blank, in KNOWN_DEVICE_TYPES)
                 if (!json.has("devType") || json.isNull("devType")) return null
-                val devType = json.getString("devType")
-                if (devType.isBlank() || devType == UNKNOWN_DEVICE_TYPE || devType == PENDING_DEVICE_TYPE || devType !in KNOWN_DEVICE_TYPES) return null
+                val rawDevType = json.opt("devType")
+                if (rawDevType !is String) return null
+                if (rawDevType.isBlank() || rawDevType == UNKNOWN_DEVICE_TYPE || rawDevType == PENDING_DEVICE_TYPE || rawDevType !in KNOWN_DEVICE_TYPES) return null
 
-                // Required: selectedSource & actualSource
+                // Required: selectedSource & actualSource (strict whole Number, 0..10)
                 if (!json.has("selectedSource") || json.isNull("selectedSource")) return null
-                val selectedSource = json.getInt("selectedSource")
+                val rawSelectedSource = json.opt("selectedSource")
+                if (rawSelectedSource !is Number) return null
+                if (rawSelectedSource is Double && rawSelectedSource.toInt().toDouble() != rawSelectedSource) return null
+                if (rawSelectedSource is Float && rawSelectedSource.toInt().toFloat() != rawSelectedSource) return null
+                val selectedSource = rawSelectedSource.toInt()
                 if (selectedSource < 0 || selectedSource > 10) return null
 
                 if (!json.has("actualSource") || json.isNull("actualSource")) return null
-                val actualSource = json.getInt("actualSource")
+                val rawActualSource = json.opt("actualSource")
+                if (rawActualSource !is Number) return null
+                if (rawActualSource is Double && rawActualSource.toInt().toDouble() != rawActualSource) return null
+                if (rawActualSource is Float && rawActualSource.toInt().toFloat() != rawActualSource) return null
+                val actualSource = rawActualSource.toInt()
                 if (actualSource < 0 || actualSource > 10) return null
 
-                // Required: fallback boolean, must match (selectedSource != actualSource)
+                // Required: fallback boolean (strict Boolean, must match selectedSource != actualSource)
                 if (!json.has("fallback") || json.isNull("fallback")) return null
-                val fallback = json.getBoolean("fallback")
+                val rawFallback = json.opt("fallback")
+                if (rawFallback !is Boolean) return null
                 val expectedFallback = (selectedSource != actualSource)
-                if (fallback != expectedFallback) return null
+                if (rawFallback != expectedFallback) return null
 
                 // Required: effects object
                 if (!json.has("effects") || json.isNull("effects")) return null
@@ -163,11 +178,11 @@ data class CaptureFingerprint(
                 CaptureFingerprint(
                     dspRevision = dspRev,
                     actualSampleRate = sampleRate,
-                    routedMicrophoneId = micId,
-                    routedDeviceType = devType,
+                    routedMicrophoneId = rawMicId,
+                    routedDeviceType = rawDevType,
                     selectedAudioSource = selectedSource,
                     actualAudioSource = actualSource,
-                    isSourceFallback = fallback,
+                    isSourceFallback = rawFallback,
                     effects = effects
                 )
             } catch (_: Exception) {

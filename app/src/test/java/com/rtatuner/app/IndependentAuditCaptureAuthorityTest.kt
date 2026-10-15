@@ -402,7 +402,7 @@ class IndependentAuditCaptureAuthorityTest {
             record.routingListeners.single().onRoutingChanged(null)
             dispatcher.scheduler.runCurrent()
             resumePublication.countDown()
-            Thread.sleep(50)
+            await { record.enteredReads.get() >= 2 }
             dispatcher.scheduler.runCurrent()
             // Hop must have been discarded because route epoch changed before publication:
             assertEquals("Hop acquired under A must be discarded when route changes before publish",
@@ -447,6 +447,7 @@ class IndependentAuditCaptureAuthorityTest {
         val routingListeners = CopyOnWriteArrayList<AudioRecord.OnRoutingChangedListener>()
         val steps = LinkedBlockingQueue<Int>()
         val starts = AtomicInteger()
+        val enteredReads = AtomicInteger()
         @Volatile var lastReadRouteId: Int? = null
         private var sampleIndex = 0
         override fun setPreferredDevice(device: AudioDeviceInfo?) = true
@@ -454,6 +455,7 @@ class IndependentAuditCaptureAuthorityTest {
         override fun removeOnRoutingChangedListener(listener: AudioRecord.OnRoutingChangedListener) { routingListeners.remove(listener) }
         override fun startRecording() { starts.incrementAndGet(); recordingState = AudioRecord.RECORDSTATE_RECORDING }
         override fun read(audioData: ShortArray, offsetInShorts: Int, sizeInShorts: Int, readMode: Int): Int {
+            enteredReads.incrementAndGet()
             val next = try { steps.take() } catch (_: InterruptedException) { return AudioRecord.ERROR_INVALID_OPERATION }
             if (next < 0) return next
             lastReadRouteId = actualRoute?.id

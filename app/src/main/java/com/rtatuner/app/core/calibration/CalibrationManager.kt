@@ -414,41 +414,20 @@ class CalibrationManager internal constructor(
         // One current live compatibility decision:
         val liveAuthority = currentAuthority
         val isSubtractingNoise: Boolean
-        if (liveAuthority != null) {
+        val isProAllowed = featurePolicy.check(ProFeature.NOISE_FLOOR) is FeatureAccessResult.Allowed
+        if (liveAuthority != null && liveAuthority.isValidRunningAuthority && isProAllowed) {
             val matchesAuthority = frameContext != null &&
                 frameContext.isRunning &&
                 frameContext.managerId == liveAuthority.managerId &&
                 frameContext.captureGeneration == liveAuthority.captureGeneration &&
-                frameContext.routeEpoch == liveAuthority.routeEpoch
+                frameContext.routeEpoch == liveAuthority.routeEpoch &&
+                frameContext.fingerprint == liveAuthority.fingerprint
 
             isSubtractingNoise = !isCapturingNoise && state.isNoiseSubtractionEffective && matchesAuthority
         } else {
-            val fallbackFp = if (frameContext != null && frameContext.isRunning && frameContext.fingerprint.isMicrophoneKnown) {
-                frameContext.fingerprint
-            } else {
-                null
-            }
-            val fallbackCompatibility = if (!noiseSnapshot.isCaptured) {
-                NoiseFloorCompatibility.Uncaptured
-            } else if (fallbackFp == null) {
-                NoiseFloorCompatibility.Incompatible("Live audio capture context is stopped or inactive.", requiresRecapture = false)
-            } else {
-                evaluateNoiseFloorCompatibility(noiseSnapshot, fallbackFp)
-            }
-            val isCompatible = fallbackCompatibility is NoiseFloorCompatibility.Compatible
-            isSubtractingNoise = !isCapturingNoise &&
-                state.isNoiseSubtractionActive &&
-                noiseSnapshot.isCaptured &&
-                !noiseSnapshot.requiresRecapture &&
-                isCompatible
-
-            if (_uiState.value.noiseFloorCompatibility != fallbackCompatibility ||
-                _uiState.value.isNoiseSubtractionEffective != isSubtractingNoise) {
-                _uiState.value = _uiState.value.copy(
-                    noiseFloorCompatibility = fallbackCompatibility,
-                    isNoiseSubtractionEffective = isSubtractingNoise
-                )
-            }
+            @Suppress("UNUSED_VARIABLE")
+            val currentUi = _uiState.value
+            isSubtractingNoise = false
         }
 
         val rawSplOffset = if (state.splCalibration.isSplMode) state.splCalibration.splOffsetDb else 0.0f

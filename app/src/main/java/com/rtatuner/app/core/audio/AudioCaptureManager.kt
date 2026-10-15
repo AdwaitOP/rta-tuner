@@ -941,26 +941,69 @@ class AudioCaptureManager(
             var hopRouteEpoch = 0L
 
             while (isRunning.get() && isCurrentSession(session)) {
+                val epochBeforeRead = session.routeEpoch
+                val generationBeforeRead = session.generation
+
                 val toRead = hopSize - hopSamplesAccumulated
                 val readResult = record.read(hopBuffer, hopSamplesAccumulated, toRead, AudioRecord.READ_BLOCKING)
 
+                val epochAfterRead = session.routeEpoch
+                val generationAfterRead = session.generation
+
+                // Check ownership and route epoch stability across the blocking read
+                val isBetweenHopRouteChange = totalFrames > 0 && hopSamplesAccumulated == 0
+                val readValid = readResult > 0 &&
+                    generationAfterRead == generationBeforeRead &&
+                    epochBeforeRead > 0L &&
+                    isRunning.get() &&
+                    isCurrentSession(session) &&
+                    (epochAfterRead == epochBeforeRead || isBetweenHopRouteChange)
+
+                if (readResult > 0 && !readValid) {
+                    // Route changed, session changed, or stopped during blocking read:
+                    // Discard returned transfer, discard any accumulated partial hop, and reset DSP history
+                    hopSamplesAccumulated = 0
+                    hopRouteEpoch = 0L
+                    slidingWindow.fill(0)
+                    biquadFilterBank.reset()
+                    if (!isRunning.get() || !isCurrentSession(session)) {
+                        break
+                    }
+                    continue
+                }
+
                 if (readResult > 0) {
                     consecutiveZeroReads = 0
-                    val currentEpoch = session.routeEpoch
+                    val effectiveReadEpoch = epochAfterRead
                     if (hopSamplesAccumulated == 0) {
-                        hopRouteEpoch = currentEpoch
-                    } else if (currentEpoch != hopRouteEpoch) {
-                        // Route changed during partial-hop assembly: discard to preserve genuine hop provenance
+                        // Starting a new hop
+                        if (hopRouteEpoch != 0L && hopRouteEpoch != effectiveReadEpoch) {
+                            // Route changed since last hop (e.g. accepted A then switched to B)
+                            // Clear overlap and IIR state so old route history does not contaminate new route
+                            slidingWindow.fill(0)
+                            biquadFilterBank.reset()
+                        }
+                        hopRouteEpoch = effectiveReadEpoch
+                    } else if (effectiveReadEpoch != hopRouteEpoch) {
+                        // Route changed during partial-hop assembly: discard both contributions to preserve genuine hop provenance
                         hopSamplesAccumulated = 0
-                        hopRouteEpoch = currentEpoch
+                        hopRouteEpoch = 0L
+                        slidingWindow.fill(0)
+                        biquadFilterBank.reset()
                         continue
                     }
                     hopSamplesAccumulated += readResult
 
                     // Only advance sliding window and process DSP when a complete contiguous hop has accumulated
                     if (hopSamplesAccumulated >= hopSize) {
-                        if (session.routeEpoch != hopRouteEpoch) {
+                        if (session.routeEpoch != hopRouteEpoch || session.generation != generationBeforeRead || !isRunning.get() || !isCurrentSession(session)) {
                             hopSamplesAccumulated = 0
+                            hopRouteEpoch = 0L
+                            slidingWindow.fill(0)
+                            biquadFilterBank.reset()
+                            if (!isRunning.get() || !isCurrentSession(session)) {
+                                break
+                            }
                             continue
                         }
                         // 1. Process continuous incoming hop through 64-bit continuous IIR biquad filter bank
@@ -1007,6 +1050,12 @@ class AudioCaptureManager(
                                 framesInSecond = 0
                                 lastFpsTimeNs = nowNs
                             }
+                        } else {
+                            // Publication was rejected (e.g. route changed right before publish)
+                            // Reset DSP state so rejected hop data cannot contaminate subsequent frames
+                            slidingWindow.fill(0)
+                            biquadFilterBank.reset()
+                            hopRouteEpoch = 0L
                         }
 
                         if (!published && (!isRunning.get() || !isCurrentSession(session))) {
