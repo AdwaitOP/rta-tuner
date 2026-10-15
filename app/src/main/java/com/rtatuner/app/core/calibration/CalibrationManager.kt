@@ -10,17 +10,19 @@ import com.rtatuner.app.core.audio.CapturedFrameContext
 import com.rtatuner.app.core.audio.NoiseFloorCompatibility
 import com.rtatuner.app.core.dsp.DspResponseRevision
 import com.rtatuner.app.core.dsp.Iso31Bands
+import com.rtatuner.app.core.entitlement.EntitlementState
 import com.rtatuner.app.core.entitlement.FeatureAccessPolicy
 import com.rtatuner.app.core.entitlement.FeatureAccessResult
 import com.rtatuner.app.core.entitlement.ProFeature
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
@@ -129,7 +131,26 @@ class CalibrationManager internal constructor(
     }
 
     private val _uiState = MutableStateFlow(CalibrationUiState())
-    val uiState: StateFlow<CalibrationUiState> = _uiState.asStateFlow()
+    val uiState: StateFlow<CalibrationUiState> = object : StateFlow<CalibrationUiState> by _uiState {
+        override val value: CalibrationUiState get() = currentEffectiveUi()
+        override val replayCache: List<CalibrationUiState> get() = listOf(value)
+
+        @OptIn(InternalCoroutinesApi::class)
+        override suspend fun collect(collector: FlowCollector<CalibrationUiState>): Nothing {
+            var previous: CalibrationUiState? = null
+            // A queued emission may predate revocation. Project current authority/ownership
+            // at delivery, including the first emission to a newly attached collector.
+            _uiState.collect(object : FlowCollector<CalibrationUiState> {
+                override suspend fun emit(value: CalibrationUiState) {
+                    val current = currentEffectiveUi()
+                    if (current != previous) {
+                        previous = current
+                        collector.emit(current)
+                    }
+                }
+            })
+        }
+    }
 
     // Requested preferences survive entitlement changes. Only effective state reaches DSP.
     private var requestedState = CalibrationUiState()
@@ -140,7 +161,9 @@ class CalibrationManager internal constructor(
     private data class EffectiveFrameState(
         val calibration: CalibrationUiState,
         val micOffsets31: FloatArray,
-        val authoritySnapshot: CaptureAuthoritySnapshot? = null
+        val authoritySnapshot: CaptureAuthoritySnapshot? = null,
+        val entitlement: EntitlementState = EntitlementState(),
+        val ui: CalibrationUiState = calibration
     )
 
     @Volatile
@@ -171,10 +194,11 @@ class CalibrationManager internal constructor(
     private val entitlementJob = (scope ?: requireNotNull(ownedScope)).launch(start = CoroutineStart.UNDISPATCHED) {
         featurePolicy.entitlements.state.collect {
             synchronized(stateLock) {
-                if (featurePolicy.check(ProFeature.NOISE_FLOOR) is FeatureAccessResult.Denied) {
+                val entitlement = featurePolicy.entitlements.state.value
+                if (!entitlement.isPro) {
                     cancelNoiseCaptureLocked()
                 }
-                publishEffectiveStateLocked()
+                publishEffectiveStateLocked(entitlement)
                 shouldResetSmoothing.set(true)
             }
         }
@@ -212,7 +236,10 @@ class CalibrationManager internal constructor(
     fun close() {
         entitlementJob.cancel()
         ownedScope?.cancel()
-        synchronized(stateLock) { cancelNoiseCaptureLocked() }
+        synchronized(stateLock) {
+            cancelNoiseCaptureLocked()
+            publishEffectiveStateLocked()
+        }
     }
 
     private fun loadPersistedState() {
@@ -318,9 +345,26 @@ class CalibrationManager internal constructor(
         }
     }
 
-    private fun publishEffectiveStateLocked() {
+    private fun currentEffectiveUi(): CalibrationUiState {
+        // Keep unchanged reads lock-free: authority publication can already hold stateLock.
+        val sampledEntitlement = featurePolicy.entitlements.state.value
+        if (effectiveFrame.entitlement != sampledEntitlement) synchronized(stateLock) {
+            // Re-read after acquiring the lock so a delayed getter cannot publish stale ownership.
+            val entitlement = featurePolicy.entitlements.state.value
+            if (effectiveFrame.entitlement != entitlement) {
+                if (!entitlement.isPro) cancelNoiseCaptureLocked()
+                publishEffectiveStateLocked(entitlement)
+                shouldResetSmoothing.set(true)
+            }
+        }
+        return effectiveFrame.ui
+    }
+
+    private fun publishEffectiveStateLocked(
+        entitlement: EntitlementState = featurePolicy.entitlements.state.value
+    ) {
         val authority = currentAuthority
-        val effective = effectiveCalibrationState(requestedState, featurePolicy, authority)
+        val effective = effectiveCalibrationState(requestedState, entitlement, authority)
         val curve = effective.micCurve?.copy(points = effective.micCurve.points.toList())
         val processingState = effective.copy(
             micCurve = curve,
@@ -330,12 +374,14 @@ class CalibrationManager internal constructor(
         val offsets = FloatArray(Iso31Bands.NUM_BANDS) { i ->
             if (effective.isMicCurveActive && curve != null) curve.getOffsetAt(Iso31Bands.CENTER_FREQUENCIES[i]) else 0.0f
         }
-        effectiveFrame = EffectiveFrameState(processingState, offsets, authority)
-        _uiState.value = effective.copy(
+        val ui = effective.copy(
             micCurve = effective.micCurve?.let { it.copy(points = it.points.toList()) },
             noiseFloor = effective.noiseFloor.copy(bands31Db = effective.noiseFloor.bands31Db.copyOf()),
             targetCurve = effective.targetCurve?.let { it.copy(points = it.points.toList()) }
         )
+        // UI and numerical state share one authority/ownership publication, with separate arrays.
+        effectiveFrame = EffectiveFrameState(processingState, offsets, authority, entitlement, ui)
+        _uiState.value = ui
     }
 
     /**
@@ -379,6 +425,7 @@ class CalibrationManager internal constructor(
                 }
 
                 if (!isCapturingNoise) {
+                    publishEffectiveStateLocked()
                     return@synchronized
                 }
 
@@ -401,7 +448,7 @@ class CalibrationManager internal constructor(
                             isCapturingNoiseFloor = true,
                             noiseCaptureProgress = progress
                         )
-                        _uiState.value = _uiState.value.copy(isCapturingNoiseFloor = true, noiseCaptureProgress = progress)
+                        publishEffectiveStateLocked()
                     }
                 }
             }
@@ -806,7 +853,6 @@ class CalibrationManager internal constructor(
         activeNoiseCaptureFingerprint = null
         lastAccumulatedFrameSequence = -1L
         requestedState = requestedState.copy(isCapturingNoiseFloor = false, noiseCaptureProgress = 0.0f)
-        _uiState.value = _uiState.value.copy(isCapturingNoiseFloor = false, noiseCaptureProgress = 0.0f)
         shouldResetSmoothing.set(true)
     }
 }

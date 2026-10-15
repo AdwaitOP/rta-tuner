@@ -2,9 +2,7 @@ package com.rtatuner.app.core.calibration
 
 import com.rtatuner.app.core.audio.CaptureAuthoritySnapshot
 import com.rtatuner.app.core.audio.NoiseFloorCompatibility
-import com.rtatuner.app.core.entitlement.FeatureAccessPolicy
-import com.rtatuner.app.core.entitlement.FeatureAccessResult
-import com.rtatuner.app.core.entitlement.ProFeature
+import com.rtatuner.app.core.entitlement.EntitlementState
 
 /**
  * Derives authorized runtime flags without rewriting requested/persisted calibration data.
@@ -12,14 +10,15 @@ import com.rtatuner.app.core.entitlement.ProFeature
  */
 internal fun effectiveCalibrationState(
     requested: CalibrationUiState,
-    policy: FeatureAccessPolicy,
+    entitlement: EntitlementState,
     liveAuthority: CaptureAuthoritySnapshot? = null
 ): CalibrationUiState {
-    val micAllowed = policy.check(ProFeature.MIC_CALIBRATION) is FeatureAccessResult.Allowed
-    val splAllowed = policy.check(ProFeature.SPL_CALIBRATION) is FeatureAccessResult.Allowed
-    val noiseAllowed = policy.check(ProFeature.NOISE_FLOOR) is FeatureAccessResult.Allowed
+    // All effective flags use one current ownership sample.
+    val micAllowed = entitlement.isPro
+    val splAllowed = entitlement.isPro
+    val noiseAllowed = entitlement.isPro
     val targetAllowed = requested.targetCurve == null || requested.targetCurve == TargetCurve.HARMAN_CAR ||
-        policy.check(ProFeature.ADVANCED_TARGETS) is FeatureAccessResult.Allowed
+        entitlement.isPro
     val micActive = requested.isMicCurveActive && requested.micCurve != null && micAllowed
 
     // One current live compatibility decision:

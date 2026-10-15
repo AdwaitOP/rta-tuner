@@ -102,87 +102,175 @@ internal fun parseStrictInt(value: Any?, min: Int = Int.MIN_VALUE, max: Int = In
 }
 
 /**
- * Lexical validator that inspects raw numeric tokens in [jsonStr] before [JSONObject]
- * parsing can widen or round non-integral decimals (e.g. 48000.0000000000000000001) into Doubles.
- *
- * Ensures mathematically exact integrality and original-domain bounds for all numeric fields:
- * - sampleRate: exactly 44100 or 48000
- * - selectedSource: 0..10
- * - actualSource: 0..10
- * - coefficientRevision: 1..Int.MAX_VALUE
+ * Checks original JSON number tokens before JSONObject can round them to Doubles.
+ * Object names are decoded before comparison; each object has its own duplicate-name
+ * set and only the fingerprint's actual numeric property paths have numeric bounds.
  */
-internal fun validateNumericTokens(jsonStr: String): Boolean {
-    val numericKeys = setOf("sampleRate", "selectedSource", "actualSource", "coefficientRevision")
-    var i = 0
-    val len = jsonStr.length
-    try {
-        while (i < len) {
-            val ch = jsonStr[i]
-            if (ch == '"') {
-                val start = i + 1
-                i++
-                while (i < len && jsonStr[i] != '"') {
-                    if (jsonStr[i] == '\\') i++
-                    i++
-                }
-                if (i >= len) return false
-                val key = jsonStr.substring(start, i)
-                i++ // skip closing quote
+internal fun validateNumericTokens(jsonStr: String): Boolean = try {
+    FingerprintJsonTokenReader(jsonStr).readDocument()
+    true
+} catch (_: Exception) {
+    false
+}
 
-                while (i < len && jsonStr[i].isWhitespace()) i++
-                if (i < len && jsonStr[i] == ':') {
-                    i++ // skip ':'
-                    while (i < len && jsonStr[i].isWhitespace()) i++
-                    if (key in numericKeys && i < len) {
-                        val firstValChar = jsonStr[i]
-                        if (firstValChar == '-' || firstValChar == '+' || (firstValChar in '0'..'9')) {
-                            val valStart = i
-                            while (i < len && jsonStr[i] != ',' && jsonStr[i] != '}' && jsonStr[i] != ']' && !jsonStr[i].isWhitespace()) {
-                                i++
-                            }
-                            val token = jsonStr.substring(valStart, i)
-                            val bd = try {
-                                java.math.BigDecimal(token)
-                            } catch (_: Exception) {
-                                return false
-                            }
-                            if (bd.stripTrailingZeros().scale() > 0) {
-                                return false
-                            }
-                            val bigInt = try {
-                                bd.toBigIntegerExact()
-                            } catch (_: Exception) {
-                                return false
-                            }
-                            when (key) {
-                                "sampleRate" -> {
-                                    if (bigInt != java.math.BigInteger.valueOf(44100) &&
-                                        bigInt != java.math.BigInteger.valueOf(48000)) {
-                                        return false
-                                    }
+/** Strict JSON token reader; never converts original number text through JSONObject. */
+private class FingerprintJsonTokenReader(private val input: String) {
+    private enum class Scope { ROOT, DSP_REVISION, OTHER }
+
+    private var offset = 0
+
+    fun readDocument() {
+        readObject(Scope.ROOT, 0)
+        skipWhitespace()
+        require(offset == input.length)
+    }
+
+    private fun readObject(scope: Scope, depth: Int) {
+        require(depth <= 64)
+        consume('{')
+        val names = HashSet<String>()
+        if (take('}')) return
+        do {
+            skipWhitespace()
+            val name = readString()
+            require(names.add(name))
+            consume(':')
+            val isNumeric = (scope == Scope.ROOT && (name == "sampleRate" || name == "selectedSource" || name == "actualSource")) ||
+                (scope == Scope.DSP_REVISION && name == "coefficientRevision")
+            if (isNumeric) {
+                skipWhitespace()
+                requireValidNumber(name, readNumber())
+            } else {
+                val childScope = if (scope == Scope.ROOT && name == "dspRevision") Scope.DSP_REVISION else Scope.OTHER
+                readValue(childScope, depth + 1)
+            }
+        } while (take(','))
+        consume('}')
+    }
+
+    private fun readArray(depth: Int) {
+        consume('[')
+        if (take(']')) return
+        do {
+            readValue(Scope.OTHER, depth + 1)
+        } while (take(','))
+        consume(']')
+    }
+
+    private fun readValue(scope: Scope, depth: Int) {
+        require(depth <= 64)
+        skipWhitespace()
+        when (current()) {
+            '{' -> readObject(scope, depth)
+            '[' -> readArray(depth)
+            '"' -> readString()
+            't' -> readLiteral("true")
+            'f' -> readLiteral("false")
+            'n' -> readLiteral("null")
+            else -> readNumber()
+        }
+    }
+
+    private fun readString(): String {
+        require(current() == '"')
+        offset++
+        val decoded = StringBuilder()
+        while (offset < input.length) {
+            val ch = input[offset++]
+            when {
+                ch == '"' -> return decoded.toString()
+                ch == '\\' -> {
+                    require(offset < input.length)
+                    when (val escaped = input[offset++]) {
+                        '"', '\\', '/' -> decoded.append(escaped)
+                        'b' -> decoded.append('\b')
+                        'f' -> decoded.append('\u000c')
+                        'n' -> decoded.append('\n')
+                        'r' -> decoded.append('\r')
+                        't' -> decoded.append('\t')
+                        'u' -> {
+                            require(offset + 4 <= input.length)
+                            var codePoint = 0
+                            repeat(4) {
+                                val hex = input[offset++]
+                                val digit = when (hex) {
+                                    in '0'..'9' -> hex - '0'
+                                    in 'a'..'f' -> hex - 'a' + 10
+                                    in 'A'..'F' -> hex - 'A' + 10
+                                    else -> null
                                 }
-                                "selectedSource", "actualSource" -> {
-                                    if (bigInt < java.math.BigInteger.ZERO || bigInt > java.math.BigInteger.valueOf(10)) {
-                                        return false
-                                    }
-                                }
-                                "coefficientRevision" -> {
-                                    if (bigInt < java.math.BigInteger.ONE || bigInt > java.math.BigInteger.valueOf(Int.MAX_VALUE.toLong())) {
-                                        return false
-                                    }
-                                }
+                                require(digit != null)
+                                codePoint = codePoint * 16 + digit
                             }
-                            continue
+                            decoded.append(codePoint.toChar())
                         }
+                        else -> throw IllegalArgumentException("Invalid JSON escape")
                     }
                 }
-            } else {
-                i++
+                ch < ' ' -> throw IllegalArgumentException("Invalid JSON control character")
+                else -> decoded.append(ch)
             }
         }
+        throw IllegalArgumentException("Unterminated JSON string")
+    }
+
+    private fun readNumber(): String {
+        val start = offset
+        if (current() == '-') offset++
+        if (current() == '0') {
+            offset++
+        } else {
+            require(current() in '1'..'9')
+            while (current() in '0'..'9') offset++
+        }
+        if (current() == '.') {
+            offset++
+            require(current() in '0'..'9')
+            while (current() in '0'..'9') offset++
+        }
+        if (current() == 'e' || current() == 'E') {
+            offset++
+            if (current() == '+' || current() == '-') offset++
+            require(current() in '0'..'9')
+            while (current() in '0'..'9') offset++
+        }
+        return input.substring(start, offset)
+    }
+
+    private fun requireValidNumber(name: String, token: String) {
+        val number = java.math.BigDecimal(token)
+        if (name == "sampleRate") {
+            require(number.compareTo(java.math.BigDecimal.valueOf(44100)) == 0 ||
+                number.compareTo(java.math.BigDecimal.valueOf(48000)) == 0)
+        } else {
+            val min = if (name == "coefficientRevision") 1L else 0L
+            val max = if (name == "coefficientRevision") Int.MAX_VALUE.toLong() else 10L
+            // Check bounds before integrality; huge exponents never allocate huge integers.
+            require(number >= java.math.BigDecimal.valueOf(min) && number <= java.math.BigDecimal.valueOf(max))
+            require(number.stripTrailingZeros().scale() <= 0)
+        }
+    }
+
+    private fun readLiteral(literal: String) {
+        require(input.startsWith(literal, offset))
+        offset += literal.length
+    }
+
+    private fun current(): Char = input.getOrNull(offset) ?: '\u0000'
+
+    private fun skipWhitespace() {
+        while (current() == ' ' || current() == '\t' || current() == '\r' || current() == '\n') offset++
+    }
+
+    private fun take(expected: Char): Boolean {
+        skipWhitespace()
+        if (current() != expected) return false
+        offset++
         return true
-    } catch (_: Exception) {
-        return false
+    }
+
+    private fun consume(expected: Char) {
+        require(take(expected))
     }
 }
 
