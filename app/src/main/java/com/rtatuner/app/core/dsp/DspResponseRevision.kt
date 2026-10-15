@@ -1,5 +1,6 @@
 package com.rtatuner.app.core.dsp
 
+import com.rtatuner.app.core.audio.parseStrictInt
 import org.json.JSONObject
 
 /**
@@ -56,11 +57,7 @@ data class DspResponseRevision(
 
             if (!json.has("coefficientRevision") || json.isNull("coefficientRevision")) return null
             val rawRev = json.opt("coefficientRevision")
-            if (rawRev !is Number) return null
-            if (rawRev is Double && rawRev.toInt().toDouble() != rawRev) return null
-            if (rawRev is Float && rawRev.toInt().toFloat() != rawRev) return null
-            val cRev = rawRev.toInt()
-            if (cRev <= 0) return null
+            val cRev = parseStrictInt(rawRev, 1, Int.MAX_VALUE) ?: return null
 
             return DspResponseRevision(
                 revisionId = json.getString("revisionId"),

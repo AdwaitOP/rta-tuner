@@ -139,7 +139,8 @@ class CalibrationManager internal constructor(
     /** Arrays are owned by this snapshot and never mutated after publication. */
     private data class EffectiveFrameState(
         val calibration: CalibrationUiState,
-        val micOffsets31: FloatArray
+        val micOffsets31: FloatArray,
+        val authoritySnapshot: CaptureAuthoritySnapshot? = null
     )
 
     @Volatile
@@ -318,7 +319,8 @@ class CalibrationManager internal constructor(
     }
 
     private fun publishEffectiveStateLocked() {
-        val effective = effectiveCalibrationState(requestedState, featurePolicy, currentAuthority)
+        val authority = currentAuthority
+        val effective = effectiveCalibrationState(requestedState, featurePolicy, authority)
         val curve = effective.micCurve?.copy(points = effective.micCurve.points.toList())
         val processingState = effective.copy(
             micCurve = curve,
@@ -328,7 +330,7 @@ class CalibrationManager internal constructor(
         val offsets = FloatArray(Iso31Bands.NUM_BANDS) { i ->
             if (effective.isMicCurveActive && curve != null) curve.getOffsetAt(Iso31Bands.CENTER_FREQUENCIES[i]) else 0.0f
         }
-        effectiveFrame = EffectiveFrameState(processingState, offsets)
+        effectiveFrame = EffectiveFrameState(processingState, offsets, authority)
         _uiState.value = effective.copy(
             micCurve = effective.micCurve?.let { it.copy(points = it.points.toList()) },
             noiseFloor = effective.noiseFloor.copy(bands31Db = effective.noiseFloor.bands31Db.copyOf()),
@@ -412,26 +414,36 @@ class CalibrationManager internal constructor(
         val noiseSnapshot = state.noiseFloor
 
         // One current live compatibility decision:
+        val isProAllowed = featurePolicy.check(ProFeature.NOISE_FLOOR) is FeatureAccessResult.Allowed
+        val isMicAllowed = isProAllowed
+        val isSplAllowed = isProAllowed
+
         val liveAuthority = currentAuthority
         val isSubtractingNoise: Boolean
-        val isProAllowed = featurePolicy.check(ProFeature.NOISE_FLOOR) is FeatureAccessResult.Allowed
         if (liveAuthority != null && liveAuthority.isValidRunningAuthority && isProAllowed) {
             val matchesAuthority = frameContext != null &&
                 frameContext.isRunning &&
                 frameContext.managerId == liveAuthority.managerId &&
                 frameContext.captureGeneration == liveAuthority.captureGeneration &&
                 frameContext.routeEpoch == liveAuthority.routeEpoch &&
-                frameContext.fingerprint == liveAuthority.fingerprint
+                frameContext.fingerprint == liveAuthority.fingerprint &&
+                frameState.authoritySnapshot == liveAuthority
 
-            isSubtractingNoise = !isCapturingNoise && state.isNoiseSubtractionEffective && matchesAuthority
+            val isFloorCompatible = matchesAuthority &&
+                evaluateNoiseFloorCompatibility(noiseSnapshot, liveAuthority.fingerprint) is NoiseFloorCompatibility.Compatible
+
+            isSubtractingNoise = !isCapturingNoise && state.isNoiseSubtractionEffective && isFloorCompatible
         } else {
             @Suppress("UNUSED_VARIABLE")
             val currentUi = _uiState.value
             isSubtractingNoise = false
         }
 
-        val rawSplOffset = if (state.splCalibration.isSplMode) state.splCalibration.splOffsetDb else 0.0f
+        val effectiveSplMode = state.splCalibration.isSplMode && isSplAllowed
+        val rawSplOffset = if (effectiveSplMode) state.splCalibration.splOffsetDb else 0.0f
         val splOffset = if (rawSplOffset.isNaN() || rawSplOffset.isInfinite()) 0.0f else rawSplOffset
+
+        val applyMic = isMicAllowed && state.isMicCurveActive
 
         for (i in 0 until numBands) {
             val rawVal = if (i < raw31Bands.size) raw31Bands[i] else AudioMath.MIN_DB_FS
@@ -447,7 +459,7 @@ class CalibrationManager internal constructor(
             }
 
             // 2. Apply Mic Calibration offset to cleaned acoustic signal
-            if (!isSubtractingNoise || valDb > AudioMath.MIN_DB_FS) {
+            if (applyMic && (!isSubtractingNoise || valDb > AudioMath.MIN_DB_FS)) {
                 val micOffset = if (i < micOffsets31.size) micOffsets31[i] else 0.0f
                 val safeMicOffset = if (micOffset.isNaN() || micOffset.isInfinite()) 0.0f else micOffset
                 valDb += safeMicOffset
@@ -463,7 +475,7 @@ class CalibrationManager internal constructor(
 
         // 4. Calibrate Raw FFT Curve
         val outRawFft = FloatArray(rawFftDb.size)
-        val micCurve = if (state.isMicCurveActive) state.micCurve else null
+        val micCurve = if (applyMic) state.micCurve else null
         for (k in rawFftDb.indices) {
             val rawFft = rawFftDb[k]
             var rawVal = if (rawFft.isNaN() || rawFft.isInfinite()) AudioMath.MIN_DB_FS else rawFft
@@ -481,17 +493,19 @@ class CalibrationManager internal constructor(
 
         // 5. Compute Target Deltas (measured - target) if target curve is active
         // Target curves are relative response shapes positioned at nominal reference baseline (-20 dBFS or 85 dBSPL)
+        val isTargetAllowed = state.targetCurve == null || state.targetCurve == TargetCurve.HARMAN_CAR || isProAllowed
+        val applyTarget = state.isTargetCurveActive && isTargetAllowed && state.targetCurve != null
         var targetDeltas: FloatArray? = null
-        if (state.isTargetCurveActive && state.targetCurve != null) {
+        if (applyTarget) {
             targetDeltas = FloatArray(numBands)
-            val targetBaselineDb = if (state.splCalibration.isSplMode) {
+            val targetBaselineDb = if (effectiveSplMode) {
                 -20.0f + splOffset
             } else {
                 -20.0f
             }
             for (i in 0 until numBands) {
                 val centerF = Iso31Bands.CENTER_FREQUENCIES[i]
-                val curveVal = state.targetCurve.getTargetDbAt(centerF)
+                val curveVal = state.targetCurve!!.getTargetDbAt(centerF)
                 val safeCurveVal = if (curveVal.isNaN() || curveVal.isInfinite()) 0.0f else curveVal
                 val targetVal = targetBaselineDb + safeCurveVal
                 val delta = out31[i] - targetVal
@@ -506,8 +520,8 @@ class CalibrationManager internal constructor(
             calibratedRawFftDb = outRawFft,
             unreliableBands = unreliable,
             targetDeltas31Db = targetDeltas,
-            isSplMode = state.splCalibration.isSplMode,
-            splOffsetDb = state.splCalibration.splOffsetDb,
+            isSplMode = effectiveSplMode,
+            splOffsetDb = if (effectiveSplMode) state.splCalibration.splOffsetDb else 0.0f,
             shouldResetSmoothing = reset
         )
     }

@@ -145,6 +145,19 @@ internal class CaptureSession(
     @Volatile
     var routeEpoch: Long = 0L
 
+    @Volatile
+    var isReading: Boolean = false
+    @Volatile
+    var readBuffer: ShortArray? = null
+    @Volatile
+    var readOffset: Int = 0
+    @Volatile
+    var readLength: Int = 0
+    @Volatile
+    var readTainted: Boolean = false
+    @Volatile
+    var readEpoch: Long = 0L
+
     private val sessionLock = Any()
     @Volatile
     private var isCleanedUp = false
@@ -300,6 +313,8 @@ class AudioCaptureManager(
         private const val DEFAULT_SAMPLE_RATE = 48000
         private const val FALLBACK_SAMPLE_RATE = 44100
         private const val MAX_CONSECUTIVE_ZERO_READS = 10
+        private const val CANARY_1 = 0x5A5A.toShort()
+        private const val CANARY_2 = 0xA5A5.toShort()
     }
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -313,14 +328,22 @@ class AudioCaptureManager(
                 aecAvailable = android.media.audiofx.AcousticEchoCanceler.isAvailable(),
                 agcAvailable = android.media.audiofx.AutomaticGainControl.isAvailable(),
                 nsAvailable = android.media.audiofx.NoiseSuppressor.isAvailable(),
-                isEffectsKnown = true
+                isEffectsKnown = true,
+                isSessionEffectsKnown = false,
+                aecSessionEnabled = false,
+                agcSessionEnabled = false,
+                nsSessionEnabled = false
             )
         } catch (_: Throwable) {
             CaptureEffectsInfo(
                 aecAvailable = false,
                 agcAvailable = false,
                 nsAvailable = false,
-                isEffectsKnown = false
+                isEffectsKnown = false,
+                isSessionEffectsKnown = false,
+                aecSessionEnabled = false,
+                agcSessionEnabled = false,
+                nsSessionEnabled = false
             )
         }
     }
@@ -945,19 +968,33 @@ class AudioCaptureManager(
                 val generationBeforeRead = session.generation
 
                 val toRead = hopSize - hopSamplesAccumulated
-                val readResult = record.read(hopBuffer, hopSamplesAccumulated, toRead, AudioRecord.READ_BLOCKING)
+                for (i in 0 until toRead) {
+                    hopBuffer[hopSamplesAccumulated + i] = if (i % 2 == 0) CANARY_1 else CANARY_2
+                }
+                session.readBuffer = hopBuffer
+                session.readOffset = hopSamplesAccumulated
+                session.readLength = toRead
+                session.readTainted = false
+                session.readEpoch = epochBeforeRead
+                session.isReading = true
+
+                val readResult = try {
+                    record.read(hopBuffer, hopSamplesAccumulated, toRead, AudioRecord.READ_BLOCKING)
+                } finally {
+                    session.isReading = false
+                }
 
                 val epochAfterRead = session.routeEpoch
                 val generationAfterRead = session.generation
 
                 // Check ownership and route epoch stability across the blocking read
-                val isBetweenHopRouteChange = totalFrames > 0 && hopSamplesAccumulated == 0
                 val readValid = readResult > 0 &&
                     generationAfterRead == generationBeforeRead &&
-                    epochBeforeRead > 0L &&
+                    session.readEpoch > 0L &&
+                    !session.readTainted &&
+                    epochAfterRead == session.readEpoch &&
                     isRunning.get() &&
-                    isCurrentSession(session) &&
-                    (epochAfterRead == epochBeforeRead || isBetweenHopRouteChange)
+                    isCurrentSession(session)
 
                 if (readResult > 0 && !readValid) {
                     // Route changed, session changed, or stopped during blocking read:
@@ -974,7 +1011,7 @@ class AudioCaptureManager(
 
                 if (readResult > 0) {
                     consecutiveZeroReads = 0
-                    val effectiveReadEpoch = epochAfterRead
+                    val effectiveReadEpoch = session.readEpoch
                     if (hopSamplesAccumulated == 0) {
                         // Starting a new hop
                         if (hopRouteEpoch != 0L && hopRouteEpoch != effectiveReadEpoch) {
@@ -1352,6 +1389,26 @@ class AudioCaptureManager(
 
         val newEpoch = routeEpochCounter.incrementAndGet()
         session.routeEpoch = newEpoch
+        if (session.isReading) {
+            val buf = session.readBuffer
+            val off = session.readOffset
+            val len = session.readLength
+            var patternIntact = (buf != null && len > 0)
+            if (patternIntact && buf != null) {
+                for (i in 0 until len) {
+                    val expected = if (i % 2 == 0) CANARY_1 else CANARY_2
+                    if (buf[off + i] != expected) {
+                        patternIntact = false
+                        break
+                    }
+                }
+            }
+            if (!patternIntact) {
+                session.readTainted = true
+            } else {
+                session.readEpoch = newEpoch
+            }
+        }
 
         session.currentFingerprint = CaptureFingerprint(
             dspRevision = DspResponseRevision.CURRENT,

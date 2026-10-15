@@ -11,6 +11,7 @@ data class CaptureEffectsInfo(
     val agcAvailable: Boolean = false,
     val nsAvailable: Boolean = false,
     val isEffectsKnown: Boolean = true,
+    val isSessionEffectsKnown: Boolean = false,
     val aecSessionEnabled: Boolean = false,
     val agcSessionEnabled: Boolean = false,
     val nsSessionEnabled: Boolean = false,
@@ -21,6 +22,7 @@ data class CaptureEffectsInfo(
         put("agc", agcAvailable)
         put("ns", nsAvailable)
         put("known", isEffectsKnown)
+        put("sessionKnown", isSessionEffectsKnown)
         put("aecEnabled", aecSessionEnabled)
         put("agcEnabled", agcSessionEnabled)
         put("nsEnabled", nsSessionEnabled)
@@ -35,10 +37,15 @@ data class CaptureEffectsInfo(
                 val raw = json.opt(key)
                 if (raw !is Boolean) return null
             }
+            if (json.has("sessionKnown")) {
+                val raw = json.opt("sessionKnown")
+                if (raw !is Boolean) return null
+            }
             val aec = json.getBoolean("aec")
             val agc = json.getBoolean("agc")
             val ns = json.getBoolean("ns")
             val known = json.getBoolean("known")
+            val sessionKnown = json.optBoolean("sessionKnown", false)
             val aecEn = json.getBoolean("aecEnabled")
             val agcEn = json.getBoolean("agcEnabled")
             val nsEn = json.getBoolean("nsEnabled")
@@ -48,11 +55,53 @@ data class CaptureEffectsInfo(
                 agcAvailable = agc,
                 nsAvailable = ns,
                 isEffectsKnown = known,
+                isSessionEffectsKnown = sessionKnown,
                 aecSessionEnabled = aecEn,
                 agcSessionEnabled = agcEn,
                 nsSessionEnabled = nsEn
             )
         }
+    }
+}
+
+/**
+ * Strict integer decoding helper that validates mathematically exact integrality
+ * and original-domain bounds before narrowing to Int, rejecting Long overflow,
+ * BigInteger wrapping, and fractional BigDecimal/Double/Float truncation.
+ */
+internal fun parseStrictInt(value: Any?, min: Int = Int.MIN_VALUE, max: Int = Int.MAX_VALUE): Int? {
+    if (value == null) return null
+    return when (value) {
+        is Int -> if (value in min..max) value else null
+        is Long -> if (value >= min.toLong() && value <= max.toLong()) value.toInt() else null
+        is Double -> {
+            if (!value.isFinite()) return null
+            if (value < min.toDouble() || value > max.toDouble()) return null
+            val l = value.toLong()
+            if (l.toDouble() == value && l in min.toLong()..max.toLong()) l.toInt() else null
+        }
+        is Float -> {
+            if (!value.isFinite()) return null
+            if (value < min.toFloat() || value > max.toFloat()) return null
+            val l = value.toLong()
+            if (l.toFloat() == value && l in min.toLong()..max.toLong()) l.toInt() else null
+        }
+        is java.math.BigInteger -> {
+            val minBig = java.math.BigInteger.valueOf(min.toLong())
+            val maxBig = java.math.BigInteger.valueOf(max.toLong())
+            if (value in minBig..maxBig) value.toInt() else null
+        }
+        is java.math.BigDecimal -> {
+            try {
+                val bigInt = value.toBigIntegerExact()
+                val minBig = java.math.BigInteger.valueOf(min.toLong())
+                val maxBig = java.math.BigInteger.valueOf(max.toLong())
+                if (bigInt in minBig..maxBig) bigInt.toInt() else null
+            } catch (_: ArithmeticException) {
+                null
+            }
+        }
+        else -> null
     }
 }
 
@@ -125,13 +174,10 @@ data class CaptureFingerprint(
                 val dspJson = json.optJSONObject("dspRevision") ?: return null
                 val dspRev = DspResponseRevision.fromJson(dspJson) ?: return null
 
-                // Required: sampleRate integer (strict whole Number, no numeric string, no fraction)
+                // Required: sampleRate integer (strict whole Number, no numeric string, no fraction, no overflow)
                 if (!json.has("sampleRate") || json.isNull("sampleRate")) return null
                 val rawRate = json.opt("sampleRate")
-                if (rawRate !is Number) return null
-                if (rawRate is Double && rawRate.toInt().toDouble() != rawRate) return null
-                if (rawRate is Float && rawRate.toInt().toFloat() != rawRate) return null
-                val sampleRate = rawRate.toInt()
+                val sampleRate = parseStrictInt(rawRate, 44100, 48000) ?: return null
                 if (sampleRate != 44100 && sampleRate != 48000) return null
 
                 // Required: micId string (strict String, not Number, not Blank, not UNKNOWN/PENDING)
@@ -146,22 +192,14 @@ data class CaptureFingerprint(
                 if (rawDevType !is String) return null
                 if (rawDevType.isBlank() || rawDevType == UNKNOWN_DEVICE_TYPE || rawDevType == PENDING_DEVICE_TYPE || rawDevType !in KNOWN_DEVICE_TYPES) return null
 
-                // Required: selectedSource & actualSource (strict whole Number, 0..10)
+                // Required: selectedSource & actualSource (strict whole Number, 0..10, no overflow)
                 if (!json.has("selectedSource") || json.isNull("selectedSource")) return null
                 val rawSelectedSource = json.opt("selectedSource")
-                if (rawSelectedSource !is Number) return null
-                if (rawSelectedSource is Double && rawSelectedSource.toInt().toDouble() != rawSelectedSource) return null
-                if (rawSelectedSource is Float && rawSelectedSource.toInt().toFloat() != rawSelectedSource) return null
-                val selectedSource = rawSelectedSource.toInt()
-                if (selectedSource < 0 || selectedSource > 10) return null
+                val selectedSource = parseStrictInt(rawSelectedSource, 0, 10) ?: return null
 
                 if (!json.has("actualSource") || json.isNull("actualSource")) return null
                 val rawActualSource = json.opt("actualSource")
-                if (rawActualSource !is Number) return null
-                if (rawActualSource is Double && rawActualSource.toInt().toDouble() != rawActualSource) return null
-                if (rawActualSource is Float && rawActualSource.toInt().toFloat() != rawActualSource) return null
-                val actualSource = rawActualSource.toInt()
-                if (actualSource < 0 || actualSource > 10) return null
+                val actualSource = parseStrictInt(rawActualSource, 0, 10) ?: return null
 
                 // Required: fallback boolean (strict Boolean, must match selectedSource != actualSource)
                 if (!json.has("fallback") || json.isNull("fallback")) return null
