@@ -123,10 +123,20 @@ class IndependentAuditCaptureAuthorityTest {
     private fun emit(record: SteppedRecord, amplitude: Int = 5000): Long {
         val prior = manager.uiState.value.frameContext
         record.steps.put(amplitude)
+        var offeredReplacement = false
+        val initialReads = record.enteredReads.get()
         await {
             val latest = manager.uiState.value.frameContext
-            latest != null && (prior == null || latest.captureGeneration != prior.captureGeneration ||
-                latest.managerId != prior.managerId || latest.frameSequence > prior.frameSequence)
+            if (latest != null && (prior == null || latest.captureGeneration != prior.captureGeneration ||
+                latest.managerId != prior.managerId || latest.frameSequence > prior.frameSequence)) {
+                true
+            } else {
+                if (!offeredReplacement && record.steps.isEmpty() && record.enteredReads.get() > initialReads) {
+                    offeredReplacement = true
+                    record.steps.offer(amplitude)
+                }
+                false
+            }
         }
         return manager.uiState.value.frameSequence
     }

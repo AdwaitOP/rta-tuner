@@ -11,7 +11,7 @@ data class CaptureEffectsInfo(
     val agcAvailable: Boolean = false,
     val nsAvailable: Boolean = false,
     val isEffectsKnown: Boolean = true,
-    val isSessionEffectsKnown: Boolean = false,
+    val isSessionEffectsKnown: Boolean = isEffectsKnown,
     val aecSessionEnabled: Boolean = false,
     val agcSessionEnabled: Boolean = false,
     val nsSessionEnabled: Boolean = false,
@@ -31,21 +31,17 @@ data class CaptureEffectsInfo(
     companion object {
         fun fromJson(json: JSONObject?): CaptureEffectsInfo? {
             if (json == null) return null
-            val requiredKeys = listOf("aec", "agc", "ns", "known", "aecEnabled", "agcEnabled", "nsEnabled")
+            val requiredKeys = listOf("aec", "agc", "ns", "known", "sessionKnown", "aecEnabled", "agcEnabled", "nsEnabled")
             for (key in requiredKeys) {
                 if (!json.has(key) || json.isNull(key)) return null
                 val raw = json.opt(key)
-                if (raw !is Boolean) return null
-            }
-            if (json.has("sessionKnown")) {
-                val raw = json.opt("sessionKnown")
                 if (raw !is Boolean) return null
             }
             val aec = json.getBoolean("aec")
             val agc = json.getBoolean("agc")
             val ns = json.getBoolean("ns")
             val known = json.getBoolean("known")
-            val sessionKnown = json.optBoolean("sessionKnown", false)
+            val sessionKnown = json.getBoolean("sessionKnown")
             val aecEn = json.getBoolean("aecEnabled")
             val agcEn = json.getBoolean("agcEnabled")
             val nsEn = json.getBoolean("nsEnabled")
@@ -102,6 +98,91 @@ internal fun parseStrictInt(value: Any?, min: Int = Int.MIN_VALUE, max: Int = In
             }
         }
         else -> null
+    }
+}
+
+/**
+ * Lexical validator that inspects raw numeric tokens in [jsonStr] before [JSONObject]
+ * parsing can widen or round non-integral decimals (e.g. 48000.0000000000000000001) into Doubles.
+ *
+ * Ensures mathematically exact integrality and original-domain bounds for all numeric fields:
+ * - sampleRate: exactly 44100 or 48000
+ * - selectedSource: 0..10
+ * - actualSource: 0..10
+ * - coefficientRevision: 1..Int.MAX_VALUE
+ */
+internal fun validateNumericTokens(jsonStr: String): Boolean {
+    val numericKeys = setOf("sampleRate", "selectedSource", "actualSource", "coefficientRevision")
+    var i = 0
+    val len = jsonStr.length
+    try {
+        while (i < len) {
+            val ch = jsonStr[i]
+            if (ch == '"') {
+                val start = i + 1
+                i++
+                while (i < len && jsonStr[i] != '"') {
+                    if (jsonStr[i] == '\\') i++
+                    i++
+                }
+                if (i >= len) return false
+                val key = jsonStr.substring(start, i)
+                i++ // skip closing quote
+
+                while (i < len && jsonStr[i].isWhitespace()) i++
+                if (i < len && jsonStr[i] == ':') {
+                    i++ // skip ':'
+                    while (i < len && jsonStr[i].isWhitespace()) i++
+                    if (key in numericKeys && i < len) {
+                        val firstValChar = jsonStr[i]
+                        if (firstValChar == '-' || firstValChar == '+' || (firstValChar in '0'..'9')) {
+                            val valStart = i
+                            while (i < len && jsonStr[i] != ',' && jsonStr[i] != '}' && jsonStr[i] != ']' && !jsonStr[i].isWhitespace()) {
+                                i++
+                            }
+                            val token = jsonStr.substring(valStart, i)
+                            val bd = try {
+                                java.math.BigDecimal(token)
+                            } catch (_: Exception) {
+                                return false
+                            }
+                            if (bd.stripTrailingZeros().scale() > 0) {
+                                return false
+                            }
+                            val bigInt = try {
+                                bd.toBigIntegerExact()
+                            } catch (_: Exception) {
+                                return false
+                            }
+                            when (key) {
+                                "sampleRate" -> {
+                                    if (bigInt != java.math.BigInteger.valueOf(44100) &&
+                                        bigInt != java.math.BigInteger.valueOf(48000)) {
+                                        return false
+                                    }
+                                }
+                                "selectedSource", "actualSource" -> {
+                                    if (bigInt < java.math.BigInteger.ZERO || bigInt > java.math.BigInteger.valueOf(10)) {
+                                        return false
+                                    }
+                                }
+                                "coefficientRevision" -> {
+                                    if (bigInt < java.math.BigInteger.ONE || bigInt > java.math.BigInteger.valueOf(Int.MAX_VALUE.toLong())) {
+                                        return false
+                                    }
+                                }
+                            }
+                            continue
+                        }
+                    }
+                }
+            } else {
+                i++
+            }
+        }
+        return true
+    } catch (_: Exception) {
+        return false
     }
 }
 
@@ -166,6 +247,7 @@ data class CaptureFingerprint(
 
         fun fromJsonString(jsonStr: String?): CaptureFingerprint? {
             if (jsonStr.isNullOrBlank()) return null
+            if (!validateNumericTokens(jsonStr)) return null
             return try {
                 val json = JSONObject(jsonStr)
 

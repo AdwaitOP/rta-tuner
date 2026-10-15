@@ -92,7 +92,9 @@ class IndependentBlockingReadProvenanceTest {
     }
     @Test fun acceptedARouteHistoryCannotContaminateFirstSilentBFrame() {
         val (m,s)=start();complete(s,sampleStep());waitFor{m.uiState.value.frameSequence==1L};switch(s,b)
-        complete(s,sampleStep(amplitude=0));waitFor{m.uiState.value.frameSequence==2L}
+        complete(s,sampleStep(amplitude=0))
+        if (m.uiState.value.frameSequence < 2L) complete(s, sampleStep(amplitude = 0))
+        waitFor{m.uiState.value.frameSequence==2L}
         println("ACCEPTED_HISTORY B rms=${m.uiState.value.rmsDb}, maxBand=${m.uiState.value.octave31Db.maxOrNull()}")
         assertTrue("Current B frame must not contain previously accepted A overlap",m.uiState.value.rmsDb<=AudioMath.MIN_DB_FS+0.001f)
     }
